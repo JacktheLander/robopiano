@@ -1,0 +1,29 @@
+primitive_root: ../../outputs/primitives/full
+output_root: ../../outputs/transformer
+experiment_name: Sonata-3-full-planner
+wandb:
+  enabled: true
+  project: robopianist
+  entity: tnguyen31-santa-clara-university
+  mode: online
+  tags: ["sonata", "transformer", "full"]
+seed: 7
+device: cuda
+resume: false
+deterministic_eval: true
+model_variant: token_prediction
+context_length: 64
+batch_size: 96
+num_workers: 4
+epochs: 30
+learning_rate: 0.0002
+weight_decay: 0.0001
+d_model: 384
+nhead: 8
+num_layers: 8
+dim_feedforward: 1024
+dropout: 0.1
+checkpoint_interval: 2
+topk: 5
+action_horizon: 32
+fallback_action_dim: 39

@@ -1,0 +1,37 @@
+primitive_root: ../../outputs/primitives/medium
+planner_checkpoint: ""
+output_root: ../../outputs/diffusion
+experiment_name: Sonata-3-medium-diffusion
+wandb:
+  enabled: true
+  project: robopianist
+  entity: tnguyen31-santa-clara-university
+  mode: online
+  tags: ["sonata", "diffusion", "medium"]
+seed: 7
+device: cuda
+resume: false
+deterministic_eval: true
+variant: full
+context_length: 48
+batch_size: 32
+num_workers: 2
+epochs: 20
+learning_rate: 0.0002
+weight_decay: 0.0001
+action_horizon: 32
+state_context_steps: 8
+model_dim: 192
+num_blocks: 8
+diffusion_steps: 100
+beta_start: 0.0001
+beta_end: 0.02
+imitation_weight: 0.5
+smoothness_weight: 0.05
+checkpoint_interval: 2
+planner_embedding_dim: 256
+primitive_embedding_dim: 128
+planner_nhead: 8
+planner_layers: 6
+planner_ffn: 768
+planner_dropout: 0.1

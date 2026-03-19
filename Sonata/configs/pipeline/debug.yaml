@@ -1,0 +1,11 @@
+profiles:
+  data: debug
+  primitive: debug
+  transformer: debug
+  diffusion: debug
+wandb:
+  enabled: true
+  project: robopianist
+  entity: tnguyen31-santa-clara-university
+  mode: online
+  tags: ["sonata", "pipeline", "debug"]

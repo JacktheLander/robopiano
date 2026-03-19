@@ -1,0 +1,37 @@
+primitive_root: ../../outputs/primitives/debug
+planner_checkpoint: ""
+output_root: ../../outputs/diffusion
+experiment_name: Sonata-3-debug-diffusion
+wandb:
+  enabled: true
+  project: robopianist
+  entity: tnguyen31-santa-clara-university
+  mode: online
+  tags: ["sonata", "diffusion", "debug"]
+seed: 7
+device: cpu
+resume: false
+deterministic_eval: true
+variant: full
+context_length: 24
+batch_size: 16
+num_workers: 0
+epochs: 8
+learning_rate: 0.0002
+weight_decay: 0.0001
+action_horizon: 32
+state_context_steps: 8
+model_dim: 128
+num_blocks: 6
+diffusion_steps: 50
+beta_start: 0.0001
+beta_end: 0.02
+imitation_weight: 0.5
+smoothness_weight: 0.05
+checkpoint_interval: 2
+planner_embedding_dim: 192
+primitive_embedding_dim: 96
+planner_nhead: 6
+planner_layers: 4
+planner_ffn: 512
+planner_dropout: 0.1

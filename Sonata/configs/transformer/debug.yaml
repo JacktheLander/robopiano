@@ -1,0 +1,29 @@
+primitive_root: ../../outputs/primitives/debug
+output_root: ../../outputs/transformer
+experiment_name: Sonata-3-debug-planner
+wandb:
+  enabled: true
+  project: robopianist
+  entity: tnguyen31-santa-clara-university
+  mode: online
+  tags: ["sonata", "transformer", "debug"]
+seed: 7
+device: cpu
+resume: false
+deterministic_eval: true
+model_variant: token_prediction
+context_length: 24
+batch_size: 32
+num_workers: 0
+epochs: 8
+learning_rate: 0.0003
+weight_decay: 0.0001
+d_model: 192
+nhead: 6
+num_layers: 4
+dim_feedforward: 512
+dropout: 0.1
+checkpoint_interval: 2
+topk: 5
+action_horizon: 32
+fallback_action_dim: 39

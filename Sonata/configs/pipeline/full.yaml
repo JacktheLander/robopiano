@@ -1,0 +1,11 @@
+profiles:
+  data: full
+  primitive: full
+  transformer: full
+  diffusion: full
+wandb:
+  enabled: true
+  project: robopianist
+  entity: tnguyen31-santa-clara-university
+  mode: online
+  tags: ["sonata", "pipeline", "full"]

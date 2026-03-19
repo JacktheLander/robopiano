@@ -1,0 +1,40 @@
+output_root: ../../outputs/primitives/full
+data_output_root: ../../outputs/data/full
+data_manifest_name: dataset_manifest
+experiment_name: Sonata-3-full-primitives
+wandb:
+  enabled: true
+  project: robopianist
+  entity: tnguyen31-santa-clara-university
+  mode: online
+  tags: ["sonata", "primitives", "full"]
+seed: 7
+force: false
+segmentation_strategy: dtw_assisted
+window_steps: 24
+stride_steps: 12
+pre_steps: 6
+post_steps: 12
+min_gap_steps: 8
+velocity_quantile: 0.85
+acceleration_quantile: 0.85
+alignment_radius: 6
+dtw_template_window: 24
+chord_tolerance_steps: 1
+segment_chunk_size: 1024
+trajectory_resample_steps: 24
+include_action_trajectory: true
+fallback_action_dim: 39
+pca_components: 160
+gmm_k_candidates: [24, 32, 48, 64]
+model_selection_metric: bic
+gmm_covariance_type: full
+gmm_reg_covar: 0.0001
+silhouette_max_examples: 4096
+gmr_horizon: 32
+gmr_components: 8
+gmr_reg_covar: 0.0001
+gmr_target_actions: true
+num_duration_buckets: 8
+num_dynamics_buckets: 8
+min_segments_per_primitive: 12
