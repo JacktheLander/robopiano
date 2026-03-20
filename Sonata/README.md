@@ -199,7 +199,13 @@ python scripts/evaluate.py \
 - `configs/diffusion/debug.yaml`, `medium.yaml`, `full.yaml`
 - `configs/pipeline/debug.yaml`, `medium.yaml`, `full.yaml`
 
-`medium` and `full` intentionally use placeholder RP1M paths. Update those to your cluster storage locations before launching.
+`medium` and `full` resolve `dataset_root` from the `RP1M_300_ROOT` environment variable. On the cluster, export it before launching:
+
+```bash
+export RP1M_300_ROOT=/project/$USER/rp1m_300.zarr
+```
+
+If cluster score files live outside the repo checkout, you can also point `note_search_roots` at environment-expanded paths because Sonata resolves `$VARS` in config paths before use. If no score files are available, segmentation falls back to `goals` and then `piano_states`.
 
 ## Evaluation Outputs
 

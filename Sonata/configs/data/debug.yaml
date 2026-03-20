@@ -1,0 +1,19 @@
+dataset_root: ../../../rp1m_toy/rp1m_toy.zarr
+output_root: ../../outputs/data/debug
+manifest_name: dataset_manifest
+split_name: dataset_splits
+summary_name: dataset_summary.json
+control_timestep: 0.05
+note_search_roots:
+  - ../../../extracted_midis
+  - ../../../robopianist/music/data
+subset_mode: head
+max_songs: 3
+max_episodes: 32
+debug_num_songs: 2
+split_seed: 7
+split_ratios:
+  train: 0.34
+  val: 0.33
+  test: 0.33
+force: false

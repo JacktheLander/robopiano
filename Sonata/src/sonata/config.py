@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -71,11 +73,22 @@ def resolve_path(path_like: str | Path | None, base_dir: str | Path | None = Non
         return None
     if isinstance(path_like, str) and not path_like.strip():
         return None
-    path = Path(path_like)
+    expanded = _expand_path_like(path_like)
+    path = Path(expanded)
     if path.is_absolute():
         return path
     base = Path(base_dir).resolve() if base_dir is not None else project_root()
     return (base / path).resolve()
+
+
+def _expand_path_like(path_like: str | Path) -> str:
+    raw = str(path_like)
+    expanded = os.path.expanduser(os.path.expandvars(raw))
+    unresolved = re.findall(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]+\})", expanded)
+    if unresolved:
+        names = ", ".join(unresolved)
+        raise ValueError(f"Unresolved environment variable(s) in Sonata path: {names}")
+    return expanded
 
 
 def simple_yaml_load(text: str) -> dict[str, Any]:

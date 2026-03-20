@@ -255,7 +255,13 @@ def run_segmentation(manifest_df: pd.DataFrame, output_dir: Path, config: dict[s
             continue
         if episode.note_path is not None and episode.note_path.exists():
             try:
-                score_events = load_note_events(episode.note_path, episode.control_timestep, chord_tolerance_steps=int(config["chord_tolerance_steps"]))
+                score_events = load_note_events(
+                    episode.note_path,
+                    episode.control_timestep,
+                    chord_tolerance_steps=int(config["chord_tolerance_steps"]),
+                    song_id=episode.song_id,
+                    episode_id=episode.episode_id,
+                )
             except Exception:
                 score_events = infer_events_from_goal_roll(
                     episode.goals if episode.goals is not None else episode.piano_states,

@@ -1,0 +1,19 @@
+dataset_root: ${RP1M_300_ROOT}
+output_root: ../../outputs/data/full
+manifest_name: dataset_manifest
+split_name: dataset_splits
+summary_name: dataset_summary.json
+control_timestep: 0.05
+note_search_roots:
+  - ../../../extracted_midis
+  - ../../../robopianist/music/data
+subset_mode: all
+max_songs: 0
+max_episodes: 0
+debug_num_songs: 16
+split_seed: 7
+split_ratios:
+  train: 0.8
+  val: 0.1
+  test: 0.1
+force: false

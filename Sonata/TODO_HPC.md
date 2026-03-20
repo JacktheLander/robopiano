@@ -2,7 +2,7 @@
 
 These are the remaining items that depend on cluster-specific deployment details or on RoboPianist environment wiring that is not fully recoverable from RP1M files alone.
 
-1. Point `configs/data/medium.yaml` and `configs/data/full.yaml` at the real shared-storage RP1M paths on the cluster.
+1. Export `RP1M_300_ROOT` to the real shared-storage RP1M path on the cluster before launching Sonata.
 2. Decide where cached manifests, segment chunks, and feature bundles should live:
    recommended split is shared read-only dataset on network storage and writable caches on node-local SSD or scratch.
 3. Validate whether the full RP1M installation also ships `.proto` or MIDI score files, or whether score lookup should always fall back to `goals`.

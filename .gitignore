@@ -17,3 +17,7 @@ rp1m_primitives/
 extracted_actions/
 extracted_joints/
 extracted_midis/
+!Sonata/configs/data/
+!Sonata/configs/data/**
+!Sonata/src/sonata/data/
+!Sonata/src/sonata/data/**
