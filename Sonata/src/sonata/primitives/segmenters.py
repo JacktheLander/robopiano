@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
+import shutil
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +15,22 @@ from tqdm import tqdm
 from sonata.data.loading import load_episode_record
 from sonata.data.score import dumps_score_context, infer_events_from_goal_roll, load_note_events, score_context_from_roll
 from sonata.data.schema import ScoreEvent, SegmentRecord
-from sonata.utils.io import save_npz, write_json, write_table
+from sonata.primitives.slim_cache import (
+    append_episode_progress,
+    build_gmr_target,
+    chunk_index_from_name,
+    collect_slim_chunk_names,
+    compose_segment_index,
+    ensure_segment_index_columns,
+    load_completed_episodes,
+    load_slim_index_table,
+    next_slim_chunk_index,
+    resolve_slim_cache_paths,
+    slim_chunk_complete,
+    slim_chunk_name,
+    write_slim_chunk,
+)
+from sonata.utils.io import read_table, save_npz, write_json, write_table
 
 
 @dataclass
@@ -333,7 +351,13 @@ def _validate_existing_chunks(segments_dir: Path, chunk_files: list[str]) -> lis
         valid.append(chunk_name)
     return valid
 
-def run_segmentation(manifest_df: pd.DataFrame, output_dir: Path, config: dict[str, Any]) -> dict[str, Path]:
+def run_segmentation(manifest_df: pd.DataFrame, output_dir: Path, config: dict[str, Any], logger: logging.Logger | None = None) -> dict[str, Path]:
+    if not bool(config.get("write_slim_cache", True)):
+        return run_segmentation_legacy(manifest_df=manifest_df, output_dir=output_dir, config=config)
+    return run_segmentation_slim(manifest_df=manifest_df, output_dir=output_dir, config=config, logger=logger)
+
+
+def run_segmentation_legacy(manifest_df: pd.DataFrame, output_dir: Path, config: dict[str, Any]) -> dict[str, Path]:
     segments_dir = output_dir / "segments"
     segments_dir.mkdir(parents=True, exist_ok=True)
 
@@ -533,6 +557,261 @@ def run_segmentation(manifest_df: pd.DataFrame, output_dir: Path, config: dict[s
     return {"segment_table_base": table_base, "score_table_base": score_base, "manifest_path": manifest_path}
 
 
+def run_segmentation_slim(
+    manifest_df: pd.DataFrame,
+    output_dir: Path,
+    config: dict[str, Any],
+    logger: logging.Logger | None = None,
+) -> dict[str, Path]:
+    segments_dir = output_dir / "segments"
+    segments_dir.mkdir(parents=True, exist_ok=True)
+    table_base = segments_dir / "segment_index"
+    score_base = segments_dir / "score_events"
+    manifest_path = segments_dir / "segment_manifest.json"
+    slim_paths = resolve_slim_cache_paths(output_dir, config)
+
+    if bool(config.get("force", False)):
+        _reset_segmentation_outputs(segments_dir=segments_dir, slim_root=slim_paths.root)
+
+    existing_segment_df = _read_optional_table(table_base)
+    existing_score_df = _read_optional_table(score_base)
+    slim_segment_df = load_slim_index_table(slim_paths)
+    existing_segment_df = compose_segment_index(existing_segment_df, slim_segment_df)
+
+    migration_summary = {"migrated_chunks": 0, "deleted_raw_chunks": 0}
+    if bool(config.get("migrate_existing_segment_chunks", False)) and not existing_segment_df.empty:
+        migration_summary = migrate_existing_segment_chunks(
+            segment_df=existing_segment_df,
+            segments_dir=segments_dir,
+            output_dir=output_dir,
+            config=config,
+            logger=logger,
+        )
+        slim_segment_df = load_slim_index_table(slim_paths)
+        existing_segment_df = compose_segment_index(existing_segment_df, slim_segment_df)
+
+    processed_episode_ids = load_completed_episodes(slim_paths)
+    if not existing_segment_df.empty and "episode_id" in existing_segment_df.columns:
+        processed_episode_ids.update(existing_segment_df["episode_id"].astype(str).tolist())
+
+    segmenter = build_segmenter(config)
+    slim_writer = SlimChunkWriter(
+        output_dir=output_dir,
+        chunk_size=int(config["segment_chunk_size"]),
+        start_chunk_index=next_slim_chunk_index(slim_paths),
+        config=config,
+    )
+    raw_writer = None
+    if bool(config.get("write_full_segment_cache", False)):
+        raw_writer = SegmentChunkWriter(
+            output_dir=segments_dir,
+            chunk_size=int(config["segment_chunk_size"]),
+            start_chunk_index=_next_raw_chunk_index(segments_dir),
+        )
+
+    new_score_rows: list[dict[str, Any]] = []
+    skipped_episodes = 0
+    for row in tqdm(manifest_df.itertuples(index=False), total=len(manifest_df), desc="Segment episodes"):
+        episode_id = str(row.episode_id)
+        if episode_id in processed_episode_ids:
+            skipped_episodes += 1
+            continue
+        episode = load_episode_record(row._asdict())
+        score_events = _load_or_infer_score_events(episode=episode, config=config)
+        new_score_rows.extend([event.as_row() for event in score_events])
+        episode_rows, episode_features, feature_names, episode_targets, episode_target_names, episode_arrays = build_episode_segments(
+            manifest_row=row,
+            episode=episode,
+            score_events=score_events,
+            segmenter=segmenter,
+            config=config,
+        )
+        if raw_writer is not None and episode_rows:
+            episode_rows = raw_writer.write_episode(episode_rows, episode_arrays)
+            for item in episode_rows:
+                item["raw_chunk_path"] = str(item["chunk_path"])
+                item["raw_chunk_index"] = int(item["chunk_index"])
+                item["chunk_path"] = ""
+                item["chunk_index"] = -1
+
+        if episode_rows:
+            flushed = slim_writer.add_episode(
+                segment_rows=episode_rows,
+                feature_matrix=np.stack(episode_features, axis=0).astype(np.float32),
+                feature_names=feature_names,
+                gmr_targets=np.stack(episode_targets, axis=0).astype(np.float32),
+                target_names=episode_target_names,
+            )
+            _record_episode_progress(slim_paths, flushed)
+        else:
+            append_episode_progress(
+                slim_paths,
+                _episode_progress_payload(song_id=str(row.song_id), episode_id=episode_id, num_segments=0),
+            )
+        processed_episode_ids.add(episode_id)
+
+    _record_episode_progress(slim_paths, slim_writer.flush())
+    slim_segment_df = load_slim_index_table(slim_paths)
+    segment_df = compose_segment_index(existing_segment_df, slim_segment_df)
+    score_df = _merge_score_tables(existing_score_df=existing_score_df, new_rows=new_score_rows)
+    write_table(segment_df, table_base)
+    write_table(score_df, score_base)
+    write_json(
+        {
+            "num_segments": int(len(segment_df)),
+            "num_score_events": int(len(score_df)),
+            "chunk_files": sorted(path.name for path in segments_dir.glob("segment_chunk_*.npz")),
+            "slim_chunk_files": collect_slim_chunk_names(slim_paths),
+            "segment_strategy": config["segmentation_strategy"],
+            "write_full_segment_cache": bool(config.get("write_full_segment_cache", False)),
+            "write_slim_cache": True,
+            "migrated_raw_chunks": int(migration_summary["migrated_chunks"]),
+            "deleted_raw_chunks": int(migration_summary["deleted_raw_chunks"]),
+            "skipped_episodes": int(skipped_episodes),
+        },
+        manifest_path,
+    )
+    if logger is not None:
+        logger.info(
+            "Segmented %d episodes into %d segments (%d slim chunks, %d raw chunks kept).",
+            len(processed_episode_ids),
+            len(segment_df),
+            len(collect_slim_chunk_names(slim_paths)),
+            len(list(segments_dir.glob("segment_chunk_*.npz"))),
+        )
+    return {"segment_table_base": table_base, "score_table_base": score_base, "manifest_path": manifest_path}
+
+
+def _reset_segmentation_outputs(segments_dir: Path, slim_root: Path) -> None:
+    if segments_dir.exists():
+        shutil.rmtree(segments_dir)
+    if slim_root.exists():
+        shutil.rmtree(slim_root)
+    segments_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _read_optional_table(base_path: Path) -> pd.DataFrame:
+    if base_path.with_suffix(".parquet").exists() or base_path.with_suffix(".csv").exists():
+        return read_table(base_path)
+    return pd.DataFrame()
+
+
+def _record_episode_progress(slim_paths, payloads: list[dict[str, Any]]) -> None:
+    for payload in payloads:
+        append_episode_progress(slim_paths, payload)
+
+
+def _episode_progress_payload(song_id: str, episode_id: str, num_segments: int) -> dict[str, Any]:
+    return {
+        "song_id": song_id,
+        "episode_id": episode_id,
+        "num_segments": int(num_segments),
+        "status": "completed",
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _merge_score_tables(existing_score_df: pd.DataFrame, new_rows: list[dict[str, Any]]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    if not existing_score_df.empty:
+        frames.append(existing_score_df)
+    if new_rows:
+        frames.append(pd.DataFrame(new_rows))
+    if not frames:
+        return pd.DataFrame()
+    merged = pd.concat(frames, ignore_index=True)
+    if "event_id" in merged.columns:
+        merged = merged.drop_duplicates(subset=["event_id"]).reset_index(drop=True)
+    return merged
+
+
+def _load_or_infer_score_events(episode, config: dict[str, Any]) -> list[ScoreEvent]:
+    if episode.note_path is not None and episode.note_path.exists():
+        try:
+            return load_note_events(
+                episode.note_path,
+                episode.control_timestep,
+                chord_tolerance_steps=int(config["chord_tolerance_steps"]),
+                song_id=episode.song_id,
+                episode_id=episode.episode_id,
+            )
+        except Exception:
+            pass
+    roll = episode.goals if episode.goals is not None else episode.piano_states
+    return infer_events_from_goal_roll(
+        roll,
+        song_id=episode.song_id,
+        episode_id=episode.episode_id,
+        control_timestep=episode.control_timestep,
+        chord_tolerance_steps=int(config["chord_tolerance_steps"]),
+        source="goals" if episode.goals is not None else "piano_states",
+    )
+
+
+def build_episode_segments(
+    manifest_row,
+    episode,
+    score_events: list[ScoreEvent],
+    segmenter: BaseSegmenter,
+    config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[np.ndarray], list[str], list[np.ndarray], list[str], list[dict[str, np.ndarray | None]]]:
+    from sonata.primitives.features import build_feature_vector_from_arrays, resample_time_axis
+
+    if episode.hand_joints is None:
+        return [], [], [], [], [], []
+    rows: list[dict[str, Any]] = []
+    feature_rows: list[np.ndarray] = []
+    feature_names: list[str] = []
+    gmr_targets: list[np.ndarray] = []
+    gmr_target_names: list[str] = []
+    arrays_by_row: list[dict[str, np.ndarray | None]] = []
+    candidate_segments = segmenter.segment(episode, score_events)
+    for index, candidate in enumerate(candidate_segments):
+        arrays = slice_segment_arrays(episode, candidate.onset_step, candidate.end_step)
+        hand_joints = arrays["hand_joints"]
+        if hand_joints is None:
+            continue
+        velocity = arrays["joint_velocities"]
+        if velocity is None:
+            velocity = np.gradient(hand_joints, episode.control_timestep, axis=0).astype(np.float32)
+            arrays["joint_velocities"] = velocity
+        context = score_context_from_roll(episode.goals if episode.goals is not None else episode.piano_states, candidate.onset_step)
+        record = SegmentRecord(
+            segment_id=f"{episode.episode_id}_segment_{index:06d}",
+            song_id=episode.song_id,
+            episode_id=episode.episode_id,
+            onset_step=candidate.onset_step,
+            end_step=candidate.end_step,
+            duration_steps=max(candidate.end_step - candidate.onset_step, 1),
+            segment_source=candidate.segment_source,
+            score_event_id=candidate.score_event_id,
+            key_signature=candidate.key_signature,
+            chunk_path="",
+            chunk_index=-1,
+            heuristic_family=candidate.heuristic_family,
+            motion_energy=float(np.linalg.norm(velocity, axis=1).mean()),
+            chord_size=int(candidate.chord_size),
+            key_center=float(candidate.key_center),
+            start_state_norm=float(np.linalg.norm(hand_joints[0])),
+            end_state_norm=float(np.linalg.norm(hand_joints[-1])),
+            score_context_json=dumps_score_context(context),
+        )
+        row_payload = record.as_row() | {"split": manifest_row.split}
+        feature_vector, names = build_feature_vector_from_arrays(row=row_payload, arrays=arrays, config=config)
+        gmr_target, target_name = build_gmr_target(arrays=arrays, config=config, resample_fn=resample_time_axis)
+        row_payload["gmr_target_name"] = target_name
+        if not feature_names:
+            feature_names = names
+        elif feature_names != names:
+            raise ValueError(f"Incompatible feature names within episode {episode.episode_id}")
+        rows.append(row_payload)
+        feature_rows.append(feature_vector.astype(np.float32))
+        gmr_targets.append(gmr_target.astype(np.float32))
+        gmr_target_names.append(target_name)
+        arrays_by_row.append(arrays)
+    return rows, feature_rows, feature_names, gmr_targets, gmr_target_names, arrays_by_row
+
+
 def slice_segment_arrays(episode, start: int, end: int) -> dict[str, np.ndarray | None]:
     arrays: dict[str, np.ndarray | None] = {}
     for field_name in (
@@ -548,6 +827,171 @@ def slice_segment_arrays(episode, start: int, end: int) -> dict[str, np.ndarray 
         array = getattr(episode, field_name)
         arrays[field_name] = np.asarray(array[start:end], dtype=np.float32) if array is not None else None
     return arrays
+
+
+def load_segment_arrays_from_bundle(bundle: Any, index: int) -> dict[str, np.ndarray | None]:
+    arrays: dict[str, np.ndarray | None] = {}
+    for field_name in (
+        "hand_joints",
+        "joint_velocities",
+        "piano_states",
+        "goals",
+        "actions",
+        "hand_fingertips",
+        "wrist_pose",
+        "hand_pose",
+    ):
+        arrays[field_name] = load_segment_array(bundle, field_name, index)
+    return arrays
+
+
+def migrate_existing_segment_chunks(
+    segment_df: pd.DataFrame,
+    segments_dir: Path,
+    output_dir: Path,
+    config: dict[str, Any],
+    logger: logging.Logger | None = None,
+) -> dict[str, int]:
+    from sonata.primitives.features import build_feature_vector, resample_time_axis
+
+    slim_paths = resolve_slim_cache_paths(output_dir, config)
+    legacy_df = ensure_segment_index_columns(segment_df)
+    legacy_df = legacy_df.loc[~legacy_df["chunk_path"].astype(str).map(lambda value: not value or value == "" or value == "nan" or value == "None")]
+    legacy_df = legacy_df.loc[~legacy_df["chunk_path"].astype(str).map(is_slim_chunk_name)]
+    migrated_chunks = 0
+    deleted_raw_chunks = 0
+    if legacy_df.empty:
+        return {"migrated_chunks": 0, "deleted_raw_chunks": 0}
+    grouped = legacy_df.groupby("chunk_path", sort=True)
+    iterator = tqdm(grouped, total=grouped.ngroups, desc="Migrate segment chunks")
+    for raw_chunk_name, rows in iterator:
+        raw_chunk_path = segments_dir / str(raw_chunk_name)
+        chunk_name = slim_chunk_name(chunk_index_from_name(raw_chunk_name))
+        if slim_chunk_complete(slim_paths, chunk_name):
+            if bool(config.get("delete_raw_chunks_after_migration", False)) and raw_chunk_path.exists():
+                raw_chunk_path.unlink()
+                deleted_raw_chunks += 1
+            continue
+        if not raw_chunk_path.exists():
+            raise FileNotFoundError(f"Missing raw segment chunk for migration: {raw_chunk_path}")
+        bundle = np.load(raw_chunk_path, allow_pickle=True)
+        ordered_rows = rows.sort_values("chunk_index", kind="stable")
+        slim_rows: list[dict[str, Any]] = []
+        feature_rows: list[np.ndarray] = []
+        feature_names: list[str] = []
+        gmr_targets: list[np.ndarray] = []
+        target_names: list[str] = []
+        for row in ordered_rows.itertuples(index=False):
+            arrays = load_segment_arrays_from_bundle(bundle, int(row.chunk_index))
+            feature_vector, names = build_feature_vector(row=row, bundle=bundle, config=config)
+            gmr_target, target_name = build_gmr_target(arrays=arrays, config=config, resample_fn=resample_time_axis)
+            if not feature_names:
+                feature_names = names
+            elif feature_names != names:
+                raise ValueError(f"Incompatible feature names while migrating {raw_chunk_name}")
+            updated = dict(row._asdict())
+            updated["raw_chunk_path"] = str(updated.get("raw_chunk_path") or raw_chunk_name)
+            updated["raw_chunk_index"] = int(updated.get("raw_chunk_index", -1))
+            if updated["raw_chunk_index"] < 0:
+                updated["raw_chunk_index"] = int(row.chunk_index)
+            updated["chunk_path"] = ""
+            updated["chunk_index"] = -1
+            updated["gmr_target_name"] = target_name
+            slim_rows.append(updated)
+            feature_rows.append(feature_vector.astype(np.float32))
+            gmr_targets.append(gmr_target.astype(np.float32))
+            target_names.append(target_name)
+        write_slim_chunk(
+            paths=slim_paths,
+            chunk_name=chunk_name,
+            segment_rows=slim_rows,
+            feature_matrix=np.stack(feature_rows, axis=0).astype(np.float32),
+            feature_names=feature_names,
+            gmr_targets=np.stack(gmr_targets, axis=0).astype(np.float32),
+            target_names=target_names,
+            source_raw_chunk=str(raw_chunk_name),
+            migrated=True,
+        )
+        migrated_chunks += 1
+        if bool(config.get("delete_raw_chunks_after_migration", False)):
+            raw_chunk_path.unlink()
+            deleted_raw_chunks += 1
+        if logger is not None:
+            logger.info("Migrated %s -> %s", raw_chunk_name, chunk_name)
+    return {"migrated_chunks": migrated_chunks, "deleted_raw_chunks": deleted_raw_chunks}
+
+
+@dataclass
+class SlimChunkWriter:
+    output_dir: Path
+    chunk_size: int
+    start_chunk_index: int
+    config: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        self.paths = resolve_slim_cache_paths(self.output_dir, self.config)
+        self.chunk_index = int(self.start_chunk_index)
+        self.buffer_rows: list[dict[str, Any]] = []
+        self.buffer_features: list[np.ndarray] = []
+        self.buffer_targets: list[np.ndarray] = []
+        self.buffer_target_names: list[str] = []
+        self.buffer_episodes: list[dict[str, Any]] = []
+        self.feature_names: list[str] | None = None
+
+    def add_episode(
+        self,
+        segment_rows: list[dict[str, Any]],
+        feature_matrix: np.ndarray,
+        feature_names: list[str],
+        gmr_targets: np.ndarray,
+        target_names: list[str],
+    ) -> list[dict[str, Any]]:
+        flushed: list[dict[str, Any]] = []
+        if not segment_rows:
+            return flushed
+        if self.buffer_rows and len(self.buffer_rows) + len(segment_rows) > self.chunk_size:
+            flushed.extend(self.flush())
+        if self.feature_names is None:
+            self.feature_names = list(feature_names)
+        elif self.feature_names != list(feature_names):
+            raise ValueError("Incompatible feature names encountered while writing slim cache.")
+        self.buffer_rows.extend(segment_rows)
+        self.buffer_features.extend(feature_matrix.astype(np.float32))
+        self.buffer_targets.extend(gmr_targets.astype(np.float32))
+        self.buffer_target_names.extend(str(name) for name in target_names)
+        self.buffer_episodes.append(
+            _episode_progress_payload(
+                song_id=str(segment_rows[0]["song_id"]),
+                episode_id=str(segment_rows[0]["episode_id"]),
+                num_segments=len(segment_rows),
+            )
+        )
+        if len(self.buffer_rows) >= self.chunk_size:
+            flushed.extend(self.flush())
+        return flushed
+
+    def flush(self) -> list[dict[str, Any]]:
+        if not self.buffer_rows:
+            return []
+        if self.feature_names is None:
+            raise ValueError("Cannot flush slim cache without feature names.")
+        write_slim_chunk(
+            paths=self.paths,
+            chunk_name=slim_chunk_name(self.chunk_index),
+            segment_rows=self.buffer_rows,
+            feature_matrix=np.stack(self.buffer_features, axis=0).astype(np.float32),
+            feature_names=self.feature_names,
+            gmr_targets=np.stack(self.buffer_targets, axis=0).astype(np.float32),
+            target_names=self.buffer_target_names,
+        )
+        payloads = list(self.buffer_episodes)
+        self.chunk_index += 1
+        self.buffer_rows = []
+        self.buffer_features = []
+        self.buffer_targets = []
+        self.buffer_target_names = []
+        self.buffer_episodes = []
+        return payloads
 
 
 @dataclass
@@ -602,6 +1046,18 @@ class SegmentChunkWriter:
         self.buffer_rows = []
         self.buffer_arrays = []
         return flushed_rows
+
+    def write_episode(self, rows: list[dict[str, Any]], arrays: list[dict[str, np.ndarray | None]]) -> list[dict[str, Any]]:
+        if self.buffer_rows or self.buffer_arrays:
+            raise ValueError("SegmentChunkWriter.write_episode expects an empty buffer.")
+        self.buffer_rows = [dict(row) for row in rows]
+        self.buffer_arrays = list(arrays)
+        return self.flush()
+
+
+def _next_raw_chunk_index(segments_dir: Path) -> int:
+    chunk_ids = [chunk_index_from_name(path.name) for path in segments_dir.glob("segment_chunk_*.npz")]
+    return max(chunk_ids) + 1 if chunk_ids else 0
 
 
 def stack_variable(arrays: list[np.ndarray | None]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

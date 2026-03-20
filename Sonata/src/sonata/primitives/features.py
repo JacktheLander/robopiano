@@ -144,17 +144,28 @@ def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, outpu
 
 def build_feature_vector(row, bundle: Any, config: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
     idx = int(row.chunk_index)
-    hand_joints = load_segment_array(bundle, "hand_joints", idx)
-    velocity = load_segment_array(bundle, "joint_velocities", idx)
-    actions = load_segment_array(bundle, "actions", idx)
-    goals = load_segment_array(bundle, "goals", idx)
-    piano_states = load_segment_array(bundle, "piano_states", idx)
+    arrays = {
+        "hand_joints": load_segment_array(bundle, "hand_joints", idx),
+        "joint_velocities": load_segment_array(bundle, "joint_velocities", idx),
+        "actions": load_segment_array(bundle, "actions", idx),
+        "goals": load_segment_array(bundle, "goals", idx),
+        "piano_states": load_segment_array(bundle, "piano_states", idx),
+    }
+    return build_feature_vector_from_arrays(row=row, arrays=arrays, config=config)
+
+
+def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | None], config: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
+    hand_joints = arrays.get("hand_joints")
+    velocity = arrays.get("joint_velocities")
+    actions = arrays.get("actions")
+    goals = arrays.get("goals")
+    piano_states = arrays.get("piano_states")
     if hand_joints is None:
-        raise ValueError(f"Missing hand_joints for segment {row.segment_id}")
+        raise ValueError(f"Missing hand_joints for segment {_row_value(row, 'segment_id')}")
     if velocity is None:
         velocity = np.gradient(hand_joints, axis=0).astype(np.float32)
     acceleration = np.gradient(velocity, axis=0).astype(np.float32)
-    score_context = json.loads(row.score_context_json)
+    score_context = json.loads(str(_row_value(row, "score_context_json")))
     contact_roll = goals if goals is not None else piano_states
     contact_roll = np.asarray(contact_roll[:, :-1] > 0.5, dtype=np.float32) if contact_roll is not None else np.zeros((hand_joints.shape[0], 88), dtype=np.float32)
 
@@ -203,12 +214,12 @@ def build_feature_vector(row, bundle: Any, config: dict[str, Any]) -> tuple[np.n
         [
             float(score_context.get("active_ratio", 0.0)),
             float(score_context.get("future_density", 0.0)),
-            float(row.duration_steps),
-            float(row.motion_energy),
-            float(row.chord_size),
-            float(row.key_center),
-            float(row.start_state_norm),
-            float(row.end_state_norm),
+            float(_row_value(row, "duration_steps")),
+            float(_row_value(row, "motion_energy")),
+            float(_row_value(row, "chord_size")),
+            float(_row_value(row, "key_center")),
+            float(_row_value(row, "start_state_norm")),
+            float(_row_value(row, "end_state_norm")),
         ],
         dtype=np.float32,
     )
@@ -236,6 +247,12 @@ def build_feature_vector(row, bundle: Any, config: dict[str, Any]) -> tuple[np.n
     )
     names.extend(["contact_mean", "contact_density", "contact_nonzero_ratio"])
     return np.concatenate(pieces).astype(np.float32), names
+
+
+def _row_value(row: Any, name: str) -> Any:
+    if isinstance(row, dict):
+        return row[name]
+    return getattr(row, name)
 
 
 def resample_time_axis(array: np.ndarray, steps: int) -> np.ndarray:

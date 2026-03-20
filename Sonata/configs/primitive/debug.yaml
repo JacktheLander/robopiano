@@ -22,6 +22,14 @@ alignment_radius: 3
 dtw_template_window: 16
 chord_tolerance_steps: 1
 segment_chunk_size: 256
+write_full_segment_cache: false
+write_slim_cache: true
+migrate_existing_segment_chunks: true
+delete_raw_chunks_after_migration: false
+slim_cache_dir: slim
+slim_feature_dir: features
+slim_gmr_target_dir: gmr_targets
+slim_index_dir: index
 trajectory_resample_steps: 16
 include_action_trajectory: true
 fallback_action_dim: 39

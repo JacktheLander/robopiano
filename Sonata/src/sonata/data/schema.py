@@ -101,6 +101,9 @@ class SegmentRecord:
     start_state_norm: float
     end_state_norm: float
     score_context_json: str
+    raw_chunk_path: str = ""
+    raw_chunk_index: int = -1
+    gmr_target_name: str = ""
 
     def as_row(self) -> dict[str, Any]:
         return asdict(self)
