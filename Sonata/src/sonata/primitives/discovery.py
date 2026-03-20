@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,12 @@ from sonata.primitives.visualization import plot_gmr_reconstruction, plot_primit
 from sonata.utils.io import read_table, save_npz, write_json, write_table
 from sonata.utils.wandb import WandbRun
 
+def _read_stage_status(manifest_path: Path) -> str:
+    if not manifest_path.exists():
+        return "missing"
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return str(payload.get("status", "unknown"))
 
 def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> dict[str, Path]:
     data_output = Path(config["data_output_root"]).resolve()
@@ -44,9 +51,22 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
         if not manifest_base.with_suffix(".csv").exists():
             scan_dataset(config=config["data_config"], logger=logger)
         manifest_df = load_manifest(manifest_base)
-        segment_outputs = run_segmentation(manifest_df=manifest_df, output_dir=primitive_root, config=config, logger=logger)
+        
+        segment_outputs = run_segmentation(manifest_df=manifest_df, output_dir=primitive_root, config=config)
+        if _read_stage_status(segment_outputs["manifest_path"]) != "completed":
+            raise RuntimeError("Segmentation did not complete successfully; resume Stage 1 before continuing.")
+
         segment_df = read_table(segment_outputs["segment_table_base"])
-        feature_outputs = extract_segment_features(segment_df=segment_df, segments_dir=primitive_root / "segments", output_dir=primitive_root, config=config)
+
+        feature_outputs = extract_segment_features(
+            segment_df=segment_df,
+            segments_dir=primitive_root / "segments",
+            output_dir=primitive_root,
+            config=config,
+        )
+        if _read_stage_status(feature_outputs["manifest_path"]) != "completed":
+            raise RuntimeError("Feature extraction did not complete successfully; resume Stage 1 before continuing.")
+            
         feature_bundle = np.load(feature_outputs["feature_bundle_path"], allow_pickle=True)
         feature_matrix = np.asarray(feature_bundle["feature_matrix"], dtype=np.float32)
         feature_names = [str(item) for item in feature_bundle["feature_names"].tolist()]
