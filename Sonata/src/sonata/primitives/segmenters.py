@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 import pandas as pd
@@ -20,14 +19,22 @@ from sonata.primitives.slim_cache import (
     build_gmr_target,
     chunk_index_from_name,
     collect_slim_chunk_names,
+    compact_store_manifest_path,
     compose_segment_index,
     ensure_segment_index_columns,
+    list_incomplete_slim_chunks,
     load_completed_episodes,
+    read_compact_store_manifest,
     load_slim_index_table,
     next_slim_chunk_index,
+    online_segment_processing_enabled,
     resolve_slim_cache_paths,
+    resolve_online_storage_format,
+    save_raw_segment_chunks_enabled,
     slim_chunk_complete,
     slim_chunk_name,
+    summarize_slim_cache,
+    write_compact_store_manifest,
     write_slim_chunk,
 )
 from sonata.utils.io import read_table, save_npz, write_json, write_table
@@ -43,6 +50,17 @@ class CandidateSegment:
     heuristic_family: str
     chord_size: int
     key_center: float
+
+
+@dataclass
+class PreparedSegment:
+    row: dict[str, Any]
+    feature_vector: np.ndarray
+    feature_names: list[str]
+    gmr_target: np.ndarray
+    gmr_target_name: str
+    arrays: dict[str, np.ndarray | None]
+    raw_bytes_estimate: int
 
 
 class BaseSegmenter:
@@ -352,7 +370,7 @@ def _validate_existing_chunks(segments_dir: Path, chunk_files: list[str]) -> lis
     return valid
 
 def run_segmentation(manifest_df: pd.DataFrame, output_dir: Path, config: dict[str, Any], logger: logging.Logger | None = None) -> dict[str, Path]:
-    if not bool(config.get("write_slim_cache", True)):
+    if not online_segment_processing_enabled(config):
         return run_segmentation_legacy(manifest_df=manifest_df, output_dir=output_dir, config=config)
     return run_segmentation_slim(manifest_df=manifest_df, output_dir=output_dir, config=config, logger=logger)
 
@@ -569,6 +587,7 @@ def run_segmentation_slim(
     score_base = segments_dir / "score_events"
     manifest_path = segments_dir / "segment_manifest.json"
     slim_paths = resolve_slim_cache_paths(output_dir, config)
+    compact_manifest_path = compact_store_manifest_path(slim_paths)
 
     if bool(config.get("force", False)):
         _reset_segmentation_outputs(segments_dir=segments_dir, slim_root=slim_paths.root)
@@ -577,8 +596,13 @@ def run_segmentation_slim(
     existing_score_df = _read_optional_table(score_base)
     slim_segment_df = load_slim_index_table(slim_paths)
     existing_segment_df = compose_segment_index(existing_segment_df, slim_segment_df)
+    previous_store_manifest = read_compact_store_manifest(slim_paths)
 
-    migration_summary = {"migrated_chunks": 0, "deleted_raw_chunks": 0}
+    incomplete_chunks = list_incomplete_slim_chunks(slim_paths)
+    if incomplete_chunks and logger is not None:
+        logger.warning("Ignoring %d incomplete online Stage 1 chunk(s) during resume.", len(incomplete_chunks))
+
+    migration_summary = {"migrated_chunks": 0, "deleted_raw_chunks": 0, "source_raw_bytes": 0}
     if bool(config.get("migrate_existing_segment_chunks", False)) and not existing_segment_df.empty:
         migration_summary = migrate_existing_segment_chunks(
             segment_df=existing_segment_df,
@@ -595,14 +619,15 @@ def run_segmentation_slim(
         processed_episode_ids.update(existing_segment_df["episode_id"].astype(str).tolist())
 
     segmenter = build_segmenter(config)
-    slim_writer = SlimChunkWriter(
+    slim_writer = OnlineSegmentWriter(
         output_dir=output_dir,
         chunk_size=int(config["segment_chunk_size"]),
         start_chunk_index=next_slim_chunk_index(slim_paths),
         config=config,
+        logger=logger,
     )
     raw_writer = None
-    if bool(config.get("write_full_segment_cache", False)):
+    if save_raw_segment_chunks_enabled(config):
         raw_writer = SegmentChunkWriter(
             output_dir=segments_dir,
             chunk_size=int(config["segment_chunk_size"]),
@@ -619,41 +644,110 @@ def run_segmentation_slim(
         episode = load_episode_record(row._asdict())
         score_events = _load_or_infer_score_events(episode=episode, config=config)
         new_score_rows.extend([event.as_row() for event in score_events])
-        episode_rows, episode_features, feature_names, episode_targets, episode_target_names, episode_arrays = build_episode_segments(
-            manifest_row=row,
-            episode=episode,
-            score_events=score_events,
-            segmenter=segmenter,
-            config=config,
-        )
-        if raw_writer is not None and episode_rows:
-            episode_rows = raw_writer.write_episode(episode_rows, episode_arrays)
-            for item in episode_rows:
-                item["raw_chunk_path"] = str(item["chunk_path"])
-                item["raw_chunk_index"] = int(item["chunk_index"])
-                item["chunk_path"] = ""
-                item["chunk_index"] = -1
-
-        if episode_rows:
-            flushed = slim_writer.add_episode(
-                segment_rows=episode_rows,
-                feature_matrix=np.stack(episode_features, axis=0).astype(np.float32),
-                feature_names=feature_names,
-                gmr_targets=np.stack(episode_targets, axis=0).astype(np.float32),
-                target_names=episode_target_names,
-            )
-            _record_episode_progress(slim_paths, flushed)
+        if raw_writer is None:
+            produced_segments = 0
+            for segment in iter_prepared_segments(
+                manifest_row=row,
+                episode=episode,
+                score_events=score_events,
+                segmenter=segmenter,
+                config=config,
+            ):
+                if produced_segments == 0:
+                    slim_writer.begin_episode(song_id=str(row.song_id), episode_id=episode_id)
+                slim_writer.append_segment(
+                    row=segment.row,
+                    feature_vector=segment.feature_vector,
+                    feature_names=segment.feature_names,
+                    gmr_target=segment.gmr_target,
+                    target_name=segment.gmr_target_name,
+                    raw_segment_bytes=segment.raw_bytes_estimate,
+                )
+                produced_segments += 1
+            if produced_segments:
+                _record_episode_progress(slim_paths, slim_writer.end_episode())
+            else:
+                append_episode_progress(
+                    slim_paths,
+                    _episode_progress_payload(song_id=str(row.song_id), episode_id=episode_id, num_segments=0),
+                )
         else:
-            append_episode_progress(
-                slim_paths,
-                _episode_progress_payload(song_id=str(row.song_id), episode_id=episode_id, num_segments=0),
+            prepared_segments = list(
+                iter_prepared_segments(
+                    manifest_row=row,
+                    episode=episode,
+                    score_events=score_events,
+                    segmenter=segmenter,
+                    config=config,
+                )
             )
+            if not prepared_segments:
+                append_episode_progress(
+                    slim_paths,
+                    _episode_progress_payload(song_id=str(row.song_id), episode_id=episode_id, num_segments=0),
+                )
+                processed_episode_ids.add(episode_id)
+                continue
+            raw_rows = raw_writer.write_episode(
+                rows=[dict(segment.row) for segment in prepared_segments],
+                arrays=[segment.arrays for segment in prepared_segments],
+            )
+            slim_writer.begin_episode(song_id=str(row.song_id), episode_id=episode_id)
+            for segment, raw_row in zip(prepared_segments, raw_rows):
+                row_payload = dict(segment.row)
+                row_payload["raw_chunk_path"] = str(raw_row["chunk_path"])
+                row_payload["raw_chunk_index"] = int(raw_row["chunk_index"])
+                slim_writer.append_segment(
+                    row=row_payload,
+                    feature_vector=segment.feature_vector,
+                    feature_names=segment.feature_names,
+                    gmr_target=segment.gmr_target,
+                    target_name=segment.gmr_target_name,
+                    raw_segment_bytes=segment.raw_bytes_estimate,
+                )
+            _record_episode_progress(slim_paths, slim_writer.end_episode())
         processed_episode_ids.add(episode_id)
 
     _record_episode_progress(slim_paths, slim_writer.flush())
     slim_segment_df = load_slim_index_table(slim_paths)
     segment_df = compose_segment_index(existing_segment_df, slim_segment_df)
     score_df = _merge_score_tables(existing_score_df=existing_score_df, new_rows=new_score_rows)
+    store_summary = summarize_slim_cache(slim_paths)
+    total_raw_estimate = int(previous_store_manifest.get("estimated_raw_segment_bytes", 0))
+    total_raw_estimate += int(migration_summary.get("source_raw_bytes", 0))
+    total_raw_estimate += int(slim_writer.stats["estimated_raw_segment_bytes"])
+    estimated_bytes_per_1k = float(store_summary["total_bytes_on_disk"] * 1000.0 / max(store_summary["num_segments"], 1))
+    estimated_reduction = (
+        float(total_raw_estimate / max(store_summary["total_bytes_on_disk"], 1))
+        if total_raw_estimate > 0 and store_summary["total_bytes_on_disk"] > 0
+        else None
+    )
+    compact_manifest = {
+        "status": "completed",
+        "online_segment_processing": True,
+        "save_raw_segment_chunks": save_raw_segment_chunks_enabled(config),
+        "online_storage_format": resolve_online_storage_format(config),
+        "num_segments": int(store_summary["num_segments"]),
+        "num_chunks": int(store_summary["num_chunks"]),
+        "feature_dim": int(store_summary["feature_dim"]),
+        "gmr_target_steps": int(store_summary["gmr_horizon"]),
+        "gmr_target_dim": int(store_summary["gmr_dim"]),
+        "episodes_completed": int(len(load_completed_episodes(slim_paths))),
+        "episodes_processed_this_run": int(slim_writer.stats["episodes_processed"]),
+        "segments_written_this_run": int(slim_writer.stats["segments_written"]),
+        "feature_rows_written_this_run": int(slim_writer.stats["feature_rows_written"]),
+        "bytes_written_this_run": int(slim_writer.stats["bytes_written"]),
+        "total_bytes_on_disk": int(store_summary["total_bytes_on_disk"]),
+        "bytes_per_1000_segments": estimated_bytes_per_1k,
+        "estimated_raw_segment_bytes": int(total_raw_estimate),
+        "estimated_storage_reduction_vs_legacy": estimated_reduction,
+        "incomplete_chunks_ignored": store_summary["incomplete_chunks"],
+        "migrated_raw_chunks": int(migration_summary["migrated_chunks"]),
+        "deleted_raw_chunks": int(migration_summary["deleted_raw_chunks"]),
+        "skipped_episodes": int(skipped_episodes),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_compact_store_manifest(slim_paths, compact_manifest)
     write_table(segment_df, table_base)
     write_table(score_df, score_base)
     write_json(
@@ -661,25 +755,43 @@ def run_segmentation_slim(
             "num_segments": int(len(segment_df)),
             "num_score_events": int(len(score_df)),
             "chunk_files": sorted(path.name for path in segments_dir.glob("segment_chunk_*.npz")),
-            "slim_chunk_files": collect_slim_chunk_names(slim_paths),
+            "slim_chunk_files": collect_slim_chunk_names(slim_paths, completed_only=True),
             "segment_strategy": config["segmentation_strategy"],
-            "write_full_segment_cache": bool(config.get("write_full_segment_cache", False)),
+            "online_segment_processing": True,
+            "save_raw_segment_chunks": save_raw_segment_chunks_enabled(config),
+            "online_storage_format": resolve_online_storage_format(config),
+            "feature_dim": int(store_summary["feature_dim"]),
+            "gmr_target_steps": int(store_summary["gmr_horizon"]),
+            "gmr_target_dim": int(store_summary["gmr_dim"]),
+            "compact_store_total_bytes": int(store_summary["total_bytes_on_disk"]),
+            "compact_store_manifest_path": str(compact_manifest_path.resolve()),
+            "bytes_per_1000_segments": estimated_bytes_per_1k,
+            "estimated_storage_reduction_vs_legacy": estimated_reduction,
+            "write_full_segment_cache": save_raw_segment_chunks_enabled(config),
             "write_slim_cache": True,
             "migrated_raw_chunks": int(migration_summary["migrated_chunks"]),
             "deleted_raw_chunks": int(migration_summary["deleted_raw_chunks"]),
             "skipped_episodes": int(skipped_episodes),
+            "incomplete_chunks_ignored": store_summary["incomplete_chunks"],
         },
         manifest_path,
     )
     if logger is not None:
         logger.info(
-            "Segmented %d episodes into %d segments (%d slim chunks, %d raw chunks kept).",
+            "Segmented %d episodes into %d segments (%d online chunks, %d raw chunks kept, %.2f MiB compact store, %.2f MiB/1k segments).",
             len(processed_episode_ids),
             len(segment_df),
-            len(collect_slim_chunk_names(slim_paths)),
+            len(collect_slim_chunk_names(slim_paths, completed_only=True)),
             len(list(segments_dir.glob("segment_chunk_*.npz"))),
+            store_summary["total_bytes_on_disk"] / (1024.0 * 1024.0),
+            estimated_bytes_per_1k / (1024.0 * 1024.0),
         )
-    return {"segment_table_base": table_base, "score_table_base": score_base, "manifest_path": manifest_path}
+    return {
+        "segment_table_base": table_base,
+        "score_table_base": score_base,
+        "manifest_path": manifest_path,
+        "compact_store_manifest_path": compact_manifest_path,
+    }
 
 
 def _reset_segmentation_outputs(segments_dir: Path, slim_root: Path) -> None:
@@ -738,6 +850,8 @@ def _load_or_infer_score_events(episode, config: dict[str, Any]) -> list[ScoreEv
         except Exception:
             pass
     roll = episode.goals if episode.goals is not None else episode.piano_states
+    if roll is None:
+        return []
     return infer_events_from_goal_roll(
         roll,
         song_id=episode.song_id,
@@ -748,23 +862,18 @@ def _load_or_infer_score_events(episode, config: dict[str, Any]) -> list[ScoreEv
     )
 
 
-def build_episode_segments(
+def iter_prepared_segments(
     manifest_row,
     episode,
     score_events: list[ScoreEvent],
     segmenter: BaseSegmenter,
     config: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[np.ndarray], list[str], list[np.ndarray], list[str], list[dict[str, np.ndarray | None]]]:
-    from sonata.primitives.features import build_feature_vector_from_arrays, resample_time_axis
+) -> Iterator[PreparedSegment]:
+    from sonata.primitives.features import build_feature_vector_from_arrays, build_gmr_target_from_arrays
 
     if episode.hand_joints is None:
-        return [], [], [], [], [], []
-    rows: list[dict[str, Any]] = []
-    feature_rows: list[np.ndarray] = []
+        return
     feature_names: list[str] = []
-    gmr_targets: list[np.ndarray] = []
-    gmr_target_names: list[str] = []
-    arrays_by_row: list[dict[str, np.ndarray | None]] = []
     candidate_segments = segmenter.segment(episode, score_events)
     for index, candidate in enumerate(candidate_segments):
         arrays = slice_segment_arrays(episode, candidate.onset_step, candidate.end_step)
@@ -798,18 +907,25 @@ def build_episode_segments(
         )
         row_payload = record.as_row() | {"split": manifest_row.split}
         feature_vector, names = build_feature_vector_from_arrays(row=row_payload, arrays=arrays, config=config)
-        gmr_target, target_name = build_gmr_target(arrays=arrays, config=config, resample_fn=resample_time_axis)
+        gmr_target, target_name = build_gmr_target_from_arrays(arrays=arrays, config=config)
         row_payload["gmr_target_name"] = target_name
         if not feature_names:
             feature_names = names
         elif feature_names != names:
             raise ValueError(f"Incompatible feature names within episode {episode.episode_id}")
-        rows.append(row_payload)
-        feature_rows.append(feature_vector.astype(np.float32))
-        gmr_targets.append(gmr_target.astype(np.float32))
-        gmr_target_names.append(target_name)
-        arrays_by_row.append(arrays)
-    return rows, feature_rows, feature_names, gmr_targets, gmr_target_names, arrays_by_row
+        yield PreparedSegment(
+            row=row_payload,
+            feature_vector=feature_vector.astype(np.float32),
+            feature_names=list(names),
+            gmr_target=gmr_target.astype(np.float32),
+            gmr_target_name=target_name,
+            arrays=arrays,
+            raw_bytes_estimate=estimate_segment_storage_bytes(arrays),
+        )
+
+
+def estimate_segment_storage_bytes(arrays: dict[str, np.ndarray | None]) -> int:
+    return int(sum(array.nbytes for array in arrays.values() if array is not None))
 
 
 def slice_segment_arrays(episode, start: int, end: int) -> dict[str, np.ndarray | None]:
@@ -852,7 +968,7 @@ def migrate_existing_segment_chunks(
     config: dict[str, Any],
     logger: logging.Logger | None = None,
 ) -> dict[str, int]:
-    from sonata.primitives.features import build_feature_vector, resample_time_axis
+    from sonata.primitives.features import build_feature_vector
 
     slim_paths = resolve_slim_cache_paths(output_dir, config)
     legacy_df = ensure_segment_index_columns(segment_df)
@@ -860,8 +976,9 @@ def migrate_existing_segment_chunks(
     legacy_df = legacy_df.loc[~legacy_df["chunk_path"].astype(str).map(is_slim_chunk_name)]
     migrated_chunks = 0
     deleted_raw_chunks = 0
+    source_raw_bytes = 0
     if legacy_df.empty:
-        return {"migrated_chunks": 0, "deleted_raw_chunks": 0}
+        return {"migrated_chunks": 0, "deleted_raw_chunks": 0, "source_raw_bytes": 0}
     grouped = legacy_df.groupby("chunk_path", sort=True)
     iterator = tqdm(grouped, total=grouped.ngroups, desc="Migrate segment chunks")
     for raw_chunk_name, rows in iterator:
@@ -874,6 +991,7 @@ def migrate_existing_segment_chunks(
             continue
         if not raw_chunk_path.exists():
             raise FileNotFoundError(f"Missing raw segment chunk for migration: {raw_chunk_path}")
+        source_raw_bytes += int(raw_chunk_path.stat().st_size)
         bundle = np.load(raw_chunk_path, allow_pickle=True)
         ordered_rows = rows.sort_values("chunk_index", kind="stable")
         slim_rows: list[dict[str, Any]] = []
@@ -884,7 +1002,7 @@ def migrate_existing_segment_chunks(
         for row in ordered_rows.itertuples(index=False):
             arrays = load_segment_arrays_from_bundle(bundle, int(row.chunk_index))
             feature_vector, names = build_feature_vector(row=row, bundle=bundle, config=config)
-            gmr_target, target_name = build_gmr_target(arrays=arrays, config=config, resample_fn=resample_time_axis)
+            gmr_target, target_name = build_gmr_target(arrays=arrays, config=config)
             if not feature_names:
                 feature_names = names
             elif feature_names != names:
@@ -918,15 +1036,20 @@ def migrate_existing_segment_chunks(
             deleted_raw_chunks += 1
         if logger is not None:
             logger.info("Migrated %s -> %s", raw_chunk_name, chunk_name)
-    return {"migrated_chunks": migrated_chunks, "deleted_raw_chunks": deleted_raw_chunks}
+    return {
+        "migrated_chunks": migrated_chunks,
+        "deleted_raw_chunks": deleted_raw_chunks,
+        "source_raw_bytes": int(source_raw_bytes),
+    }
 
 
 @dataclass
-class SlimChunkWriter:
+class OnlineSegmentWriter:
     output_dir: Path
     chunk_size: int
     start_chunk_index: int
     config: dict[str, Any]
+    logger: logging.Logger | None = None
 
     def __post_init__(self) -> None:
         self.paths = resolve_slim_cache_paths(self.output_dir, self.config)
@@ -937,53 +1060,99 @@ class SlimChunkWriter:
         self.buffer_target_names: list[str] = []
         self.buffer_episodes: list[dict[str, Any]] = []
         self.feature_names: list[str] | None = None
+        self.current_episode_song_id: str | None = None
+        self.current_episode_id: str | None = None
+        self.current_episode_segments = 0
+        self.stats: dict[str, float] = {
+            "episodes_processed": 0,
+            "segments_written": 0,
+            "feature_rows_written": 0,
+            "bytes_written": 0,
+            "estimated_raw_segment_bytes": 0,
+        }
 
-    def add_episode(
+    def begin_episode(self, song_id: str, episode_id: str) -> None:
+        if self.current_episode_id is not None:
+            raise ValueError("Cannot begin a new episode before ending the current one.")
+        self.current_episode_song_id = song_id
+        self.current_episode_id = episode_id
+        self.current_episode_segments = 0
+
+    def append_segment(
         self,
-        segment_rows: list[dict[str, Any]],
-        feature_matrix: np.ndarray,
+        row: dict[str, Any],
+        feature_vector: np.ndarray,
         feature_names: list[str],
-        gmr_targets: np.ndarray,
-        target_names: list[str],
-    ) -> list[dict[str, Any]]:
-        flushed: list[dict[str, Any]] = []
-        if not segment_rows:
-            return flushed
-        if self.buffer_rows and len(self.buffer_rows) + len(segment_rows) > self.chunk_size:
-            flushed.extend(self.flush())
+        gmr_target: np.ndarray,
+        target_name: str,
+        raw_segment_bytes: int,
+    ) -> None:
+        if self.current_episode_id is None or self.current_episode_song_id is None:
+            raise ValueError("OnlineSegmentWriter.append_segment requires begin_episode() first.")
         if self.feature_names is None:
             self.feature_names = list(feature_names)
         elif self.feature_names != list(feature_names):
-            raise ValueError("Incompatible feature names encountered while writing slim cache.")
-        self.buffer_rows.extend(segment_rows)
-        self.buffer_features.extend(feature_matrix.astype(np.float32))
-        self.buffer_targets.extend(gmr_targets.astype(np.float32))
-        self.buffer_target_names.extend(str(name) for name in target_names)
+            raise ValueError("Incompatible feature names encountered while writing the online Stage 1 store.")
+        self.buffer_rows.append(dict(row))
+        self.buffer_features.append(np.asarray(feature_vector, dtype=np.float32))
+        self.buffer_targets.append(np.asarray(gmr_target, dtype=np.float32))
+        self.buffer_target_names.append(str(target_name))
+        self.current_episode_segments += 1
+        self.stats["estimated_raw_segment_bytes"] += int(raw_segment_bytes)
+
+    def end_episode(self) -> list[dict[str, Any]]:
+        if self.current_episode_id is None or self.current_episode_song_id is None:
+            raise ValueError("Cannot end an episode before begin_episode().")
+        payloads: list[dict[str, Any]] = []
         self.buffer_episodes.append(
             _episode_progress_payload(
-                song_id=str(segment_rows[0]["song_id"]),
-                episode_id=str(segment_rows[0]["episode_id"]),
-                num_segments=len(segment_rows),
+                song_id=self.current_episode_song_id,
+                episode_id=self.current_episode_id,
+                num_segments=self.current_episode_segments,
             )
         )
+        self.stats["episodes_processed"] += 1
+        self.current_episode_song_id = None
+        self.current_episode_id = None
+        self.current_episode_segments = 0
         if len(self.buffer_rows) >= self.chunk_size:
-            flushed.extend(self.flush())
-        return flushed
+            payloads.extend(self.flush())
+        return payloads
 
     def flush(self) -> list[dict[str, Any]]:
         if not self.buffer_rows:
             return []
         if self.feature_names is None:
-            raise ValueError("Cannot flush slim cache without feature names.")
+            raise ValueError("Cannot flush the online Stage 1 store without feature names.")
+        chunk_name = slim_chunk_name(self.chunk_index)
         write_slim_chunk(
             paths=self.paths,
-            chunk_name=slim_chunk_name(self.chunk_index),
+            chunk_name=chunk_name,
             segment_rows=self.buffer_rows,
             feature_matrix=np.stack(self.buffer_features, axis=0).astype(np.float32),
             feature_names=self.feature_names,
             gmr_targets=np.stack(self.buffer_targets, axis=0).astype(np.float32),
             target_names=self.buffer_target_names,
         )
+        chunk_bytes = int(sum(path.stat().st_size for path in (
+            self.paths.feature_dir / chunk_name,
+            self.paths.gmr_target_dir / chunk_name,
+            self.paths.index_dir / f"{Path(chunk_name).stem}.csv",
+            self.paths.manifest_dir / f"{Path(chunk_name).stem}.json",
+        ) if path.exists()))
+        self.stats["segments_written"] += len(self.buffer_rows)
+        self.stats["feature_rows_written"] += len(self.buffer_rows)
+        self.stats["bytes_written"] += chunk_bytes
+        if self.logger is not None:
+            per_1k = float(self.stats["bytes_written"] * 1000.0 / max(int(self.stats["segments_written"]), 1))
+            self.logger.info(
+                "Online Stage 1 wrote %d episodes / %d segments / %d feature rows, %.2f MiB total, %.2f MiB per 1k segments.",
+                int(self.stats["episodes_processed"]),
+                int(self.stats["segments_written"]),
+                int(self.stats["feature_rows_written"]),
+                float(self.stats["bytes_written"]) / (1024.0 * 1024.0),
+                per_1k / (1024.0 * 1024.0),
+            )
         payloads = list(self.buffer_episodes)
         self.chunk_index += 1
         self.buffer_rows = []

@@ -17,7 +17,7 @@ from sonata.utils.logging import configure_logging
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Migrate Sonata Stage 1 raw segment chunks into the slim cache.")
+    parser = argparse.ArgumentParser(description="Migrate Sonata Stage 1 raw segment chunks into the online compact store.")
     parser.add_argument("--profile", default="debug")
     parser.add_argument("--config", default=None)
     parser.add_argument("--output-root", default=None)
@@ -33,6 +33,9 @@ def main() -> None:
     if args.output_root is not None:
         config["output_root"] = args.output_root
     config["output_root"] = str(resolve_path(config["output_root"], config_dir))
+    config["online_segment_processing"] = True
+    config["save_raw_segment_chunks"] = False
+    config["online_storage_format"] = config.get("online_storage_format", "npz_shards")
     config["write_slim_cache"] = True
     config["migrate_existing_segment_chunks"] = True
     if args.delete_raw:
@@ -61,6 +64,9 @@ def main() -> None:
     manifest = read_json(manifest_path) if manifest_path.exists() else {}
     manifest.update(
         {
+            "online_segment_processing": True,
+            "save_raw_segment_chunks": False,
+            "online_storage_format": config["online_storage_format"],
             "write_slim_cache": True,
             "migrated_raw_chunks": int(summary["migrated_chunks"]),
             "deleted_raw_chunks": int(summary["deleted_raw_chunks"]),
@@ -69,7 +75,7 @@ def main() -> None:
     )
     write_json(manifest, manifest_path)
     logger.info(
-        "Migrated %d raw chunks into %d slim chunks.",
+        "Migrated %d raw chunks into %d online compact chunks.",
         summary["migrated_chunks"],
         len(collect_slim_chunk_names(slim_paths)),
     )

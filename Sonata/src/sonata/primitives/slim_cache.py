@@ -16,6 +16,7 @@ SEGMENT_INDEX_DEFAULTS: dict[str, Any] = {
     "raw_chunk_index": -1,
     "gmr_target_name": "",
 }
+ONLINE_STORAGE_FORMATS = {"npz", "npz_shards"}
 
 
 @dataclass(frozen=True)
@@ -28,13 +29,28 @@ class SlimCachePaths:
     progress_dir: Path
 
 
+def online_segment_processing_enabled(config: dict[str, Any]) -> bool:
+    return bool(config.get("online_segment_processing", config.get("write_slim_cache", True)))
+
+
+def save_raw_segment_chunks_enabled(config: dict[str, Any]) -> bool:
+    return bool(config.get("save_raw_segment_chunks", config.get("write_full_segment_cache", False)))
+
+
+def resolve_online_storage_format(config: dict[str, Any]) -> str:
+    value = str(config.get("online_storage_format", "npz_shards"))
+    if value not in ONLINE_STORAGE_FORMATS:
+        raise ValueError(f"Unsupported Sonata online storage format: {value}")
+    return value
+
+
 def resolve_slim_cache_paths(output_dir: Path, config: dict[str, Any]) -> SlimCachePaths:
-    root = output_dir / str(config.get("slim_cache_dir", "slim"))
+    root = output_dir / str(config.get("online_cache_dir", config.get("slim_cache_dir", "slim")))
     return SlimCachePaths(
         root=root,
-        feature_dir=root / str(config.get("slim_feature_dir", "features")),
-        gmr_target_dir=root / str(config.get("slim_gmr_target_dir", "gmr_targets")),
-        index_dir=root / str(config.get("slim_index_dir", "index")),
+        feature_dir=root / str(config.get("online_feature_dir", config.get("slim_feature_dir", "features"))),
+        gmr_target_dir=root / str(config.get("online_gmr_target_dir", config.get("slim_gmr_target_dir", "gmr_targets"))),
+        index_dir=root / str(config.get("online_index_dir", config.get("slim_index_dir", "index"))),
         manifest_dir=root / "manifests",
         progress_dir=root / "progress",
     )
@@ -81,6 +97,10 @@ def manifest_chunk_path(paths: SlimCachePaths, chunk_name: str | Path) -> Path:
     return paths.manifest_dir / f"{Path(chunk_name).stem}.json"
 
 
+def compact_store_manifest_path(paths: SlimCachePaths) -> Path:
+    return paths.root / "compact_store_manifest.json"
+
+
 def episode_progress_path(paths: SlimCachePaths) -> Path:
     return paths.progress_dir / "episode_progress.jsonl"
 
@@ -121,16 +141,29 @@ def append_episode_progress(paths: SlimCachePaths, payload: dict[str, Any]) -> N
         handle.write("\n")
 
 
-def collect_slim_chunk_names(paths: SlimCachePaths) -> list[str]:
-    if not paths.index_dir.exists():
-        return []
-    chunk_names = [f"{path.stem}.npz" for path in paths.index_dir.glob("slim_chunk_*.csv")]
-    return sorted(chunk_names, key=chunk_index_from_name)
+def collect_slim_chunk_names(paths: SlimCachePaths, completed_only: bool = False) -> list[str]:
+    names: set[str] = set()
+    if paths.index_dir.exists():
+        names.update(f"{path.stem}.npz" for path in paths.index_dir.glob("slim_chunk_*.csv"))
+    if paths.feature_dir.exists():
+        names.update(path.name for path in paths.feature_dir.glob("slim_chunk_*.npz"))
+    if paths.gmr_target_dir.exists():
+        names.update(path.name for path in paths.gmr_target_dir.glob("slim_chunk_*.npz"))
+    if paths.manifest_dir.exists():
+        names.update(f"{path.stem}.npz" for path in paths.manifest_dir.glob("slim_chunk_*.json"))
+    ordered = sorted(names, key=chunk_index_from_name)
+    if completed_only:
+        ordered = [name for name in ordered if slim_chunk_complete(paths, name)]
+    return ordered
+
+
+def list_incomplete_slim_chunks(paths: SlimCachePaths) -> list[str]:
+    return [name for name in collect_slim_chunk_names(paths, completed_only=False) if not slim_chunk_complete(paths, name)]
 
 
 def load_slim_index_table(paths: SlimCachePaths) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
-    for chunk_name in collect_slim_chunk_names(paths):
+    for chunk_name in collect_slim_chunk_names(paths, completed_only=True):
         chunk_path = index_chunk_path(paths, chunk_name)
         if chunk_path.exists():
             frames.append(pd.read_csv(chunk_path))
@@ -161,7 +194,7 @@ def compose_segment_index(existing_df: pd.DataFrame, slim_df: pd.DataFrame) -> p
 
 
 def next_slim_chunk_index(paths: SlimCachePaths) -> int:
-    names = collect_slim_chunk_names(paths)
+    names = collect_slim_chunk_names(paths, completed_only=False)
     if not names:
         return 0
     return max(chunk_index_from_name(name) for name in names) + 1
@@ -180,15 +213,11 @@ def slim_chunk_complete(paths: SlimCachePaths, chunk_name: str | Path) -> bool:
     )
 
 
-def build_gmr_target(arrays: dict[str, np.ndarray | None], config: dict[str, Any], resample_fn) -> tuple[np.ndarray, str]:
-    target_name = "actions" if bool(config.get("gmr_target_actions", True)) and arrays.get("actions") is not None else "hand_joints"
-    trajectory = arrays.get(target_name)
-    if trajectory is None:
-        trajectory = arrays.get("hand_joints")
-        target_name = "hand_joints"
-    if trajectory is None:
-        raise ValueError("Cannot build GMR target without actions or hand_joints.")
-    return resample_fn(np.asarray(trajectory, dtype=np.float32), int(config["gmr_horizon"])), target_name
+def build_gmr_target(arrays: dict[str, np.ndarray | None], config: dict[str, Any], resample_fn=None) -> tuple[np.ndarray, str]:
+    del resample_fn
+    from sonata.primitives.features import build_gmr_target_from_arrays
+
+    return build_gmr_target_from_arrays(arrays=arrays, config=config)
 
 
 def write_slim_chunk(
@@ -239,24 +268,24 @@ def write_slim_chunk(
         target_names=np.asarray(target_names, dtype=object),
     )
     _write_csv_atomic(index_chunk_path(paths, chunk_name), rows_df)
-    _write_json_atomic(
-        manifest_chunk_path(paths, chunk_name),
-        {
-            "chunk_name": chunk_name,
-            "feature_path": str(feature_chunk_path(paths, chunk_name).resolve()),
-            "gmr_target_path": str(gmr_target_chunk_path(paths, chunk_name).resolve()),
-            "index_path": str(index_chunk_path(paths, chunk_name).resolve()),
-            "num_segments": int(len(rows_df)),
-            "num_features": int(feature_matrix.shape[1]) if feature_matrix.ndim == 2 else 0,
-            "gmr_horizon": int(gmr_targets.shape[1]) if gmr_targets.ndim >= 2 else 0,
-            "gmr_dim": int(gmr_targets.shape[2]) if gmr_targets.ndim == 3 else 0,
-            "source_raw_chunk": source_raw_chunk or "",
-            "migrated": bool(migrated),
-            "status": "completed",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    manifest_payload = {
+        "chunk_name": chunk_name,
+        "feature_path": str(feature_chunk_path(paths, chunk_name).resolve()),
+        "gmr_target_path": str(gmr_target_chunk_path(paths, chunk_name).resolve()),
+        "index_path": str(index_chunk_path(paths, chunk_name).resolve()),
+        "num_segments": int(len(rows_df)),
+        "num_features": int(feature_matrix.shape[1]) if feature_matrix.ndim == 2 else 0,
+        "gmr_horizon": int(gmr_targets.shape[1]) if gmr_targets.ndim >= 2 else 0,
+        "gmr_dim": int(gmr_targets.shape[2]) if gmr_targets.ndim == 3 else 0,
+        "source_raw_chunk": source_raw_chunk or "",
+        "migrated": bool(migrated),
+        "status": "completed",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json_atomic(manifest_chunk_path(paths, chunk_name), manifest_payload)
     verify_slim_chunk(paths, chunk_name, segment_ids=segment_ids)
+    manifest_payload.update(chunk_storage_bytes(paths, chunk_name))
+    _write_json_atomic(manifest_chunk_path(paths, chunk_name), manifest_payload)
     return updated_rows
 
 
@@ -269,6 +298,50 @@ def verify_slim_chunk(paths: SlimCachePaths, chunk_name: str, segment_ids: np.nd
         raise ValueError(f"Slim feature ids do not match expected ids for {chunk_name}")
     if not np.array_equal(stored_target_ids, segment_ids):
         raise ValueError(f"Slim GMR ids do not match expected ids for {chunk_name}")
+
+
+def chunk_storage_bytes(paths: SlimCachePaths, chunk_name: str | Path) -> dict[str, int]:
+    sizes = {
+        "feature_bytes": _safe_file_size(feature_chunk_path(paths, chunk_name)),
+        "gmr_target_bytes": _safe_file_size(gmr_target_chunk_path(paths, chunk_name)),
+        "index_bytes": _safe_file_size(index_chunk_path(paths, chunk_name)),
+        "manifest_bytes": _safe_file_size(manifest_chunk_path(paths, chunk_name)),
+    }
+    sizes["total_bytes"] = int(sum(sizes.values()))
+    return sizes
+
+
+def summarize_slim_cache(paths: SlimCachePaths) -> dict[str, Any]:
+    chunk_names = collect_slim_chunk_names(paths, completed_only=True)
+    manifests: list[dict[str, Any]] = []
+    for chunk_name in chunk_names:
+        chunk_manifest = manifest_chunk_path(paths, chunk_name)
+        if chunk_manifest.exists():
+            manifests.append(json.loads(chunk_manifest.read_text()))
+    feature_dim = next((int(item.get("num_features", 0)) for item in manifests if int(item.get("num_features", 0)) > 0), 0)
+    gmr_horizon = next((int(item.get("gmr_horizon", 0)) for item in manifests if int(item.get("gmr_horizon", 0)) > 0), 0)
+    gmr_dim = next((int(item.get("gmr_dim", 0)) for item in manifests if int(item.get("gmr_dim", 0)) > 0), 0)
+    return {
+        "num_chunks": int(len(chunk_names)),
+        "num_segments": int(sum(int(item.get("num_segments", 0)) for item in manifests)),
+        "feature_dim": feature_dim,
+        "gmr_horizon": gmr_horizon,
+        "gmr_dim": gmr_dim,
+        "total_bytes_on_disk": int(tree_storage_bytes(paths.root)),
+        "incomplete_chunks": list_incomplete_slim_chunks(paths),
+    }
+
+
+def read_compact_store_manifest(paths: SlimCachePaths) -> dict[str, Any]:
+    path = compact_store_manifest_path(paths)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def write_compact_store_manifest(paths: SlimCachePaths, payload: dict[str, Any]) -> None:
+    ensure_slim_dirs(paths)
+    _write_json_atomic(compact_store_manifest_path(paths), payload)
 
 
 def _save_npz_atomic(path: Path, **arrays: Any) -> None:
@@ -291,3 +364,13 @@ def _write_csv_atomic(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(tmp_path, index=False)
     tmp_path.replace(path)
+
+
+def _safe_file_size(path: Path) -> int:
+    return int(path.stat().st_size) if path.exists() else 0
+
+
+def tree_storage_bytes(root: Path) -> int:
+    if not root.exists():
+        return 0
+    return int(sum(path.stat().st_size for path in root.rglob("*") if path.is_file()))

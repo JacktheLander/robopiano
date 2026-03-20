@@ -143,6 +143,8 @@ def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, outpu
 
 
 def build_feature_vector(row, bundle: Any, config: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
+    from sonata.primitives.segmenters import load_segment_array
+
     idx = int(row.chunk_index)
     arrays = {
         "hand_joints": load_segment_array(bundle, "hand_joints", idx),
@@ -247,6 +249,21 @@ def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | No
     )
     names.extend(["contact_mean", "contact_density", "contact_nonzero_ratio"])
     return np.concatenate(pieces).astype(np.float32), names
+
+
+def build_gmr_target_from_arrays(arrays: dict[str, np.ndarray | None], config: dict[str, Any]) -> tuple[np.ndarray, str]:
+    target_name = "actions" if bool(config.get("gmr_target_actions", True)) and arrays.get("actions") is not None else "hand_joints"
+    trajectory = arrays.get(target_name)
+    if trajectory is None:
+        trajectory = arrays.get("hand_joints")
+        target_name = "hand_joints"
+    if trajectory is None:
+        raise ValueError("Cannot build GMR target without actions or hand_joints.")
+    return resample_time_axis(np.asarray(trajectory, dtype=np.float32), resolve_gmr_resample_steps(config)), target_name
+
+
+def resolve_gmr_resample_steps(config: dict[str, Any]) -> int:
+    return int(config.get("gmr_resample_steps", config.get("gmr_horizon", 32)))
 
 
 def _row_value(row: Any, name: str) -> Any:
