@@ -9,7 +9,8 @@ import pandas as pd
 from tqdm import tqdm
 
 from sonata.primitives.segmenters import load_segment_array
-from sonata.utils.io import save_npz, write_json, write_table
+from sonata.primitives.slim_cache import feature_chunk_path, is_slim_chunk_name, resolve_slim_cache_paths
+from sonata.utils.io import read_json, save_npz, write_json, write_table
 
 
 def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, output_dir: Path, config: dict[str, Any]) -> dict[str, Path]:
@@ -18,20 +19,46 @@ def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, outpu
     table_base = features_dir / "segment_features"
     bundle_path = features_dir / "segment_features_bundle.npz"
     manifest_path = features_dir / "segment_features_manifest.json"
-    if table_base.with_suffix(".csv").exists() and not bool(config.get("force", False)):
-        return {"feature_table_base": table_base, "feature_bundle_path": bundle_path, "manifest_path": manifest_path}
+    if table_base.with_suffix(".csv").exists() and bundle_path.exists() and manifest_path.exists() and not bool(config.get("force", False)):
+        manifest = read_json(manifest_path)
+        if int(manifest.get("num_segments", -1)) == int(len(segment_df)):
+            return {"feature_table_base": table_base, "feature_bundle_path": bundle_path, "manifest_path": manifest_path}
 
-    feature_rows: list[np.ndarray] = []
+    slim_paths = resolve_slim_cache_paths(output_dir, config)
+    indexed_df = segment_df.reset_index(drop=True).copy()
+    indexed_df["__feature_row_index"] = np.arange(len(indexed_df), dtype=np.int64)
+    feature_rows: list[np.ndarray | None] = [None] * len(indexed_df)
     feature_names: list[str] = []
-    grouped = segment_df.groupby("chunk_path", sort=True)
+    grouped = indexed_df.groupby("chunk_path", sort=True)
     for chunk_name, rows in tqdm(grouped, total=grouped.ngroups, desc="Extract segment features"):
+        ordered_rows = rows.sort_values("chunk_index", kind="stable")
+        if is_slim_chunk_name(chunk_name) and feature_chunk_path(slim_paths, chunk_name).exists():
+            bundle = np.load(feature_chunk_path(slim_paths, chunk_name), allow_pickle=True)
+            chunk_names = [str(item) for item in bundle["feature_names"].tolist()]
+            if not feature_names:
+                feature_names = chunk_names
+            elif feature_names != chunk_names:
+                raise ValueError(f"Incompatible slim feature names in chunk {chunk_name}")
+            chunk_ids = np.asarray(bundle["segment_ids"], dtype=object)
+            chunk_matrix = np.asarray(bundle["feature_matrix"], dtype=np.float32)
+            for row in ordered_rows.itertuples(index=False):
+                idx = int(row.chunk_index)
+                if idx >= len(chunk_ids) or str(chunk_ids[idx]) != str(row.segment_id):
+                    raise ValueError(f"Slim feature segment id mismatch in chunk {chunk_name}")
+                feature_rows[int(row.__feature_row_index)] = chunk_matrix[idx]
+            continue
         bundle = np.load(segments_dir / str(chunk_name), allow_pickle=True)
-        for row in rows.itertuples(index=False):
+        for row in ordered_rows.itertuples(index=False):
             vector, names = build_feature_vector(row=row, bundle=bundle, config=config)
             if not feature_names:
                 feature_names = names
-            feature_rows.append(vector)
-    feature_matrix = np.stack(feature_rows, axis=0).astype(np.float32)
+            feature_rows[int(row.__feature_row_index)] = vector
+    if not feature_rows:
+        feature_matrix = np.zeros((0, 0), dtype=np.float32)
+    else:
+        if any(vector is None for vector in feature_rows):
+            raise ValueError("Missing feature vectors while materializing feature bundle.")
+        feature_matrix = np.stack([np.asarray(vector, dtype=np.float32) for vector in feature_rows], axis=0).astype(np.float32)
     feature_df = pd.concat([segment_df.reset_index(drop=True), pd.DataFrame(feature_matrix, columns=feature_names)], axis=1)
     write_table(feature_df, table_base)
     save_npz(bundle_path, feature_matrix=feature_matrix, feature_names=np.asarray(feature_names, dtype=object), segment_ids=segment_df["segment_id"].astype(str).to_numpy(dtype=object))
@@ -49,17 +76,28 @@ def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, outpu
 
 def build_feature_vector(row, bundle: Any, config: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
     idx = int(row.chunk_index)
-    hand_joints = load_segment_array(bundle, "hand_joints", idx)
-    velocity = load_segment_array(bundle, "joint_velocities", idx)
-    actions = load_segment_array(bundle, "actions", idx)
-    goals = load_segment_array(bundle, "goals", idx)
-    piano_states = load_segment_array(bundle, "piano_states", idx)
+    arrays = {
+        "hand_joints": load_segment_array(bundle, "hand_joints", idx),
+        "joint_velocities": load_segment_array(bundle, "joint_velocities", idx),
+        "actions": load_segment_array(bundle, "actions", idx),
+        "goals": load_segment_array(bundle, "goals", idx),
+        "piano_states": load_segment_array(bundle, "piano_states", idx),
+    }
+    return build_feature_vector_from_arrays(row=row, arrays=arrays, config=config)
+
+
+def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | None], config: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
+    hand_joints = arrays.get("hand_joints")
+    velocity = arrays.get("joint_velocities")
+    actions = arrays.get("actions")
+    goals = arrays.get("goals")
+    piano_states = arrays.get("piano_states")
     if hand_joints is None:
-        raise ValueError(f"Missing hand_joints for segment {row.segment_id}")
+        raise ValueError(f"Missing hand_joints for segment {_row_value(row, 'segment_id')}")
     if velocity is None:
         velocity = np.gradient(hand_joints, axis=0).astype(np.float32)
     acceleration = np.gradient(velocity, axis=0).astype(np.float32)
-    score_context = json.loads(row.score_context_json)
+    score_context = json.loads(str(_row_value(row, "score_context_json")))
     contact_roll = goals if goals is not None else piano_states
     contact_roll = np.asarray(contact_roll[:, :-1] > 0.5, dtype=np.float32) if contact_roll is not None else np.zeros((hand_joints.shape[0], 88), dtype=np.float32)
 
@@ -108,12 +146,12 @@ def build_feature_vector(row, bundle: Any, config: dict[str, Any]) -> tuple[np.n
         [
             float(score_context.get("active_ratio", 0.0)),
             float(score_context.get("future_density", 0.0)),
-            float(row.duration_steps),
-            float(row.motion_energy),
-            float(row.chord_size),
-            float(row.key_center),
-            float(row.start_state_norm),
-            float(row.end_state_norm),
+            float(_row_value(row, "duration_steps")),
+            float(_row_value(row, "motion_energy")),
+            float(_row_value(row, "chord_size")),
+            float(_row_value(row, "key_center")),
+            float(_row_value(row, "start_state_norm")),
+            float(_row_value(row, "end_state_norm")),
         ],
         dtype=np.float32,
     )
@@ -141,6 +179,12 @@ def build_feature_vector(row, bundle: Any, config: dict[str, Any]) -> tuple[np.n
     )
     names.extend(["contact_mean", "contact_density", "contact_nonzero_ratio"])
     return np.concatenate(pieces).astype(np.float32), names
+
+
+def _row_value(row: Any, name: str) -> Any:
+    if isinstance(row, dict):
+        return row[name]
+    return getattr(row, name)
 
 
 def resample_time_axis(array: np.ndarray, steps: int) -> np.ndarray:

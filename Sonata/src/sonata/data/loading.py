@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from sonata.data.schema import EpisodeRecord
-from sonata.utils.io import read_table
+from sonata.utils.io import read_json, read_table
 
 ARRAY_FIELDS = (
     "actions",
@@ -34,6 +34,21 @@ def load_manifest(path_without_suffix: str | Path) -> pd.DataFrame:
         if column not in df.columns:
             df[column] = default
     return df
+
+
+def load_stage1_source_manifest(primitive_root: str | Path) -> pd.DataFrame:
+    primitive_root = Path(primitive_root).resolve()
+    run_config = read_json(primitive_root / "run_config.json")
+    data_output_root = Path(str(run_config["data_output_root"])).resolve()
+    manifest_name = str(run_config.get("data_manifest_name", "dataset_manifest"))
+    return load_manifest(data_output_root / manifest_name)
+
+
+def build_manifest_lookup(manifest_df: pd.DataFrame) -> dict[tuple[str, str], dict[str, Any]]:
+    lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in manifest_df.itertuples(index=False):
+        lookup[(str(row.song_id), str(row.episode_id))] = row._asdict()
+    return lookup
 
 
 def load_episode_record(row: dict[str, Any] | pd.Series) -> EpisodeRecord:

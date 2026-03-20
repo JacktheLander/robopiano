@@ -17,7 +17,8 @@ from sonata.data.indexer import scan_dataset
 from sonata.data.loading import load_manifest
 from sonata.primitives.features import extract_segment_features, resample_time_axis
 from sonata.primitives.gmr import PhaseGMR
-from sonata.primitives.segmenters import load_segment_array, run_segmentation
+from sonata.primitives.segmenters import load_segment_arrays_from_bundle, run_segmentation
+from sonata.primitives.slim_cache import build_gmr_target, gmr_target_chunk_path, is_slim_chunk_name, resolve_slim_cache_paths
 from sonata.primitives.tokenization import add_token_columns, build_vocabulary_payload
 from sonata.primitives.visualization import plot_gmr_reconstruction, plot_primitive_frequency, plot_usage_entropy
 from sonata.utils.io import read_table, save_npz, write_json, write_table
@@ -43,7 +44,7 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
         if not manifest_base.with_suffix(".csv").exists():
             scan_dataset(config=config["data_config"], logger=logger)
         manifest_df = load_manifest(manifest_base)
-        segment_outputs = run_segmentation(manifest_df=manifest_df, output_dir=primitive_root, config=config)
+        segment_outputs = run_segmentation(manifest_df=manifest_df, output_dir=primitive_root, config=config, logger=logger)
         segment_df = read_table(segment_outputs["segment_table_base"])
         feature_outputs = extract_segment_features(segment_df=segment_df, segments_dir=primitive_root / "segments", output_dir=primitive_root, config=config)
         feature_bundle = np.load(feature_outputs["feature_bundle_path"], allow_pickle=True)
@@ -197,6 +198,9 @@ def fit_primitive_gmm(segment_df: pd.DataFrame, feature_matrix: np.ndarray, feat
 def fit_gmr_library(assignments_df: pd.DataFrame, segments_dir: Path, output_dir: Path, config: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
     library_dir = output_dir / "library"
     library_dir.mkdir(parents=True, exist_ok=True)
+    slim_paths = resolve_slim_cache_paths(output_dir, config)
+    slim_cache: dict[str, Any] = {}
+    raw_cache: dict[str, Any] = {}
     grouped = assignments_df.groupby("primitive_id", sort=True)
     library_rows: list[dict[str, Any]] = []
     gmr_payload: dict[str, Any] = {"models": {}}
@@ -204,18 +208,17 @@ def fit_gmr_library(assignments_df: pd.DataFrame, segments_dir: Path, output_dir
         train_group = group[group["split"] == "train"]
         source_group = train_group if len(train_group) >= int(config["min_segments_per_primitive"]) else group
         trajectories: list[np.ndarray] = []
-        trace_examples: list[np.ndarray] = []
         for row in source_group.itertuples(index=False):
-            bundle = np.load(segments_dir / str(row.chunk_path), allow_pickle=True)
-            target_name = "actions" if bool(config.get("gmr_target_actions", True)) and "actions" in bundle else "hand_joints"
-            trajectory = load_segment_array(bundle, target_name, int(row.chunk_index))
-            if trajectory is None:
-                trajectory = load_segment_array(bundle, "hand_joints", int(row.chunk_index))
-            if trajectory is None:
-                continue
-            resampled = resample_time_axis(trajectory, int(config["gmr_horizon"]))
-            trajectories.append(resampled.astype(np.float32))
-            trace_examples.append(resampled[:, 0])
+            trajectory = load_gmr_trajectory(
+                row=row,
+                slim_paths=slim_paths,
+                segments_dir=segments_dir,
+                config=config,
+                slim_cache=slim_cache,
+                raw_cache=raw_cache,
+            )
+            if trajectory is not None:
+                trajectories.append(trajectory.astype(np.float32))
         if not trajectories:
             continue
         stacked = np.stack(trajectories, axis=0)
@@ -245,6 +248,44 @@ def fit_gmr_library(assignments_df: pd.DataFrame, segments_dir: Path, output_dir
         )
     library_df = pd.DataFrame(library_rows).sort_values("primitive_id").reset_index(drop=True)
     return library_df, gmr_payload
+
+
+def load_gmr_trajectory(
+    row,
+    slim_paths,
+    segments_dir: Path,
+    config: dict[str, Any],
+    slim_cache: dict[str, Any],
+    raw_cache: dict[str, Any],
+) -> np.ndarray | None:
+    chunk_name = str(row.chunk_path)
+    if chunk_name and is_slim_chunk_name(chunk_name):
+        target_path = gmr_target_chunk_path(slim_paths, chunk_name)
+        if target_path.exists():
+            bundle = slim_cache.get(chunk_name)
+            if bundle is None:
+                bundle = np.load(target_path, allow_pickle=True)
+                slim_cache[chunk_name] = bundle
+            index = int(row.chunk_index)
+            segment_ids = np.asarray(bundle["segment_ids"], dtype=object)
+            if index >= len(segment_ids) or str(segment_ids[index]) != str(row.segment_id):
+                raise ValueError(f"Slim GMR target segment id mismatch in {chunk_name}")
+            return np.asarray(bundle["gmr_targets"][index], dtype=np.float32)
+
+    raw_chunk_name = str(getattr(row, "raw_chunk_path", "") or chunk_name)
+    raw_index = int(getattr(row, "raw_chunk_index", -1))
+    if raw_index < 0:
+        raw_index = int(row.chunk_index)
+    raw_path = segments_dir / raw_chunk_name
+    if not raw_chunk_name or not raw_path.exists():
+        return None
+    bundle = raw_cache.get(raw_chunk_name)
+    if bundle is None:
+        bundle = np.load(raw_path, allow_pickle=True)
+        raw_cache[raw_chunk_name] = bundle
+    arrays = load_segment_arrays_from_bundle(bundle, raw_index)
+    trajectory, _ = build_gmr_target(arrays=arrays, config=config, resample_fn=resample_time_axis)
+    return trajectory.astype(np.float32)
 
 
 def compute_stage1_metrics(assignments_df: pd.DataFrame, sweep_df: pd.DataFrame, library_df: pd.DataFrame) -> dict[str, Any]:

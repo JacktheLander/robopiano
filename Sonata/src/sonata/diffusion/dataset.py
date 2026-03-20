@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from sonata.primitives.segmenters import load_segment_array
+from sonata.data.loading import build_manifest_lookup, load_episode_record, load_stage1_source_manifest
 from sonata.transformer.dataset import build_planner_context, load_transformer_inputs, planner_collate_fn
 
 
@@ -42,18 +42,20 @@ class DiffusionChunkDataset(Dataset):
         self.context_length = int(context_length)
         self.action_horizon = int(action_horizon)
         self.state_context_steps = int(state_context_steps)
+        self.manifest_lookup = build_manifest_lookup(load_stage1_source_manifest(primitive_root))
         self.samples: list[dict[str, Any]] = []
         grouped = self.token_df.sort_values(["episode_id", "onset_step"]).groupby("episode_id", sort=True)
         for _, group in grouped:
+            group_key = (str(group.iloc[0]["song_id"]), str(group.iloc[0]["episode_id"]))
+            episode = load_episode_record(self.manifest_lookup[group_key])
             primitive = group["primitive_index"].astype(int).to_numpy()
             duration = group["duration_bucket"].astype(int).to_numpy()
             dynamics = group["dynamics_bucket"].astype(int).to_numpy()
             score_context = np.stack([build_planner_context(row) for _, row in group.iterrows()], axis=0).astype(np.float32)
             for target_index in range(1, len(group)):
                 row = group.iloc[target_index]
-                bundle = np.load(self.primitive_root / "segments" / str(row["chunk_path"]), allow_pickle=True)
-                hand_joints = load_segment_array(bundle, "hand_joints", int(row["chunk_index"]))
-                actions = load_segment_array(bundle, "actions", int(row["chunk_index"]))
+                hand_joints = slice_episode_array(episode.hand_joints, int(row["onset_step"]), int(row["end_step"]))
+                actions = slice_episode_array(episode.actions, int(row["onset_step"]), int(row["end_step"]))
                 if hand_joints is None or actions is None:
                     continue
                 state_context = resample_sequence(hand_joints, self.state_context_steps).reshape(-1)
@@ -94,6 +96,12 @@ def resample_sequence(array: np.ndarray, steps: int) -> np.ndarray:
     for dim in range(array.shape[1]):
         output[:, dim] = np.interp(x_new, x_old, array[:, dim])
     return output
+
+
+def slice_episode_array(array: np.ndarray | None, start: int, end: int) -> np.ndarray | None:
+    if array is None:
+        return None
+    return np.asarray(array[start:end], dtype=np.float32)
 
 
 def build_prior_lookup(primitive_root: Path, action_horizon: int) -> dict[str, np.ndarray]:
@@ -148,11 +156,10 @@ def metadata_to_planner(metadata: DiffusionMetadata):
 
 def load_diffusion_inputs(primitive_root: Path, action_horizon: int, state_context_steps: int) -> tuple[pd.DataFrame, DiffusionMetadata, dict[str, np.ndarray]]:
     token_df, planner_metadata = load_transformer_inputs(primitive_root)
-    sample_bundle = np.load(primitive_root / "segments" / str(token_df.iloc[0]["chunk_path"]), allow_pickle=True)
-    sample_actions = load_segment_array(sample_bundle, "actions", int(token_df.iloc[0]["chunk_index"]))
-    sample_hand = load_segment_array(sample_bundle, "hand_joints", int(token_df.iloc[0]["chunk_index"]))
-    action_dim = int(sample_actions.shape[1]) if sample_actions is not None else 39
-    state_dim = int(state_context_steps * sample_hand.shape[1]) if sample_hand is not None else int(state_context_steps * 46)
+    source_manifest = load_stage1_source_manifest(primitive_root)
+    action_dim = int(source_manifest["action_dim"].replace(0, np.nan).dropna().iloc[0]) if "action_dim" in source_manifest.columns and not source_manifest["action_dim"].replace(0, np.nan).dropna().empty else 39
+    hand_dim = int(source_manifest["hand_joint_dim"].replace(0, np.nan).dropna().iloc[0]) if "hand_joint_dim" in source_manifest.columns and not source_manifest["hand_joint_dim"].replace(0, np.nan).dropna().empty else 46
+    state_dim = int(state_context_steps * hand_dim)
     metadata = DiffusionMetadata(
         action_dim=action_dim,
         state_dim=state_dim,

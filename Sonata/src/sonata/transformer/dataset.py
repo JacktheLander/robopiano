@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from sonata.primitives.segmenters import load_segment_array
+from sonata.data.loading import build_manifest_lookup, load_episode_record, load_stage1_source_manifest
 from sonata.utils.io import read_json, read_table
 
 
@@ -96,9 +96,12 @@ class TransformerActionDataset(Dataset):
         self.action_horizon = int(action_horizon)
         self.primitive_root = primitive_root
         self.token_df = token_df[token_df["split"] == split].copy()
+        self.manifest_lookup = build_manifest_lookup(load_stage1_source_manifest(primitive_root))
         self.samples: list[dict[str, Any]] = []
         grouped = self.token_df.sort_values(["episode_id", "onset_step"]).groupby("episode_id", sort=True)
         for _, group in grouped:
+            group_key = (str(group.iloc[0]["song_id"]), str(group.iloc[0]["episode_id"]))
+            episode = load_episode_record(self.manifest_lookup[group_key])
             primitive = group["primitive_index"].astype(int).to_numpy()
             duration = group["duration_bucket"].astype(int).to_numpy()
             dynamics = group["dynamics_bucket"].astype(int).to_numpy()
@@ -106,8 +109,7 @@ class TransformerActionDataset(Dataset):
             for target_index in range(1, len(group)):
                 row = group.iloc[target_index]
                 start = max(0, target_index - self.context_length)
-                bundle = np.load(self.primitive_root / "segments" / str(row["chunk_path"]), allow_pickle=True)
-                actions = load_segment_array(bundle, "actions", int(row["chunk_index"]))
+                actions = slice_episode_array(episode.actions, int(row["onset_step"]), int(row["end_step"]))
                 if actions is None:
                     continue
                 action_target = resample_actions(actions, self.action_horizon)
@@ -136,6 +138,12 @@ def resample_actions(actions: np.ndarray, horizon: int) -> np.ndarray:
     for dim in range(actions.shape[1]):
         output[:, dim] = np.interp(x_new, x_old, actions[:, dim])
     return output
+
+
+def slice_episode_array(array: np.ndarray | None, start: int, end: int) -> np.ndarray | None:
+    if array is None:
+        return None
+    return np.asarray(array[start:end], dtype=np.float32)
 
 
 def planner_collate_fn(batch: list[dict[str, Any]], metadata: PlannerMetadata) -> dict[str, torch.Tensor]:

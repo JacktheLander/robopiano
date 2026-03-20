@@ -70,13 +70,22 @@ Stage 0 writes a cached RP1M manifest and song-level splits:
 
 Stage 1 consumes the manifest and writes:
 
-- chunked segment caches in `outputs/primitives/<profile>/segments/`
+- segment metadata tables in `outputs/primitives/<profile>/segments/`
+- chunked slim cache artifacts in `outputs/primitives/<profile>/slim/`
 - feature bundles in `outputs/primitives/<profile>/features/`
 - GMM assignments in `outputs/primitives/<profile>/clustering/`
 - GMR priors and primitive summaries in `outputs/primitives/<profile>/library/`
 - token tables in `outputs/primitives/<profile>/tokens/`
 - stage metrics in `outputs/primitives/<profile>/metrics/`
 - stage plots in `outputs/primitives/<profile>/plots/`
+
+The slim cache keeps only:
+
+- segment index / metadata rows
+- clustering feature vectors
+- one fixed-horizon GMR target per segment
+
+The legacy raw `segment_chunk_*.npz` bundles are now optional debug artifacts. By default Sonata migrates existing raw chunks into the slim cache and continues new segmentation directly in slim mode. Keeping only the slim representation typically cuts Stage 1 cache storage by roughly 80% to 92%, because the large padded variable-length arrays are no longer retained after features and GMR targets have been materialized.
 
 Stage 2 consumes primitive tokens and writes run directories under `outputs/transformer/`.
 
@@ -93,6 +102,7 @@ Evaluation writes offline metrics into `<output-root>/offline/` and optional rol
 - Primitive discovery uses a GMM sweep over candidate `K`, chosen by BIC or AIC.
 - Each primitive fits a phase-conditioned GMR prior and exports a reusable coarse trajectory template.
 - Tokens are explicit and inspectable: primitive id, primitive index, duration bucket, dynamics bucket, and score context JSON.
+- Segment metadata keeps `chunk_path` / `chunk_index` pointed at the slim cache. If you enable `write_full_segment_cache: true`, the optional raw debug chunk location is preserved in `raw_chunk_path` / `raw_chunk_index`.
 
 ### Stage 2: Transformer planner
 
@@ -145,6 +155,25 @@ python scripts/prepare_rp1m.py --profile debug
 python scripts/train_primitives.py --profile debug
 python scripts/train_transformer.py --profile debug
 python scripts/train_diffusion.py --profile debug --planner-checkpoint /path/to/best.pt
+```
+
+If you already have legacy `segment_chunk_*.npz` files and want to materialize the slim cache before rerunning Stage 1:
+
+```bash
+python scripts/migrate_segment_chunks.py --profile full
+```
+
+To migrate existing raw chunks, continue the remaining segmentation directly in slim mode, and finish Stage 1 end-to-end:
+
+```bash
+python scripts/train_primitives.py --profile full
+```
+
+To delete raw chunks immediately after each migrated chunk is verified:
+
+```bash
+python scripts/migrate_segment_chunks.py --profile full --delete-raw
+python scripts/train_primitives.py --profile full
 ```
 
 W&B is enabled by default in the shipped Sonata configs. If you want uploads to the Santa Clara workspace, authenticate first:
@@ -207,6 +236,17 @@ export RP1M_300_ROOT=/project/$USER/rp1m_300.zarr
 
 If cluster score files live outside the repo checkout, you can also point `note_search_roots` at environment-expanded paths because Sonata resolves `$VARS` in config paths before use. If no score files are available, segmentation falls back to `goals` and then `piano_states`.
 
+Primitive configs now also expose:
+
+- `write_full_segment_cache`
+- `write_slim_cache`
+- `migrate_existing_segment_chunks`
+- `delete_raw_chunks_after_migration`
+- `slim_cache_dir`
+- `slim_feature_dir`
+- `slim_gmr_target_dir`
+- `slim_index_dir`
+
 ## Evaluation Outputs
 
 Stage 1:
@@ -247,10 +287,30 @@ Stage 3 and full pipeline:
 - W&B logging mirrors run config, scalar metrics, summaries, checkpoint artifacts, and run-output directories when enabled in config or via CLI.
 - The `logs/` directory is reserved as part of the run structure, but the current scripts primarily emit structured logs to stdout/stderr rather than automatically writing a persistent per-run log file there.
 
+## Slim Cache Migration
+
+Use this flow when a profile already contains legacy `segment_chunk_*.npz` outputs:
+
+1. Run `python scripts/migrate_segment_chunks.py --profile <profile>` to scan each raw chunk, rebuild the exact Stage 1 features, store the pre-resampled GMR target, and write resumable per-chunk slim manifests under `outputs/primitives/<profile>/slim/`.
+2. Run `python scripts/train_primitives.py --profile <profile>` to continue any remaining segmentation directly in slim mode and then finish clustering, GMR fitting, and tokenization.
+3. Add `--delete-raw` to the migration script, or set `delete_raw_chunks_after_migration: true`, when you want Sonata to remove each raw chunk after the slim outputs have been written and verified.
+
+Migration is idempotent and resumable: completed slim chunks are skipped on rerun, new segmentation appends new slim chunks, and the consolidated `segments/segment_index.csv` is rebuilt from the migrated slim records plus any remaining legacy rows.
+
+The slim cache layout is:
+
+- `outputs/primitives/<profile>/slim/index/slim_chunk_*.csv`
+- `outputs/primitives/<profile>/slim/features/slim_chunk_*.npz`
+- `outputs/primitives/<profile>/slim/gmr_targets/slim_chunk_*.npz`
+- `outputs/primitives/<profile>/slim/manifests/slim_chunk_*.json`
+- `outputs/primitives/<profile>/slim/progress/episode_progress.jsonl`
+
+Stage 2 and Stage 3 command-line inputs stay the same. Internally, the training loaders now reconstruct action and hand-joint slices from the Stage 0 dataset manifest referenced in `outputs/primitives/<profile>/run_config.json`, so the underlying dataset path used by Stage 0 must still be reachable when training those stages.
+
 ## Target Environment
 
-- `prepare_rp1m.py` and `train_primitives.py` are the CPU-heavy stages. They scan RP1M, load episodes one at a time, segment trajectories, and save chunked `.npz` segment bundles so later stages avoid reopening the raw dataset repeatedly.
-- `train_transformer.py` and `train_diffusion.py` consume the cached primitive outputs rather than rescanning RP1M. This is the intended GPU-node path.
+- `prepare_rp1m.py` and `train_primitives.py` are the CPU-heavy stages. They scan RP1M, load episodes one at a time, segment trajectories, and save the slim Stage 1 cache needed for clustering and GMR fitting.
+- `train_transformer.py` and `train_diffusion.py` consume the cached primitive outputs rather than recomputing segmentation. Their public inputs are unchanged; when they need action or hand-joint targets they recover them from the Stage 0 manifest and dataset referenced in `run_config.json`.
 - `run_pipeline.py` is convenient for local debugging and end-to-end smoke runs, but on the cluster the more robust pattern is: run Stage 0 and Stage 1 on shared CPU storage first, then launch Stage 2 and Stage 3 jobs against those cached outputs.
 - The code does not assume Slurm locally. Cluster-specific scheduling remains outside Sonata itself; Sonata focuses on explicit filesystem outputs so CPU and GPU jobs can hand off work through shared storage cleanly.
 
