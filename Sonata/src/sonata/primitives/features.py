@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+
 from pathlib import Path
 from typing import Any
 
@@ -9,41 +11,134 @@ import pandas as pd
 from tqdm import tqdm
 
 from sonata.primitives.segmenters import load_segment_array
-from sonata.utils.io import save_npz, write_json, write_table
+from sonata.utils.io import read_table, save_npz, write_json, write_table
 
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+
+
+def _atomic_save_npz(path: Path, **payload: Any) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    save_npz(tmp_path, **payload)
+    os.replace(tmp_path, path)
+
+
+def _load_feature_manifest(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"status": "new", "completed_chunk_paths": [], "num_rows": 0}
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    payload.setdefault("status", "partial")
+    payload.setdefault("completed_chunk_paths", [])
+    payload.setdefault("num_rows", 0)
+    return payload
 
 def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, output_dir: Path, config: dict[str, Any]) -> dict[str, Path]:
     features_dir = output_dir / "features"
     features_dir.mkdir(parents=True, exist_ok=True)
+
     table_base = features_dir / "segment_features"
     bundle_path = features_dir / "segment_features_bundle.npz"
     manifest_path = features_dir / "segment_features_manifest.json"
-    if table_base.with_suffix(".csv").exists() and not bool(config.get("force", False)):
+
+    partial_table_csv = features_dir / "segment_features.partial.csv"
+    chunk_feature_dir = features_dir / "chunk_features"
+    chunk_feature_dir.mkdir(parents=True, exist_ok=True)
+
+    final_table_csv = table_base.with_suffix(".csv")
+    force = bool(config.get("force", False))
+
+    if force:
+        for path in [partial_table_csv, final_table_csv, bundle_path, manifest_path]:
+            if path.exists():
+                path.unlink()
+
+    if final_table_csv.exists() and bundle_path.exists() and not force:
         return {"feature_table_base": table_base, "feature_bundle_path": bundle_path, "manifest_path": manifest_path}
 
-    feature_rows: list[np.ndarray] = []
-    feature_names: list[str] = []
+    manifest = _load_feature_manifest(manifest_path)
+    completed_chunk_paths = set(str(item) for item in manifest.get("completed_chunk_paths", []))
+
     grouped = segment_df.groupby("chunk_path", sort=True)
+    feature_names: list[str] = []
+
     for chunk_name, rows in tqdm(grouped, total=grouped.ngroups, desc="Extract segment features"):
-        bundle = np.load(segments_dir / str(chunk_name), allow_pickle=True)
+        chunk_name = str(chunk_name)
+        if chunk_name in completed_chunk_paths:
+            continue
+
+        bundle = np.load(segments_dir / chunk_name, allow_pickle=True)
+        chunk_rows: list[dict[str, Any]] = []
+
         for row in rows.itertuples(index=False):
             vector, names = build_feature_vector(row=row, bundle=bundle, config=config)
             if not feature_names:
                 feature_names = names
-            feature_rows.append(vector)
-    feature_matrix = np.stack(feature_rows, axis=0).astype(np.float32)
-    feature_df = pd.concat([segment_df.reset_index(drop=True), pd.DataFrame(feature_matrix, columns=feature_names)], axis=1)
+            merged = dict(pd.Series(row._asdict()))
+            merged.update({name: float(value) for name, value in zip(feature_names, vector.tolist())})
+            chunk_rows.append(merged)
+
+        if chunk_rows:
+            chunk_df = pd.DataFrame(chunk_rows)
+            chunk_df.to_csv(
+                partial_table_csv,
+                mode="a",
+                header=not partial_table_csv.exists() or partial_table_csv.stat().st_size == 0,
+                index=False,
+            )
+
+            chunk_matrix = chunk_df[feature_names].to_numpy(dtype=np.float32)
+            chunk_segment_ids = chunk_df["segment_id"].astype(str).to_numpy(dtype=object)
+            chunk_feature_path = chunk_feature_dir / f"{Path(chunk_name).stem}.features.npz"
+            _atomic_save_npz(
+                chunk_feature_path,
+                feature_matrix=chunk_matrix,
+                feature_names=np.asarray(feature_names, dtype=object),
+                segment_ids=chunk_segment_ids,
+            )
+
+        completed_chunk_paths.add(chunk_name)
+        _atomic_write_json(
+            manifest_path,
+            {
+                "status": "running",
+                "completed_chunk_paths": sorted(completed_chunk_paths),
+                "num_rows": int(pd.read_csv(partial_table_csv).shape[0]) if partial_table_csv.exists() else 0,
+            },
+        )
+
+    feature_df = pd.read_csv(partial_table_csv) if partial_table_csv.exists() else pd.DataFrame()
     write_table(feature_df, table_base)
-    save_npz(bundle_path, feature_matrix=feature_matrix, feature_names=np.asarray(feature_names, dtype=object), segment_ids=segment_df["segment_id"].astype(str).to_numpy(dtype=object))
+
+    if feature_df.empty:
+        feature_matrix = np.zeros((0, 0), dtype=np.float32)
+        feature_names = []
+        segment_ids = np.asarray([], dtype=object)
+    else:
+        inferred_feature_names = [col for col in feature_df.columns if col not in segment_df.columns]
+        feature_names = feature_names or inferred_feature_names
+        feature_matrix = feature_df[feature_names].to_numpy(dtype=np.float32)
+        segment_ids = feature_df["segment_id"].astype(str).to_numpy(dtype=object)
+
+    _atomic_save_npz(
+        bundle_path,
+        feature_matrix=feature_matrix,
+        feature_names=np.asarray(feature_names, dtype=object),
+        segment_ids=segment_ids,
+    )
+
     write_json(
         {
-            "num_segments": int(len(segment_df)),
-            "num_features": int(feature_matrix.shape[1]),
-            "trajectory_resample_steps": int(config["trajectory_resample_steps"]),
+            "num_segments": int(feature_matrix.shape[0]),
+            "num_features": int(feature_matrix.shape[1]) if feature_matrix.ndim == 2 else 0,
             "feature_prefix_counts": prefix_counts(feature_names),
         },
         manifest_path,
     )
+
     return {"feature_table_base": table_base, "feature_bundle_path": bundle_path, "manifest_path": manifest_path}
 
 
