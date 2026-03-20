@@ -22,6 +22,9 @@ alignment_radius: 6
 dtw_template_window: 24
 chord_tolerance_steps: 1
 segment_chunk_size: 1024
+online_segment_processing: true
+save_raw_segment_chunks: false
+online_storage_format: npz_shards
 write_full_segment_cache: false
 write_slim_cache: true
 migrate_existing_segment_chunks: true
@@ -39,6 +42,7 @@ model_selection_metric: bic
 gmm_covariance_type: full
 gmm_reg_covar: 0.0001
 silhouette_max_examples: 4096
+gmr_resample_steps: 32
 gmr_horizon: 32
 gmr_components: 8
 gmr_reg_covar: 0.0001

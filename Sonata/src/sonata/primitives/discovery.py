@@ -15,17 +15,30 @@ from sklearn.preprocessing import StandardScaler
 
 from sonata.data.indexer import scan_dataset
 from sonata.data.loading import load_manifest
-from sonata.primitives.features import extract_segment_features, resample_time_axis
+from sonata.primitives.features import load_feature_matrix_from_store, resolve_gmr_resample_steps
 from sonata.primitives.gmr import PhaseGMR
 from sonata.primitives.segmenters import load_segment_arrays_from_bundle, run_segmentation
-from sonata.primitives.slim_cache import build_gmr_target, gmr_target_chunk_path, is_slim_chunk_name, resolve_slim_cache_paths
+from sonata.primitives.slim_cache import (
+    build_gmr_target,
+    gmr_target_chunk_path,
+    is_slim_chunk_name,
+    resolve_online_storage_format,
+    resolve_slim_cache_paths,
+    save_raw_segment_chunks_enabled,
+    summarize_slim_cache,
+)
 from sonata.primitives.tokenization import add_token_columns, build_vocabulary_payload
 from sonata.primitives.visualization import plot_gmr_reconstruction, plot_primitive_frequency, plot_usage_entropy
-from sonata.utils.io import read_table, save_npz, write_json, write_table
+from sonata.utils.io import read_json, read_table, save_npz, write_json, write_table
 from sonata.utils.wandb import WandbRun
 
 
 def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> dict[str, Path]:
+    config = dict(config)
+    config.setdefault("online_segment_processing", True if config.get("write_slim_cache", True) else False)
+    config.setdefault("save_raw_segment_chunks", save_raw_segment_chunks_enabled(config))
+    config.setdefault("online_storage_format", resolve_online_storage_format(config))
+    config.setdefault("gmr_resample_steps", resolve_gmr_resample_steps(config))
     data_output = Path(config["data_output_root"]).resolve()
     primitive_root = Path(config["output_root"]).resolve()
     primitive_root.mkdir(parents=True, exist_ok=True)
@@ -46,10 +59,17 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
         manifest_df = load_manifest(manifest_base)
         segment_outputs = run_segmentation(manifest_df=manifest_df, output_dir=primitive_root, config=config, logger=logger)
         segment_df = read_table(segment_outputs["segment_table_base"])
-        feature_outputs = extract_segment_features(segment_df=segment_df, segments_dir=primitive_root / "segments", output_dir=primitive_root, config=config)
-        feature_bundle = np.load(feature_outputs["feature_bundle_path"], allow_pickle=True)
-        feature_matrix = np.asarray(feature_bundle["feature_matrix"], dtype=np.float32)
-        feature_names = [str(item) for item in feature_bundle["feature_names"].tolist()]
+        feature_matrix, feature_names = load_feature_matrix_from_store(
+            segment_df=segment_df,
+            output_dir=primitive_root,
+            config=config,
+            segments_dir=primitive_root / "segments",
+        )
+        store_summary = (
+            read_json(segment_outputs["compact_store_manifest_path"])
+            if "compact_store_manifest_path" in segment_outputs and Path(segment_outputs["compact_store_manifest_path"]).exists()
+            else summarize_slim_cache(resolve_slim_cache_paths(primitive_root, config))
+        )
         wandb_run.summary(
             {
                 "stage": "primitives",
@@ -58,6 +78,9 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
                 "dataset/num_rows": int(len(manifest_df)),
                 "segments/count": int(len(segment_df)),
                 "features/dim": int(feature_matrix.shape[1]) if feature_matrix.ndim == 2 else 0,
+                "gmr_target/steps": int(store_summary.get("gmr_target_steps", store_summary.get("gmr_horizon", 0))),
+                "gmr_target/dim": int(store_summary.get("gmr_target_dim", store_summary.get("gmr_dim", 0))),
+                "stage1_storage/bytes": int(store_summary.get("total_bytes_on_disk", 0)),
             }
         )
 
@@ -88,7 +111,7 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
         write_table(token_df, token_base)
         write_json(build_vocabulary_payload(token_df), primitive_root / "tokens" / "primitive_vocabulary.json")
 
-        metrics = compute_stage1_metrics(assignments_df=assignments_df, sweep_df=sweep_df, library_df=library_df)
+        metrics = compute_stage1_metrics(assignments_df=assignments_df, sweep_df=sweep_df, library_df=library_df, storage_summary=store_summary)
         metrics_dir = primitive_root / "metrics"
         metrics_dir.mkdir(parents=True, exist_ok=True)
         metrics_path = metrics_dir / "stage1_metrics.json"
@@ -120,7 +143,10 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
 
         return {
             "segment_table_base": segment_outputs["segment_table_base"],
-            "feature_table_base": feature_outputs["feature_table_base"],
+            "compact_store_manifest_path": segment_outputs.get(
+                "compact_store_manifest_path",
+                resolve_slim_cache_paths(primitive_root, config).root / "compact_store_manifest.json",
+            ),
             "assignments_base": assignments_base,
             "library_base": primitive_root / "library" / "primitive_library",
             "tokens_base": token_base,
@@ -284,15 +310,20 @@ def load_gmr_trajectory(
         bundle = np.load(raw_path, allow_pickle=True)
         raw_cache[raw_chunk_name] = bundle
     arrays = load_segment_arrays_from_bundle(bundle, raw_index)
-    trajectory, _ = build_gmr_target(arrays=arrays, config=config, resample_fn=resample_time_axis)
+    trajectory, _ = build_gmr_target(arrays=arrays, config=config)
     return trajectory.astype(np.float32)
 
 
-def compute_stage1_metrics(assignments_df: pd.DataFrame, sweep_df: pd.DataFrame, library_df: pd.DataFrame) -> dict[str, Any]:
+def compute_stage1_metrics(
+    assignments_df: pd.DataFrame,
+    sweep_df: pd.DataFrame,
+    library_df: pd.DataFrame,
+    storage_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     probabilities = assignments_df["primitive_id"].value_counts(normalize=True).to_numpy(dtype=np.float32)
     usage_entropy = float(-(probabilities * np.log(probabilities + 1e-8)).sum())
     cross_song_reuse = float((library_df["num_songs"] > 1).mean()) if not library_df.empty else 0.0
-    return {
+    metrics = {
         "num_primitives": int(library_df["primitive_id"].nunique()) if not library_df.empty else 0,
         "selected_k": int(sweep_df.loc[sweep_df["selected_k"].notna(), "selected_k"].iloc[0]) if not sweep_df.empty else 0,
         "mean_assignment_confidence": float(assignments_df["assignment_confidence"].mean()),
@@ -302,3 +333,15 @@ def compute_stage1_metrics(assignments_df: pd.DataFrame, sweep_df: pd.DataFrame,
         "median_reconstruction_mse": float(library_df["reconstruction_mse"].median()) if not library_df.empty else 0.0,
         "gmm_sweep": sweep_df.to_dict(orient="records"),
     }
+    if storage_summary:
+        metrics.update(
+            {
+                "segment_store_bytes": int(storage_summary.get("total_bytes_on_disk", 0)),
+                "segment_store_bytes_per_1000_segments": float(storage_summary.get("bytes_per_1000_segments", 0.0)),
+                "feature_dim": int(storage_summary.get("feature_dim", 0)),
+                "gmr_target_steps": int(storage_summary.get("gmr_target_steps", storage_summary.get("gmr_horizon", 0))),
+                "gmr_target_dim": int(storage_summary.get("gmr_target_dim", storage_summary.get("gmr_dim", 0))),
+                "estimated_storage_reduction_vs_legacy": storage_summary.get("estimated_storage_reduction_vs_legacy"),
+            }
+        )
+    return metrics

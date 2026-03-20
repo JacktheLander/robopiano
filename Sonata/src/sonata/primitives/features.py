@@ -8,12 +8,15 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from sonata.primitives.segmenters import load_segment_array
-from sonata.primitives.slim_cache import feature_chunk_path, is_slim_chunk_name, resolve_slim_cache_paths
 from sonata.utils.io import read_json, save_npz, write_json, write_table
 
 
-def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, output_dir: Path, config: dict[str, Any]) -> dict[str, Path]:
+def extract_segment_features(
+    segment_df: pd.DataFrame,
+    segments_dir: Path,
+    output_dir: Path,
+    config: dict[str, Any],
+) -> dict[str, Path]:
     features_dir = output_dir / "features"
     features_dir.mkdir(parents=True, exist_ok=True)
     table_base = features_dir / "segment_features"
@@ -24,15 +27,50 @@ def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, outpu
         if int(manifest.get("num_segments", -1)) == int(len(segment_df)):
             return {"feature_table_base": table_base, "feature_bundle_path": bundle_path, "manifest_path": manifest_path}
 
+    feature_matrix, feature_names = load_feature_matrix_from_store(
+        segment_df=segment_df,
+        output_dir=output_dir,
+        config=config,
+        segments_dir=segments_dir,
+    )
+    feature_df = pd.concat([segment_df.reset_index(drop=True), pd.DataFrame(feature_matrix, columns=feature_names)], axis=1)
+    write_table(feature_df, table_base)
+    save_npz(
+        bundle_path,
+        feature_matrix=feature_matrix,
+        feature_names=np.asarray(feature_names, dtype=object),
+        segment_ids=segment_df["segment_id"].astype(str).to_numpy(dtype=object),
+    )
+    write_json(
+        {
+            "num_segments": int(len(segment_df)),
+            "num_features": int(feature_matrix.shape[1]),
+            "trajectory_resample_steps": int(config["trajectory_resample_steps"]),
+            "feature_prefix_counts": prefix_counts(feature_names),
+            "materialized_from_online_store": True,
+        },
+        manifest_path,
+    )
+    return {"feature_table_base": table_base, "feature_bundle_path": bundle_path, "manifest_path": manifest_path}
+
+
+def load_feature_matrix_from_store(
+    segment_df: pd.DataFrame,
+    output_dir: Path,
+    config: dict[str, Any],
+    segments_dir: Path | None = None,
+) -> tuple[np.ndarray, list[str]]:
+    from sonata.primitives.slim_cache import feature_chunk_path, is_slim_chunk_name, resolve_slim_cache_paths
+
     slim_paths = resolve_slim_cache_paths(output_dir, config)
     indexed_df = segment_df.reset_index(drop=True).copy()
     indexed_df["__feature_row_index"] = np.arange(len(indexed_df), dtype=np.int64)
     feature_rows: list[np.ndarray | None] = [None] * len(indexed_df)
     feature_names: list[str] = []
     grouped = indexed_df.groupby("chunk_path", sort=True)
-    for chunk_name, rows in tqdm(grouped, total=grouped.ngroups, desc="Extract segment features"):
+    for chunk_name, rows in tqdm(grouped, total=grouped.ngroups, desc="Load segment features"):
         ordered_rows = rows.sort_values("chunk_index", kind="stable")
-        if is_slim_chunk_name(chunk_name) and feature_chunk_path(slim_paths, chunk_name).exists():
+        if chunk_name and is_slim_chunk_name(chunk_name) and feature_chunk_path(slim_paths, chunk_name).exists():
             bundle = np.load(feature_chunk_path(slim_paths, chunk_name), allow_pickle=True)
             chunk_names = [str(item) for item in bundle["feature_names"].tolist()]
             if not feature_names:
@@ -47,34 +85,27 @@ def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, outpu
                     raise ValueError(f"Slim feature segment id mismatch in chunk {chunk_name}")
                 feature_rows[int(row.__feature_row_index)] = chunk_matrix[idx]
             continue
+        if segments_dir is None:
+            raise FileNotFoundError(f"Missing raw segments_dir fallback for chunk {chunk_name}")
         bundle = np.load(segments_dir / str(chunk_name), allow_pickle=True)
         for row in ordered_rows.itertuples(index=False):
             vector, names = build_feature_vector(row=row, bundle=bundle, config=config)
             if not feature_names:
                 feature_names = names
+            elif feature_names != names:
+                raise ValueError(f"Incompatible raw feature names in chunk {chunk_name}")
             feature_rows[int(row.__feature_row_index)] = vector
     if not feature_rows:
-        feature_matrix = np.zeros((0, 0), dtype=np.float32)
-    else:
-        if any(vector is None for vector in feature_rows):
-            raise ValueError("Missing feature vectors while materializing feature bundle.")
-        feature_matrix = np.stack([np.asarray(vector, dtype=np.float32) for vector in feature_rows], axis=0).astype(np.float32)
-    feature_df = pd.concat([segment_df.reset_index(drop=True), pd.DataFrame(feature_matrix, columns=feature_names)], axis=1)
-    write_table(feature_df, table_base)
-    save_npz(bundle_path, feature_matrix=feature_matrix, feature_names=np.asarray(feature_names, dtype=object), segment_ids=segment_df["segment_id"].astype(str).to_numpy(dtype=object))
-    write_json(
-        {
-            "num_segments": int(len(segment_df)),
-            "num_features": int(feature_matrix.shape[1]),
-            "trajectory_resample_steps": int(config["trajectory_resample_steps"]),
-            "feature_prefix_counts": prefix_counts(feature_names),
-        },
-        manifest_path,
-    )
-    return {"feature_table_base": table_base, "feature_bundle_path": bundle_path, "manifest_path": manifest_path}
+        return np.zeros((0, 0), dtype=np.float32), feature_names
+    if any(vector is None for vector in feature_rows):
+        raise ValueError("Missing feature vectors while materializing feature matrix.")
+    feature_matrix = np.stack([np.asarray(vector, dtype=np.float32) for vector in feature_rows], axis=0).astype(np.float32)
+    return feature_matrix, feature_names
 
 
 def build_feature_vector(row, bundle: Any, config: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
+    from sonata.primitives.segmenters import load_segment_array
+
     idx = int(row.chunk_index)
     arrays = {
         "hand_joints": load_segment_array(bundle, "hand_joints", idx),
@@ -179,6 +210,21 @@ def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | No
     )
     names.extend(["contact_mean", "contact_density", "contact_nonzero_ratio"])
     return np.concatenate(pieces).astype(np.float32), names
+
+
+def build_gmr_target_from_arrays(arrays: dict[str, np.ndarray | None], config: dict[str, Any]) -> tuple[np.ndarray, str]:
+    target_name = "actions" if bool(config.get("gmr_target_actions", True)) and arrays.get("actions") is not None else "hand_joints"
+    trajectory = arrays.get(target_name)
+    if trajectory is None:
+        trajectory = arrays.get("hand_joints")
+        target_name = "hand_joints"
+    if trajectory is None:
+        raise ValueError("Cannot build GMR target without actions or hand_joints.")
+    return resample_time_axis(np.asarray(trajectory, dtype=np.float32), resolve_gmr_resample_steps(config)), target_name
+
+
+def resolve_gmr_resample_steps(config: dict[str, Any]) -> int:
+    return int(config.get("gmr_resample_steps", config.get("gmr_horizon", 32)))
 
 
 def _row_value(row: Any, name: str) -> Any:
