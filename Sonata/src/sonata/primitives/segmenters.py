@@ -270,6 +270,104 @@ def build_segmenter(config: dict[str, Any]) -> BaseSegmenter:
         )
     raise ValueError(f"Unknown segmentation strategy: {strategy}")
 
+def _atomic_save_npz(path: Path, **payload: Any) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    save_npz(tmp_path, **payload)
+    os.replace(tmp_path, path)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+
+
+def _append_rows_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    write_header = not path.exists() or path.stat().st_size == 0
+    df.to_csv(path, mode="a", header=write_header, index=False)
+
+
+def _read_partial_csv(path: Path) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+def _load_resume_manifest(manifest_path: Path) -> dict[str, Any]:
+    if not manifest_path.exists():
+        return {
+            "status": "new",
+            "next_chunk_index": 0,
+            "processed_episode_ids": [],
+            "chunk_files": [],
+            "num_segments_written": 0,
+            "num_score_events_written": 0,
+            "segment_strategy": None,
+        }
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    payload.setdefault("status", "partial")
+    payload.setdefault("next_chunk_index", 0)
+    payload.setdefault("processed_episode_ids", [])
+    payload.setdefault("chunk_files", [])
+    payload.setdefault("num_segments_written", 0)
+    payload.setdefault("num_score_events_written", 0)
+    payload.setdefault("segment_strategy", None)
+    return payload
+
+
+def _write_resume_manifest(
+    manifest_path: Path,
+    *,
+    status: str,
+    next_chunk_index: int,
+    processed_episode_ids: list[str],
+    chunk_files: list[str],
+    num_segments_written: int,
+    num_score_events_written: int,
+    config: dict[str, Any],
+) -> None:
+    _atomic_write_json(
+        manifest_path,
+        {
+            "status": status,
+            "next_chunk_index": int(next_chunk_index),
+            "processed_episode_ids": [str(item) for item in processed_episode_ids],
+            "chunk_files": [str(item) for item in chunk_files],
+            "num_segments_written": int(num_segments_written),
+            "num_score_events_written": int(num_score_events_written),
+            "segment_strategy": str(config["segmentation_strategy"]),
+            "segment_chunk_size": int(config["segment_chunk_size"]),
+        },
+    )
+
+
+def _collect_chunk_rows(flushed_rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    by_chunk: dict[str, list[dict[str, Any]]] = {}
+    for row in flushed_rows:
+        chunk_name = str(row["chunk_path"])
+        by_chunk.setdefault(chunk_name, []).append(row)
+    return by_chunk
+
+
+def _validate_existing_chunks(segments_dir: Path, chunk_files: list[str]) -> list[str]:
+    valid: list[str] = []
+    for chunk_name in chunk_files:
+        chunk_path = segments_dir / chunk_name
+        if not chunk_path.exists():
+            continue
+        try:
+            with np.load(chunk_path, allow_pickle=True) as bundle:
+                if "segment_ids" not in bundle:
+                    continue
+        except Exception:
+            continue
+        valid.append(chunk_name)
+    return valid
 
 def run_segmentation(manifest_df: pd.DataFrame, output_dir: Path, config: dict[str, Any], logger: logging.Logger | None = None) -> dict[str, Path]:
     if not online_segment_processing_enabled(config):
@@ -280,50 +378,200 @@ def run_segmentation(manifest_df: pd.DataFrame, output_dir: Path, config: dict[s
 def run_segmentation_legacy(manifest_df: pd.DataFrame, output_dir: Path, config: dict[str, Any]) -> dict[str, Path]:
     segments_dir = output_dir / "segments"
     segments_dir.mkdir(parents=True, exist_ok=True)
+
     table_base = segments_dir / "segment_index"
     score_base = segments_dir / "score_events"
     manifest_path = segments_dir / "segment_manifest.json"
-    if table_base.with_suffix(".csv").exists() and not bool(config.get("force", False)):
+
+    segment_partial_csv = segments_dir / "segment_index.partial.csv"
+    score_partial_csv = segments_dir / "score_events.partial.csv"
+
+    final_segment_csv = table_base.with_suffix(".csv")
+    final_score_csv = score_base.with_suffix(".csv")
+    force = bool(config.get("force", False))
+
+    if force:
+        for path in [segment_partial_csv, score_partial_csv, final_segment_csv, final_score_csv, manifest_path]:
+            if path.exists():
+                path.unlink()
+
+    if final_segment_csv.exists() and final_score_csv.exists() and not force:
         return {"segment_table_base": table_base, "score_table_base": score_base, "manifest_path": manifest_path}
 
+    resume_state = _load_resume_manifest(manifest_path)
+    resume_state["chunk_files"] = _validate_existing_chunks(segments_dir, resume_state.get("chunk_files", []))
+
     segmenter = build_segmenter(config)
-    writer = SegmentChunkWriter(output_dir=segments_dir, chunk_size=int(config["segment_chunk_size"]))
-    segment_rows: list[dict[str, Any]] = []
-    score_rows: list[dict[str, Any]] = []
+    writer = SegmentChunkWriter(
+        output_dir=segments_dir,
+        chunk_size=int(config["segment_chunk_size"]),
+        start_chunk_index=int(resume_state.get("next_chunk_index", 0)),
+        existing_chunk_files=resume_state.get("chunk_files", []),
+    )
 
-    for row in tqdm(manifest_df.itertuples(index=False), total=len(manifest_df), desc="Segment episodes"):
+    processed_episode_ids = {str(item) for item in resume_state.get("processed_episode_ids", [])}
+
+    existing_segment_df = _read_partial_csv(segment_partial_csv)
+    existing_score_df = _read_partial_csv(score_partial_csv)
+
+    num_segments_written = int(len(existing_segment_df))
+    existing_score_ids = (
+        set(existing_score_df["event_id"].astype(str).tolist())
+        if not existing_score_df.empty and "event_id" in existing_score_df.columns
+        else set()
+    )
+    num_score_events_written = int(len(existing_score_ids))
+
+    remaining_df = manifest_df[~manifest_df["episode_id"].astype(str).isin(processed_episode_ids)].reset_index(drop=True)
+
+    _write_resume_manifest(
+        manifest_path,
+        status="running",
+        next_chunk_index=writer.chunk_index,
+        processed_episode_ids=sorted(processed_episode_ids),
+        chunk_files=writer.chunk_files,
+        num_segments_written=num_segments_written,
+        num_score_events_written=num_score_events_written,
+        config=config,
+    )
+
+    for row in tqdm(remaining_df.itertuples(index=False), total=len(remaining_df), desc="Segment episodes"):
         episode = load_episode_record(row._asdict())
-        score_events = _load_or_infer_score_events(episode=episode, config=config)
-        score_rows.extend([event.as_row() for event in score_events])
-        for segment in iter_prepared_segments(
-            manifest_row=row,
-            episode=episode,
-            score_events=score_events,
-            segmenter=segmenter,
-            config=config,
-        ):
-            row_updates = writer.add(segment.row, segment.arrays)
-            segment_rows.extend(row_updates)
+        if episode.hand_joints is None:
+            processed_episode_ids.add(str(episode.episode_id))
+            _write_resume_manifest(
+                manifest_path,
+                status="running",
+                next_chunk_index=writer.chunk_index,
+                processed_episode_ids=sorted(processed_episode_ids),
+                chunk_files=writer.chunk_files,
+                num_segments_written=num_segments_written,
+                num_score_events_written=num_score_events_written,
+                config=config,
+            )
+            continue
 
-    segment_rows.extend(writer.flush())
-    segment_df = pd.DataFrame(segment_rows)
-    score_df = pd.DataFrame(score_rows).drop_duplicates(subset=["event_id"]).reset_index(drop=True)
+        if episode.note_path is not None and episode.note_path.exists():
+            try:
+                score_events = load_note_events(
+                    episode.note_path,
+                    episode.control_timestep,
+                    chord_tolerance_steps=int(config["chord_tolerance_steps"]),
+                    song_id=episode.song_id,
+                    episode_id=episode.episode_id,
+                )
+            except Exception:
+                score_events = infer_events_from_goal_roll(
+                    episode.goals if episode.goals is not None else episode.piano_states,
+                    song_id=episode.song_id,
+                    episode_id=episode.episode_id,
+                    control_timestep=episode.control_timestep,
+                    chord_tolerance_steps=int(config["chord_tolerance_steps"]),
+                    source="goals" if episode.goals is not None else "piano_states",
+                )
+        else:
+            roll = episode.goals if episode.goals is not None else episode.piano_states
+            score_events = infer_events_from_goal_roll(
+                roll,
+                song_id=episode.song_id,
+                episode_id=episode.episode_id,
+                control_timestep=episode.control_timestep,
+                chord_tolerance_steps=int(config["chord_tolerance_steps"]),
+                source="goals" if episode.goals is not None else "piano_states",
+            )
+
+        new_score_rows = []
+        for event in score_events:
+            event_row = event.as_row()
+            event_id = str(event_row["event_id"])
+            if event_id not in existing_score_ids:
+                existing_score_ids.add(event_id)
+                new_score_rows.append(event_row)
+
+        candidate_segments = segmenter.segment(episode, score_events)
+        for index, candidate in enumerate(candidate_segments):
+            arrays = slice_segment_arrays(episode, candidate.onset_step, candidate.end_step)
+            hand_joints = arrays["hand_joints"]
+            if hand_joints is None:
+                continue
+
+            velocity = arrays["joint_velocities"]
+            if velocity is None:
+                velocity = np.gradient(hand_joints, episode.control_timestep, axis=0).astype(np.float32)
+                arrays["joint_velocities"] = velocity
+
+            context = score_context_from_roll(
+                episode.goals if episode.goals is not None else episode.piano_states,
+                candidate.onset_step,
+            )
+
+            record = SegmentRecord(
+                segment_id=f"{episode.episode_id}_segment_{index:06d}",
+                song_id=episode.song_id,
+                episode_id=episode.episode_id,
+                onset_step=candidate.onset_step,
+                end_step=candidate.end_step,
+                duration_steps=max(candidate.end_step - candidate.onset_step, 1),
+                segment_source=candidate.segment_source,
+                score_event_id=candidate.score_event_id,
+                key_signature=candidate.key_signature,
+                chunk_path="",
+                chunk_index=-1,
+                heuristic_family=candidate.heuristic_family,
+                motion_energy=float(np.linalg.norm(velocity, axis=1).mean()),
+                chord_size=int(candidate.chord_size),
+                key_center=float(candidate.key_center),
+                start_state_norm=float(np.linalg.norm(hand_joints[0])),
+                end_state_norm=float(np.linalg.norm(hand_joints[-1])),
+                score_context_json=dumps_score_context(context),
+            )
+            writer.add(record.as_row() | {"split": row.split}, arrays)
+
+        flushed_rows = writer.flush()
+        if flushed_rows:
+            _append_rows_csv(segment_partial_csv, flushed_rows)
+            num_segments_written += len(flushed_rows)
+
+        if new_score_rows:
+            _append_rows_csv(score_partial_csv, new_score_rows)
+            num_score_events_written = len(existing_score_ids)
+
+        processed_episode_ids.add(str(episode.episode_id))
+        _write_resume_manifest(
+            manifest_path,
+            status="running",
+            next_chunk_index=writer.chunk_index,
+            processed_episode_ids=sorted(processed_episode_ids),
+            chunk_files=writer.chunk_files,
+            num_segments_written=num_segments_written,
+            num_score_events_written=num_score_events_written,
+            config=config,
+        )
+
+    final_flush_rows = writer.flush()
+    if final_flush_rows:
+        _append_rows_csv(segment_partial_csv, final_flush_rows)
+        num_segments_written += len(final_flush_rows)
+
+    segment_df = _read_partial_csv(segment_partial_csv)
+    score_df = _read_partial_csv(score_partial_csv)
+    if not score_df.empty and "event_id" in score_df.columns:
+        score_df = score_df.drop_duplicates(subset=["event_id"]).reset_index(drop=True)
+
     write_table(segment_df, table_base)
     write_table(score_df, score_base)
-    write_json(
-        {
-            "num_segments": int(len(segment_df)),
-            "num_score_events": int(len(score_df)),
-            "chunk_files": writer.chunk_files,
-            "segment_strategy": config["segmentation_strategy"],
-            "online_segment_processing": False,
-            "save_raw_segment_chunks": True,
-            "online_storage_format": "",
-            "write_full_segment_cache": True,
-            "write_slim_cache": False,
-        },
+
+    _write_resume_manifest(
         manifest_path,
+        status="completed",
+        next_chunk_index=writer.chunk_index,
+        processed_episode_ids=sorted(processed_episode_ids),
+        chunk_files=writer.chunk_files,
+        num_segments_written=int(len(segment_df)),
+        num_score_events_written=int(len(score_df)),
+        config=config,
     )
+
     return {"segment_table_base": table_base, "score_table_base": score_base, "manifest_path": manifest_path}
 
 
@@ -920,12 +1168,13 @@ class SegmentChunkWriter:
     output_dir: Path
     chunk_size: int
     start_chunk_index: int = 0
+    existing_chunk_files: list[str] | None = None
 
     def __post_init__(self) -> None:
         self.buffer_rows: list[dict[str, Any]] = []
         self.buffer_arrays: list[dict[str, np.ndarray | None]] = []
         self.chunk_index = int(self.start_chunk_index)
-        self.chunk_files: list[str] = []
+        self.chunk_files: list[str] = list(self.existing_chunk_files or [])
 
     def add(self, row: dict[str, Any], arrays: dict[str, np.ndarray | None]) -> list[dict[str, Any]]:
         self.buffer_rows.append(row)
@@ -937,22 +1186,31 @@ class SegmentChunkWriter:
     def flush(self) -> list[dict[str, Any]]:
         if not self.buffer_rows:
             return []
+
         chunk_name = f"segment_chunk_{self.chunk_index:05d}.npz"
         chunk_path = self.output_dir / chunk_name
-        payload: dict[str, Any] = {"segment_ids": np.asarray([row["segment_id"] for row in self.buffer_rows], dtype=object)}
+        payload: dict[str, Any] = {
+            "segment_ids": np.asarray([row["segment_id"] for row in self.buffer_rows], dtype=object)
+        }
+
         for field_name in sorted({key for item in self.buffer_arrays for key in item}):
             stacked, lengths, available = stack_variable([item.get(field_name) for item in self.buffer_arrays])
             payload[field_name] = stacked
             payload[f"{field_name}_lengths"] = lengths
             payload[f"{field_name}_available"] = available
-        save_npz(chunk_path, **payload)
+
+        _atomic_save_npz(chunk_path, **payload)
+
         flushed_rows: list[dict[str, Any]] = []
         for index, row in enumerate(self.buffer_rows):
             updated = dict(row)
             updated["chunk_path"] = chunk_name
             updated["chunk_index"] = index
             flushed_rows.append(updated)
-        self.chunk_files.append(chunk_name)
+
+        if chunk_name not in self.chunk_files:
+            self.chunk_files.append(chunk_name)
+
         self.chunk_index += 1
         self.buffer_rows = []
         self.buffer_arrays = []
