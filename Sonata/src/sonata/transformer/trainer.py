@@ -89,8 +89,8 @@ def run_transformer_training(config: dict[str, Any], logger: logging.Logger) -> 
             logger.info("Epoch %d train=%s val=%s", epoch, train_metrics, val_metrics)
             scheduler.step()
             monitor = float(val_metrics["loss"])
-            if monitor < best_metric:
-                best_metric = monitor
+            if epoch == start_epoch or monitor < best_metric:
+                best_metric = monitor if np.isfinite(monitor) else best_metric
                 best_checkpoint = save_checkpoint(
                     run_paths.checkpoints / "best.pt",
                     {
@@ -203,17 +203,21 @@ def evaluate(model, loader, device, model_type: str, topk: int) -> tuple[dict[st
         batch = move_to_device(batch, str(device))
         outputs = model(batch)
         loss, metrics = compute_loss(outputs, batch, model_type)
-        losses.append(float(loss.item()))
+        loss_value = float(loss.item())
+        if np.isfinite(loss_value):
+            losses.append(loss_value)
         primitive_acc.append(float(metrics.get("primitive_accuracy", 0.0)))
         if "primitive_logits" in outputs:
-            topk_hits = topk_accuracy(outputs["primitive_logits"], batch["target_primitive"], topk=topk)
+            primitive_logits = torch.nan_to_num(outputs["primitive_logits"])
+            topk_hits = topk_accuracy(primitive_logits, batch["target_primitive"], topk=topk)
             topk_acc.append(float(topk_hits))
-            predictions = outputs["primitive_logits"].argmax(dim=-1)
+            predictions = primitive_logits.argmax(dim=-1)
             for truth, pred in zip(batch["target_primitive"].tolist(), predictions.tolist()):
                 generated.append({"target_primitive": int(truth), "predicted_primitive": int(pred)})
-    perplexity = float(np.exp(np.mean(losses))) if model_type == "token_prediction" and losses else 0.0
+    val_loss = float(np.mean(losses)) if losses else float("inf")
+    perplexity = float(np.exp(val_loss)) if model_type == "token_prediction" and np.isfinite(val_loss) else float("inf")
     return {
-        "loss": float(np.mean(losses)) if losses else 0.0,
+        "loss": val_loss,
         "primitive_accuracy": float(np.mean(primitive_acc)) if primitive_acc else 0.0,
         "topk_accuracy": float(np.mean(topk_acc)) if topk_acc else 0.0,
         "perplexity": perplexity,
@@ -226,11 +230,14 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
         target = batch["action_target"]
         loss = F.mse_loss(pred, target)
         return loss, {"primitive_accuracy": 0.0}
-    primitive_loss = F.cross_entropy(outputs["primitive_logits"], batch["target_primitive"])
-    duration_loss = F.cross_entropy(outputs["duration_logits"], batch["target_duration"])
-    dynamics_loss = F.cross_entropy(outputs["dynamics_logits"], batch["target_dynamics"])
+    primitive_logits = torch.nan_to_num(outputs["primitive_logits"])
+    duration_logits = torch.nan_to_num(outputs["duration_logits"])
+    dynamics_logits = torch.nan_to_num(outputs["dynamics_logits"])
+    primitive_loss = F.cross_entropy(primitive_logits, batch["target_primitive"])
+    duration_loss = F.cross_entropy(duration_logits, batch["target_duration"])
+    dynamics_loss = F.cross_entropy(dynamics_logits, batch["target_dynamics"])
     loss = primitive_loss + 0.5 * duration_loss + 0.25 * dynamics_loss
-    predictions = outputs["primitive_logits"].argmax(dim=-1)
+    predictions = primitive_logits.argmax(dim=-1)
     primitive_accuracy = (predictions == batch["target_primitive"]).float().mean().item()
     return loss, {"primitive_accuracy": float(primitive_accuracy)}
 

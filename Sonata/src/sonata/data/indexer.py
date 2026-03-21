@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import math
@@ -37,11 +38,20 @@ def scan_dataset(config: dict[str, Any], logger: logging.Logger) -> dict[str, Pa
 
     dataset_root = Path(config["dataset_root"]).resolve()
     note_search_roots = [Path(path).resolve() for path in config.get("note_search_roots", [])]
+    scan_num_workers = _positive_int(config.get("scan_num_workers")) or 0
     if dataset_root.name.endswith(".zarr"):
-        songs = _scan_zarr_root(dataset_root=dataset_root, note_search_roots=note_search_roots)
+        songs = _scan_zarr_root(
+            dataset_root=dataset_root,
+            note_search_roots=note_search_roots,
+            num_workers=scan_num_workers,
+        )
         backend = "zarr"
     else:
-        songs = _scan_npy_root(dataset_root=dataset_root, note_search_roots=note_search_roots)
+        songs = _scan_npy_root(
+            dataset_root=dataset_root,
+            note_search_roots=note_search_roots,
+            num_workers=scan_num_workers,
+        )
         backend = "npy_dir"
     if not songs:
         raise FileNotFoundError(f"No songs found under Sonata dataset root: {dataset_root}")
@@ -110,76 +120,92 @@ def scan_dataset(config: dict[str, Any], logger: logging.Logger) -> dict[str, Pa
     return {"manifest_base": manifest_base, "split_base": split_base, "summary_path": summary_path}
 
 
-def _scan_zarr_root(dataset_root: Path, note_search_roots: list[Path]) -> list[dict[str, Any]]:
-    songs: list[dict[str, Any]] = []
-    for song_dir in sorted(path for path in dataset_root.iterdir() if path.is_dir() and (path / ".zgroup").exists()):
-        dims: dict[str, int] = {}
-        num_episodes = 0
-        num_steps = 0
-        for array_name in ARRAY_NAMES:
-            zarray_path = song_dir / array_name / ".zarray"
-            if not zarray_path.exists():
-                continue
-            metadata = json.loads(zarray_path.read_text())
-            shape = list(metadata.get("shape", []))
-            if len(shape) >= 2:
-                num_episodes = max(num_episodes, int(shape[0]))
-                num_steps = max(num_steps, int(shape[1]))
-            dims[array_name] = int(shape[2]) if len(shape) >= 3 else 1
-        if not dims:
-            continue
-        song_id = song_dir.name
-        songs.append(
-            {
-                "song_id": song_id,
-                "song_key": song_id,
-                "song_path": "",
-                "note_path": str(_find_note_path(song_id=song_id, note_search_roots=note_search_roots) or ""),
-                "num_episodes": int(num_episodes),
-                "num_steps": int(num_steps),
-                "dims": dims,
-            }
-        )
-    return songs
+def _scan_zarr_root(
+    dataset_root: Path,
+    note_search_roots: list[Path],
+    num_workers: int = 0,
+) -> list[dict[str, Any]]:
+    song_dirs = sorted(path for path in dataset_root.iterdir() if path.is_dir() and (path / ".zgroup").exists())
+    songs = _parallel_map_ordered(
+        song_dirs,
+        lambda song_dir: _scan_zarr_song(song_dir, note_search_roots),
+        num_workers=num_workers,
+    )
+    return [song for song in songs if song is not None]
 
 
-def _scan_npy_root(dataset_root: Path, note_search_roots: list[Path]) -> list[dict[str, Any]]:
-    songs: list[dict[str, Any]] = []
+def _scan_npy_root(
+    dataset_root: Path,
+    note_search_roots: list[Path],
+    num_workers: int = 0,
+) -> list[dict[str, Any]]:
     candidates = [path for path in sorted(dataset_root.iterdir()) if path.is_dir()]
     if not candidates and any((dataset_root / f"{name}.npy").exists() for name in ARRAY_NAMES):
         candidates = [dataset_root]
+    songs = _parallel_map_ordered(
+        candidates,
+        lambda song_dir: _scan_npy_song(song_dir, note_search_roots),
+        num_workers=num_workers,
+    )
+    return [song for song in songs if song is not None]
 
-    for song_dir in candidates:
-        dims: dict[str, int] = {}
-        num_episodes = 0
-        num_steps = 0
-        for array_name in ARRAY_NAMES:
-            shape = _discover_npy_shape(song_dir=song_dir, array_name=array_name)
-            if shape is None:
-                continue
-            if len(shape) >= 2:
-                num_steps = max(num_steps, int(shape[-2]))
-            if len(shape) >= 3:
-                num_episodes = max(num_episodes, int(shape[0]))
-                dims[array_name] = int(shape[2])
-            elif len(shape) == 2:
-                num_episodes = max(num_episodes, 1)
-                dims[array_name] = int(shape[1])
-        if not dims:
+
+def _scan_zarr_song(song_dir: Path, note_search_roots: list[Path]) -> dict[str, Any] | None:
+    dims: dict[str, int] = {}
+    num_episodes = 0
+    num_steps = 0
+    for array_name in ARRAY_NAMES:
+        zarray_path = song_dir / array_name / ".zarray"
+        if not zarray_path.exists():
             continue
-        song_id = song_dir.name
-        songs.append(
-            {
-                "song_id": song_id,
-                "song_key": song_id,
-                "song_path": str(song_dir.resolve()),
-                "note_path": str(_find_note_path(song_id=song_id, note_search_roots=note_search_roots) or ""),
-                "num_episodes": int(num_episodes),
-                "num_steps": int(num_steps),
-                "dims": dims,
-            }
-        )
-    return songs
+        metadata = json.loads(zarray_path.read_text())
+        shape = list(metadata.get("shape", []))
+        if len(shape) >= 2:
+            num_episodes = max(num_episodes, int(shape[0]))
+            num_steps = max(num_steps, int(shape[1]))
+        dims[array_name] = int(shape[2]) if len(shape) >= 3 else 1
+    if not dims:
+        return None
+    song_id = song_dir.name
+    return {
+        "song_id": song_id,
+        "song_key": song_id,
+        "song_path": "",
+        "note_path": str(_find_note_path(song_id=song_id, note_search_roots=note_search_roots) or ""),
+        "num_episodes": int(num_episodes),
+        "num_steps": int(num_steps),
+        "dims": dims,
+    }
+
+
+def _scan_npy_song(song_dir: Path, note_search_roots: list[Path]) -> dict[str, Any] | None:
+    dims: dict[str, int] = {}
+    num_episodes = 0
+    num_steps = 0
+    for array_name in ARRAY_NAMES:
+        shape = _discover_npy_shape(song_dir=song_dir, array_name=array_name)
+        if shape is None:
+            continue
+        if len(shape) >= 2:
+            num_steps = max(num_steps, int(shape[-2]))
+        if len(shape) >= 3:
+            num_episodes = max(num_episodes, int(shape[0]))
+            dims[array_name] = int(shape[2])
+        elif len(shape) == 2:
+            num_episodes = max(num_episodes, 1)
+            dims[array_name] = int(shape[1])
+    if not dims:
+        return None
+    song_id = song_dir.name
+    return {
+        "song_id": song_id,
+        "song_key": song_id,
+        "song_path": str(song_dir.resolve()),
+        "note_path": str(_find_note_path(song_id=song_id, note_search_roots=note_search_roots) or ""),
+        "num_episodes": int(num_episodes),
+        "num_steps": int(num_steps),
+        "dims": dims,
+    }
 
 
 def _discover_npy_shape(song_dir: Path, array_name: str) -> tuple[int, ...] | None:
@@ -299,3 +325,15 @@ def _positive_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _parallel_map_ordered(
+    items: list[Path],
+    fn,
+    *,
+    num_workers: int,
+) -> list[dict[str, Any] | None]:
+    if num_workers <= 1 or len(items) <= 1:
+        return [fn(item) for item in items]
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        return list(executor.map(fn, items))

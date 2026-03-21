@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 
@@ -11,7 +12,8 @@ import pandas as pd
 from tqdm import tqdm
 
 from sonata.primitives.segmenters import load_segment_array
-from sonata.utils.io import read_table, save_npz, write_json, write_table
+from sonata.primitives.slim_cache import feature_chunk_path, is_slim_chunk_name, resolve_slim_cache_paths
+from sonata.utils.io import save_npz, write_json, write_table
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -21,9 +23,9 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _atomic_save_npz(path: Path, **payload: Any) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    save_npz(tmp_path, **payload)
-    os.replace(tmp_path, path)
+    tmp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
+    saved_path = save_npz(tmp_path, **payload)
+    os.replace(saved_path, path)
 
 
 def _load_feature_manifest(path: Path) -> dict[str, Any]:
@@ -58,6 +60,52 @@ def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, outpu
 
     if final_table_csv.exists() and bundle_path.exists() and not force:
         return {"feature_table_base": table_base, "feature_bundle_path": bundle_path, "manifest_path": manifest_path}
+
+    chunk_paths = (
+        segment_df["chunk_path"].astype(str).fillna("").tolist()
+        if "chunk_path" in segment_df.columns
+        else []
+    )
+    if chunk_paths and all(is_slim_chunk_name(chunk_path) for chunk_path in chunk_paths):
+        feature_matrix, feature_names = load_feature_matrix_from_store(
+            segment_df=segment_df,
+            output_dir=output_dir,
+            config=config,
+        )
+        if feature_names:
+            feature_df = pd.concat(
+                [
+                    segment_df.reset_index(drop=True),
+                    pd.DataFrame(feature_matrix, columns=feature_names),
+                ],
+                axis=1,
+            )
+        else:
+            feature_df = segment_df.reset_index(drop=True).copy()
+        write_table(feature_df, table_base)
+        _atomic_save_npz(
+            bundle_path,
+            feature_matrix=np.asarray(feature_matrix, dtype=np.float32),
+            feature_names=np.asarray(feature_names, dtype=object),
+            segment_ids=feature_df["segment_id"].astype(str).to_numpy(dtype=object)
+            if "segment_id" in feature_df.columns
+            else np.asarray([], dtype=object),
+        )
+        write_json(
+            {
+                "status": "completed",
+                "num_segments": int(feature_matrix.shape[0]),
+                "num_features": int(feature_matrix.shape[1]) if feature_matrix.ndim == 2 else 0,
+                "feature_prefix_counts": prefix_counts(feature_names),
+                "source": "slim_store",
+            },
+            manifest_path,
+        )
+        return {
+            "feature_table_base": table_base,
+            "feature_bundle_path": bundle_path,
+            "manifest_path": manifest_path,
+        }
 
     manifest = _load_feature_manifest(manifest_path)
     completed_chunk_paths = set(str(item) for item in manifest.get("completed_chunk_paths", []))
@@ -132,6 +180,7 @@ def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, outpu
 
     write_json(
         {
+            "status": "completed",
             "num_segments": int(feature_matrix.shape[0]),
             "num_features": int(feature_matrix.shape[1]) if feature_matrix.ndim == 2 else 0,
             "feature_prefix_counts": prefix_counts(feature_names),
@@ -142,9 +191,91 @@ def extract_segment_features(segment_df: pd.DataFrame, segments_dir: Path, outpu
     return {"feature_table_base": table_base, "feature_bundle_path": bundle_path, "manifest_path": manifest_path}
 
 
-def build_feature_vector(row, bundle: Any, config: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
-    from sonata.primitives.segmenters import load_segment_array
+def load_feature_matrix_from_store(
+    segment_df: pd.DataFrame,
+    output_dir: Path,
+    config: dict[str, Any],
+) -> tuple[np.ndarray, list[str]]:
+    if segment_df.empty:
+        return np.zeros((0, 0), dtype=np.float32), []
+    if "chunk_path" not in segment_df.columns or "chunk_index" not in segment_df.columns:
+        raise ValueError("Segment table must include chunk_path and chunk_index to load slim feature chunks.")
 
+    paths = resolve_slim_cache_paths(output_dir, config)
+    ordered = segment_df.reset_index(drop=True).copy()
+    ordered["_row_position"] = np.arange(len(ordered), dtype=np.int64)
+    grouped_items = list(ordered.groupby("chunk_path", sort=False))
+    num_workers = _positive_int(config.get("feature_num_workers")) or 0
+    if num_workers > 1 and len(grouped_items) > 1:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            results = list(
+                executor.map(
+                    lambda item: _load_feature_rows_from_store_chunk(
+                        paths=paths,
+                        chunk_name=str(item[0]),
+                        rows=item[1],
+                    ),
+                    grouped_items,
+                )
+            )
+    else:
+        results = [
+            _load_feature_rows_from_store_chunk(paths=paths, chunk_name=str(chunk_name), rows=rows)
+            for chunk_name, rows in grouped_items
+        ]
+
+    first_names = next((names for _, _, names in results if names), [])
+    feature_dim = len(first_names)
+    if feature_dim == 0:
+        return np.zeros((len(ordered), 0), dtype=np.float32), []
+    feature_matrix = np.zeros((len(ordered), feature_dim), dtype=np.float32)
+    for positions, chunk_matrix, feature_names in results:
+        if list(feature_names) != list(first_names):
+            raise ValueError("Incompatible feature names found across slim feature chunks.")
+        feature_matrix[np.asarray(positions, dtype=np.int64)] = np.asarray(chunk_matrix, dtype=np.float32)
+    return feature_matrix, list(first_names)
+
+
+def _load_feature_rows_from_store_chunk(
+    *,
+    paths,
+    chunk_name: str,
+    rows: pd.DataFrame,
+) -> tuple[list[int], np.ndarray, list[str]]:
+    if not is_slim_chunk_name(chunk_name):
+        raise ValueError(f"Expected slim chunk path, found: {chunk_name}")
+    chunk_path = feature_chunk_path(paths, chunk_name)
+    if not chunk_path.exists():
+        raise FileNotFoundError(f"Missing slim feature chunk: {chunk_path}")
+    bundle = np.load(chunk_path, allow_pickle=True)
+    segment_ids = np.asarray(bundle["segment_ids"], dtype=object)
+    feature_matrix = np.asarray(bundle["feature_matrix"], dtype=np.float32)
+    feature_names = [str(item) for item in np.asarray(bundle["feature_names"], dtype=object).tolist()]
+
+    ordered_rows = rows.sort_values("chunk_index", kind="stable")
+    positions: list[int] = []
+    values: list[np.ndarray] = []
+    for row_position, chunk_index, segment_id in ordered_rows[
+        ["_row_position", "chunk_index", "segment_id"]
+    ].itertuples(index=False, name=None):
+        chunk_index = int(chunk_index)
+        if chunk_index < 0 or chunk_index >= len(segment_ids):
+            raise IndexError(f"Chunk index {chunk_index} is out of range for {chunk_name}")
+        expected_segment_id = str(segment_id)
+        actual_segment_id = str(segment_ids[chunk_index])
+        if actual_segment_id != expected_segment_id:
+            raise ValueError(
+                f"Slim feature segment id mismatch in {chunk_name}: "
+                f"expected {expected_segment_id}, found {actual_segment_id}"
+            )
+        positions.append(int(row_position))
+        values.append(feature_matrix[chunk_index])
+    if values:
+        return positions, np.stack(values, axis=0).astype(np.float32), feature_names
+    return positions, np.zeros((0, len(feature_names)), dtype=np.float32), feature_names
+
+
+def build_feature_vector(row, bundle: Any, config: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
     idx = int(row.chunk_index)
     arrays = {
         "hand_joints": load_segment_array(bundle, "hand_joints", idx),
@@ -289,3 +420,11 @@ def prefix_counts(names: list[str]) -> dict[str, int]:
         prefix = name.split("_", 1)[0]
         counts[prefix] = counts.get(prefix, 0) + 1
     return counts
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None

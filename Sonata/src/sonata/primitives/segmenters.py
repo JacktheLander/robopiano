@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -7,6 +9,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 import numpy as np
@@ -64,6 +67,14 @@ class PreparedSegment:
     gmr_target_name: str
     arrays: dict[str, np.ndarray | None]
     raw_bytes_estimate: int
+
+
+@dataclass
+class PreparedEpisodeBatch:
+    song_id: str
+    episode_id: str
+    score_rows: list[dict[str, Any]]
+    prepared_segments: list[PreparedSegment]
 
 
 class BaseSegmenter:
@@ -274,9 +285,9 @@ def build_segmenter(config: dict[str, Any]) -> BaseSegmenter:
     raise ValueError(f"Unknown segmentation strategy: {strategy}")
 
 def _atomic_save_npz(path: Path, **payload: Any) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    save_npz(tmp_path, **payload)
-    os.replace(tmp_path, path)
+    tmp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
+    saved_path = save_npz(tmp_path, **payload)
+    os.replace(saved_path, path)
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -621,6 +632,11 @@ def run_segmentation_slim(
     if not existing_segment_df.empty and "episode_id" in existing_segment_df.columns:
         processed_episode_ids.update(existing_segment_df["episode_id"].astype(str).tolist())
 
+    remaining_df = manifest_df[
+        ~manifest_df["episode_id"].astype(str).isin(processed_episode_ids)
+    ].reset_index(drop=True)
+    skipped_episodes = int(len(manifest_df) - len(remaining_df))
+
     segmenter = build_segmenter(config)
     slim_writer = OnlineSegmentWriter(
         output_dir=output_dir,
@@ -638,43 +654,43 @@ def run_segmentation_slim(
         )
 
     new_score_rows: list[dict[str, Any]] = []
-    skipped_episodes = 0
-    for row in tqdm(manifest_df.itertuples(index=False), total=len(manifest_df), desc="Segment episodes"):
-        episode_id = str(row.episode_id)
-        if episode_id in processed_episode_ids:
-            skipped_episodes += 1
-            continue
-        episode = load_episode_record(row._asdict())
-        score_events = _load_or_infer_score_events(episode=episode, config=config)
-        new_score_rows.extend([event.as_row() for event in score_events])
-        if raw_writer is None:
-            produced_segments = 0
-            for segment in iter_prepared_segments(
-                manifest_row=row,
-                episode=episode,
-                score_events=score_events,
-                segmenter=segmenter,
-                config=config,
-            ):
-                if produced_segments == 0:
-                    slim_writer.begin_episode(song_id=str(row.song_id), episode_id=episode_id)
-                slim_writer.append_segment(
-                    row=segment.row,
-                    feature_vector=segment.feature_vector,
-                    feature_names=segment.feature_names,
-                    gmr_target=segment.gmr_target,
-                    target_name=segment.gmr_target_name,
-                    raw_segment_bytes=segment.raw_bytes_estimate,
-                )
-                produced_segments += 1
-            if produced_segments:
+    if raw_writer is None:
+        segment_num_workers = _positive_int(config.get("segment_num_workers")) or 0
+        prepared_batches = _iter_prepared_episode_batches(
+            manifest_df=remaining_df,
+            config=config,
+            max_workers=segment_num_workers,
+        )
+        for batch in tqdm(prepared_batches, total=len(remaining_df), desc="Segment episodes"):
+            new_score_rows.extend(batch.score_rows)
+            if batch.prepared_segments:
+                slim_writer.begin_episode(song_id=batch.song_id, episode_id=batch.episode_id)
+                for segment in batch.prepared_segments:
+                    slim_writer.append_segment(
+                        row=segment.row,
+                        feature_vector=segment.feature_vector,
+                        feature_names=segment.feature_names,
+                        gmr_target=segment.gmr_target,
+                        target_name=segment.gmr_target_name,
+                        raw_segment_bytes=segment.raw_bytes_estimate,
+                    )
                 _record_episode_progress(slim_paths, slim_writer.end_episode())
             else:
                 append_episode_progress(
                     slim_paths,
-                    _episode_progress_payload(song_id=str(row.song_id), episode_id=episode_id, num_segments=0),
+                    _episode_progress_payload(
+                        song_id=batch.song_id,
+                        episode_id=batch.episode_id,
+                        num_segments=0,
+                    ),
                 )
-        else:
+            processed_episode_ids.add(batch.episode_id)
+    else:
+        for row in tqdm(remaining_df.itertuples(index=False), total=len(remaining_df), desc="Segment episodes"):
+            episode_id = str(row.episode_id)
+            episode = load_episode_record(row._asdict())
+            score_events = _load_or_infer_score_events(episode=episode, config=config)
+            new_score_rows.extend([event.as_row() for event in score_events])
             prepared_segments = list(
                 iter_prepared_segments(
                     manifest_row=row,
@@ -709,7 +725,7 @@ def run_segmentation_slim(
                     raw_segment_bytes=segment.raw_bytes_estimate,
                 )
             _record_episode_progress(slim_paths, slim_writer.end_episode())
-        processed_episode_ids.add(episode_id)
+            processed_episode_ids.add(episode_id)
 
     _record_episode_progress(slim_paths, slim_writer.flush())
     slim_segment_df = load_slim_index_table(slim_paths)
@@ -755,6 +771,7 @@ def run_segmentation_slim(
     write_table(score_df, score_base)
     write_json(
         {
+            "status": "completed",
             "num_segments": int(len(segment_df)),
             "num_score_events": int(len(score_df)),
             "chunk_files": sorted(path.name for path in segments_dir.glob("segment_chunk_*.npz")),
@@ -862,6 +879,55 @@ def _load_or_infer_score_events(episode, config: dict[str, Any]) -> list[ScoreEv
         control_timestep=episode.control_timestep,
         chord_tolerance_steps=int(config["chord_tolerance_steps"]),
         source="goals" if episode.goals is not None else "piano_states",
+    )
+
+
+def _iter_prepared_episode_batches(
+    manifest_df: pd.DataFrame,
+    config: dict[str, Any],
+    max_workers: int,
+) -> Iterator[PreparedEpisodeBatch]:
+    payloads = [row._asdict() for row in manifest_df.itertuples(index=False)]
+    if max_workers <= 1 or len(payloads) <= 1:
+        for payload in payloads:
+            yield _prepare_episode_batch(payload, config)
+        return
+
+    in_flight_limit = max(max_workers * 2, 1)
+    iterator = iter(payloads)
+    futures: deque = deque()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for _ in range(min(in_flight_limit, len(payloads))):
+            payload = next(iterator, None)
+            if payload is None:
+                break
+            futures.append(executor.submit(_prepare_episode_batch, payload, config))
+        while futures:
+            future = futures.popleft()
+            yield future.result()
+            payload = next(iterator, None)
+            if payload is not None:
+                futures.append(executor.submit(_prepare_episode_batch, payload, config))
+
+
+def _prepare_episode_batch(manifest_row_payload: dict[str, Any], config: dict[str, Any]) -> PreparedEpisodeBatch:
+    manifest_row = SimpleNamespace(**manifest_row_payload)
+    episode = load_episode_record(manifest_row_payload)
+    score_events = _load_or_infer_score_events(episode=episode, config=config)
+    prepared_segments = list(
+        iter_prepared_segments(
+            manifest_row=manifest_row,
+            episode=episode,
+            score_events=score_events,
+            segmenter=build_segmenter(config),
+            config=config,
+        )
+    )
+    return PreparedEpisodeBatch(
+        song_id=str(manifest_row.song_id),
+        episode_id=str(manifest_row.episode_id),
+        score_rows=[event.as_row() for event in score_events],
+        prepared_segments=prepared_segments,
     )
 
 
@@ -1225,6 +1291,14 @@ class SegmentChunkWriter:
         self.buffer_rows = [dict(row) for row in rows]
         self.buffer_arrays = list(arrays)
         return self.flush()
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _next_raw_chunk_index(segments_dir: Path) -> int:

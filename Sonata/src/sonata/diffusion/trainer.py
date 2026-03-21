@@ -119,7 +119,7 @@ def run_diffusion_training(config: dict[str, Any], logger: logging.Logger, joint
                 wandb_run.summary({"resume/checkpoint": str(checkpoint), "resume/start_epoch": start_epoch})
 
         for epoch in range(start_epoch, int(config["epochs"])):
-            train_metrics = diffusion_epoch(
+            train_metrics, _ = diffusion_epoch(
                 model=model,
                 primitive_embed=primitive_embed,
                 planner=planner,
@@ -146,8 +146,9 @@ def run_diffusion_training(config: dict[str, Any], logger: logging.Logger, joint
             wandb_run.log(row, step=epoch)
             logger.info("Epoch %d train=%s val=%s", epoch, train_metrics, val_metrics)
             scheduler.step()
-            if val_metrics["loss"] < best_loss:
-                best_loss = val_metrics["loss"]
+            monitor = float(val_metrics["loss"])
+            if epoch == start_epoch or (np.isfinite(monitor) and monitor < best_loss):
+                best_loss = monitor if np.isfinite(monitor) else best_loss
                 best_checkpoint = save_checkpoint(
                     run_paths.checkpoints / "best.pt",
                     {
@@ -290,20 +291,22 @@ def diffusion_epoch(model, primitive_embed, planner, loader, optimizer, diffusio
 
 
 def build_condition_vector(batch, primitive_embed, planner, config: dict[str, Any]) -> torch.Tensor:
-    score = batch["score_context"]
-    state = batch["state_context"]
-    scalar = torch.stack(
+    score = torch.nan_to_num(batch["score_context"])
+    state = torch.nan_to_num(batch["state_context"])
+    scalar = torch.nan_to_num(
+        torch.stack(
         [
             batch["duration_bucket"].float(),
             batch["dynamics_bucket"].float(),
             batch["primitive_index"].float(),
         ],
         dim=-1,
+        )
     )
     if planner is not None and str(config["variant"]) != "diffusion_only":
         with torch.set_grad_enabled(any(parameter.requires_grad for parameter in planner.parameters())):
             planner_outputs = planner(batch)
-            plan = planner_outputs["plan_embedding"]
-        return torch.cat([score, state, scalar, plan], dim=-1)
-    primitive = primitive_embed(batch["primitive_index"])
-    return torch.cat([score, state, scalar, primitive], dim=-1)
+            plan = torch.nan_to_num(planner_outputs["plan_embedding"])
+        return torch.nan_to_num(torch.cat([score, state, scalar, plan], dim=-1))
+    primitive = torch.nan_to_num(primitive_embed(batch["primitive_index"]))
+    return torch.nan_to_num(torch.cat([score, state, scalar, primitive], dim=-1))

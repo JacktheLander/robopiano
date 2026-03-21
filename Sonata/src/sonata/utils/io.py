@@ -65,6 +65,7 @@ def append_csv_row(path: str | Path, fieldnames: list[str], row: dict[str, Any])
 
 def save_npz(path: str | Path, **arrays: Any) -> Path:
     resolved = Path(path).resolve()
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(resolved, **arrays)
-    return resolved
+    target = resolved if resolved.suffix == ".npz" else resolved.with_name(f"{resolved.name}.npz")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(target, **arrays)
+    return target

@@ -9,7 +9,7 @@ note_search_roots:
   - ../../../robopianist/music/data
 subset_mode: all
 max_songs: 0
-max_episodes: 0
+max_episodes: 20
 debug_num_songs: 8
 split_seed: 7
 split_ratios:
@@ -17,3 +17,4 @@ split_ratios:
   val: 0.1
   test: 0.1
 force: false
+scan_num_workers: 16

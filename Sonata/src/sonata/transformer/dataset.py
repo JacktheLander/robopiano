@@ -24,7 +24,7 @@ def parse_score_context(raw: str) -> np.ndarray:
         ],
         dtype=np.float32,
     )
-    return np.concatenate([histogram, scalars], axis=0).astype(np.float32)
+    return np.nan_to_num(np.concatenate([histogram, scalars], axis=0).astype(np.float32))
 
 
 def build_planner_context(row: pd.Series) -> np.ndarray:
@@ -40,7 +40,7 @@ def build_planner_context(row: pd.Series) -> np.ndarray:
         ],
         dtype=np.float32,
     )
-    return np.concatenate([score, scalars], axis=0)
+    return np.nan_to_num(np.concatenate([score, scalars], axis=0).astype(np.float32))
 
 
 @dataclass
@@ -156,11 +156,13 @@ def planner_collate_fn(batch: list[dict[str, Any]], metadata: PlannerMetadata) -
     attention_mask = np.zeros((batch_size, max_length), dtype=np.float32)
     for index, item in enumerate(batch):
         length = len(item["primitive_history"])
-        primitive[index, -length:] = item["primitive_history"]
-        duration[index, -length:] = item["duration_history"]
-        dynamics[index, -length:] = item["dynamics_history"]
-        score[index, -length:] = item["score_history"]
-        attention_mask[index, -length:] = 1.0
+        # Right padding keeps valid tokens in a causal prefix and avoids NaNs
+        # from mixed-length batches inside the planner transformer.
+        primitive[index, :length] = item["primitive_history"]
+        duration[index, :length] = item["duration_history"]
+        dynamics[index, :length] = item["dynamics_history"]
+        score[index, :length] = item["score_history"]
+        attention_mask[index, :length] = 1.0
     return {
         "primitive_history": torch.from_numpy(primitive),
         "duration_history": torch.from_numpy(duration),
@@ -194,13 +196,27 @@ def load_transformer_inputs(primitive_root: Path) -> tuple[pd.DataFrame, Planner
     token_df = read_table(primitive_root / "tokens" / "primitive_tokens")
     vocabulary = read_json(primitive_root / "tokens" / "primitive_vocabulary.json")
     score_dim = build_planner_context(token_df.iloc[0]).shape[0] if not token_df.empty else 20
+    duration_buckets = [int(value) for value in vocabulary.get("duration_buckets", [])]
+    dynamics_buckets = [int(value) for value in vocabulary.get("dynamics_buckets", [])]
+    num_duration_buckets = int(
+        vocabulary.get(
+            "num_duration_buckets",
+            (max(duration_buckets) + 1) if duration_buckets else 1,
+        )
+    )
+    num_dynamics_buckets = int(
+        vocabulary.get(
+            "num_dynamics_buckets",
+            (max(dynamics_buckets) + 1) if dynamics_buckets else 1,
+        )
+    )
     metadata = PlannerMetadata(
         num_primitives=int(vocabulary["num_primitives"]),
-        num_duration_buckets=len(vocabulary["duration_buckets"]),
-        num_dynamics_buckets=len(vocabulary["dynamics_buckets"]),
+        num_duration_buckets=num_duration_buckets,
+        num_dynamics_buckets=num_dynamics_buckets,
         score_dim=score_dim,
         pad_primitive=int(vocabulary["num_primitives"]),
-        pad_duration=len(vocabulary["duration_buckets"]),
-        pad_dynamics=len(vocabulary["dynamics_buckets"]),
+        pad_duration=num_duration_buckets,
+        pad_dynamics=num_dynamics_buckets,
     )
     return token_df, metadata
