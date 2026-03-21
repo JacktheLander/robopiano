@@ -10,7 +10,6 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from sonata.config import deep_update, load_stage_config, resolve_path
-from sonata.primitives.discovery import run_primitive_pipeline
 from sonata.utils.logging import configure_logging
 from sonata.utils.wandb import add_wandb_arguments, apply_wandb_cli_overrides
 
@@ -28,6 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    from sonata.primitives.discovery import run_primitive_pipeline
+
     config = load_stage_config("primitive", profile=args.profile, config_path=args.config)
     config = apply_wandb_cli_overrides(config, args)
     config_dir = resolve_path(config["config_path"]).parent
