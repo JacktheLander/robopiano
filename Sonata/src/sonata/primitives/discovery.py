@@ -16,7 +16,7 @@ from sklearn.preprocessing import StandardScaler
 
 from sonata.data.indexer import scan_dataset
 from sonata.data.loading import load_manifest
-from sonata.primitives.features import load_feature_matrix_from_store, resolve_gmr_resample_steps
+from sonata.primitives.features import extract_segment_features, resolve_gmr_resample_steps
 from sonata.primitives.gmr import PhaseGMR
 from sonata.primitives.segmenters import load_segment_arrays_from_bundle, run_segmentation
 from sonata.primitives.slim_cache import (
@@ -68,6 +68,11 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
         segment_outputs = run_segmentation(manifest_df=manifest_df, output_dir=primitive_root, config=config)
         if _read_stage_status(segment_outputs["manifest_path"]) != "completed":
             raise RuntimeError("Segmentation did not complete successfully; resume Stage 1 before continuing.")
+        compact_store_manifest = segment_outputs.get("compact_store_manifest_path")
+        if compact_store_manifest is not None and compact_store_manifest.exists():
+            store_summary = read_json(compact_store_manifest)
+        else:
+            store_summary = summarize_slim_cache(resolve_slim_cache_paths(primitive_root, config))
 
         segment_df = read_table(segment_outputs["segment_table_base"])
 

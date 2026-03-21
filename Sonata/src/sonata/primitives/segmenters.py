@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,6 +24,7 @@ from sonata.primitives.slim_cache import (
     compact_store_manifest_path,
     compose_segment_index,
     ensure_segment_index_columns,
+    is_slim_chunk_name,
     list_incomplete_slim_chunks,
     load_completed_episodes,
     read_compact_store_manifest,
