@@ -1,39 +1,47 @@
 primitive_root: ../../outputs/primitives/medium
 output_root: ../../outputs/transformer
-experiment_name: Sonata-3-medium-planner
+experiment_name: Sonata-3-medium-planner-tuned-v1
 wandb:
   enabled: true
   project: robopianist
   entity: tnguyen31-santa-clara-university
   mode: online
-  tags: ["sonata", "transformer", "medium"]
+  tags: ["sonata", "transformer", "medium", "tuned"]
+
 seed: 7
 device: cuda
 resume: false
 deterministic_eval: true
+
 model_variant: token_prediction
 context_length: 48
 batch_size: 64
-num_workers: 2
-epochs: 20
-learning_rate: 0.0001
-min_learning_rate: 0.00001
-lr_warmup_epochs: 2
-warmup_start_factor: 0.2
-weight_decay: 0.001
-d_model: 256
-nhead: 8
-num_layers: 6
-dim_feedforward: 768
-dropout: 0.2
-gradient_clip_norm: 1.0
-label_smoothing: 0.05
+num_workers: 4
+
+epochs: 10
+learning_rate: 0.00003
+min_learning_rate: 0.000003
+lr_warmup_epochs: 1
+warmup_start_factor: 0.1
+weight_decay: 0.01
+
+d_model: 192
+nhead: 6
+num_layers: 4
+dim_feedforward: 512
+dropout: 0.3
+
+gradient_clip_norm: 0.5
+label_smoothing: 0.1
+
 use_class_weights: true
-class_weight_power: 0.5
-class_weight_max: 5.0
-early_stopping_patience: 3
-early_stopping_min_delta: 0.0001
-checkpoint_interval: 2
+class_weight_power: 0.3
+class_weight_max: 3.0
+
+early_stopping_patience: 1
+early_stopping_min_delta: 0.001
+checkpoint_interval: 1
+
 topk: 5
 action_horizon: 32
 fallback_action_dim: 39
