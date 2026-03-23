@@ -7,17 +7,15 @@ wandb:
   entity: tnguyen31-santa-clara-university
   mode: online
   tags: ["sonata", "transformer", "medium", "tuned"]
-
 seed: 7
 device: cuda
 resume: false
 deterministic_eval: true
+model_variant: factored_goal_conditioned
 
-model_variant: token_prediction
 context_length: 48
 batch_size: 64
 num_workers: 4
-
 epochs: 10
 learning_rate: 0.00003
 min_learning_rate: 0.000003
@@ -30,18 +28,35 @@ nhead: 6
 num_layers: 4
 dim_feedforward: 512
 dropout: 0.3
+plan_embedding_dim: 192
 
-gradient_clip_norm: 0.5
+family_mapping_mode: heuristic_stats
+continuous_param_names: ["motion_energy", "chord_size", "start_state_norm", "end_state_norm"]
+family_loss_weight: 1.0
+primitive_loss_weight: 1.0
+duration_loss_weight: 0.35
+dynamics_loss_weight: 0.25
+param_loss_weight: 0.1
+normalize_loss_by_active_weights: true
+
 label_smoothing: 0.1
-
-use_class_weights: true
+use_focal_loss: true
+focal_heads: ["family", "primitive"]
+focal_gamma: 1.5
+use_class_balanced_loss: true
+class_balance_strategy: effective_num
+class_balance_beta: 0.999
 class_weight_power: 0.3
 class_weight_max: 3.0
+use_balanced_sampler: true
+balanced_sampler_target: family
 
+gradient_clip_norm: 0.5
 early_stopping_patience: 1
 early_stopping_min_delta: 0.001
 checkpoint_interval: 1
-
 topk: 5
+eval_temperature: 1.0
+
 action_horizon: 32
 fallback_action_dim: 39

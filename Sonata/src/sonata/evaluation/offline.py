@@ -29,9 +29,16 @@ def evaluate_offline_pipeline(
     pipeline = Sonata3Pipeline(primitive_root=primitive_root, diffusion_checkpoint=diffusion_checkpoint, device=device)
     action_horizon = int(pipeline.config["action_horizon"])
     state_context_steps = int(pipeline.config["state_context_steps"])
-    token_df, metadata, prior_lookup = load_diffusion_inputs(primitive_root, action_horizon=action_horizon, state_context_steps=state_context_steps)
+    token_df, metadata, prior_lookup = load_diffusion_inputs(
+        primitive_root,
+        action_horizon=action_horizon,
+        state_context_steps=state_context_steps,
+        family_mapping_mode=str(pipeline.config.get("family_mapping_mode", "heuristic_stats")),
+        continuous_param_names=pipeline.config.get("continuous_param_names"),
+    )
     dataset = DiffusionChunkDataset(
         token_df=token_df,
+        metadata=metadata,
         primitive_root=primitive_root,
         split=split,
         context_length=int(pipeline.config["context_length"]),

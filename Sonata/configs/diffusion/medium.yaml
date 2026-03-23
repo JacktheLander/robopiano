@@ -13,14 +13,16 @@ device: cuda
 resume: false
 deterministic_eval: true
 variant: full
+
 context_length: 48
-batch_size: 32
+batch_size: 48
 num_workers: 2
 epochs: 20
-learning_rate: 0.0002
+learning_rate: 0.0001
 weight_decay: 0.0001
 action_horizon: 32
 state_context_steps: 8
+
 model_dim: 192
 num_blocks: 8
 diffusion_steps: 100
@@ -29,6 +31,10 @@ beta_end: 0.02
 imitation_weight: 0.5
 smoothness_weight: 0.05
 checkpoint_interval: 2
+
+family_mapping_mode: heuristic_stats
+continuous_param_names: ["motion_energy", "chord_size", "start_state_norm", "end_state_norm"]
+
 planner_embedding_dim: 256
 primitive_embedding_dim: 128
 planner_nhead: 8

@@ -11,7 +11,11 @@ seed: 7
 device: cpu
 resume: false
 deterministic_eval: true
-model_variant: token_prediction
+
+# `factored_goal_conditioned` is the default Stage 2 planner.
+# `direct_transformer_action` keeps the action-regression baseline.
+model_variant: factored_goal_conditioned
+
 context_length: 24
 batch_size: 32
 num_workers: 0
@@ -21,19 +25,45 @@ min_learning_rate: 0.00005
 lr_warmup_epochs: 2
 warmup_start_factor: 0.2
 weight_decay: 0.001
+
 d_model: 192
 nhead: 6
 num_layers: 4
 dim_feedforward: 512
 dropout: 0.2
-gradient_clip_norm: 1.0
+plan_embedding_dim: 192
+
+# Families are derived online from Stage 1 token/library metadata.
+family_mapping_mode: heuristic_stats
+continuous_param_names: ["motion_energy", "chord_size", "start_state_norm", "end_state_norm"]
+
+# Head loss weights for the factored planner.
+family_loss_weight: 1.0
+primitive_loss_weight: 1.0
+duration_loss_weight: 0.35
+dynamics_loss_weight: 0.25
+param_loss_weight: 0.1
+normalize_loss_by_active_weights: true
+
+# Imbalance controls.
 label_smoothing: 0.05
-use_class_weights: true
+use_focal_loss: true
+focal_heads: ["family", "primitive"]
+focal_gamma: 1.5
+use_class_balanced_loss: true
+class_balance_strategy: effective_num
+class_balance_beta: 0.999
 class_weight_power: 0.5
 class_weight_max: 5.0
+use_balanced_sampler: true
+balanced_sampler_target: family
+
+gradient_clip_norm: 1.0
 early_stopping_patience: 3
 early_stopping_min_delta: 0.0001
 checkpoint_interval: 2
 topk: 5
+eval_temperature: 1.0
+
 action_horizon: 32
 fallback_action_dim: 39

@@ -11,10 +11,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from sonata.diffusion.dataset import DiffusionChunkDataset, diffusion_collate_fn, load_diffusion_inputs
+from sonata.diffusion.dataset import DiffusionChunkDataset, DiffusionMetadata, diffusion_collate_fn, load_diffusion_inputs, metadata_to_planner
 from sonata.diffusion.diffusion import GaussianDiffusion1D
 from sonata.diffusion.model import ConditionalTemporalDenoiser
-from sonata.transformer.model import PrimitivePlannerTransformer
+from sonata.transformer.model import (
+    FACTORED_PLANNER_ARCHITECTURE,
+    PrimitivePlannerTransformer,
+    build_planner_from_config,
+    planner_output_dim_from_config,
+)
 from sonata.utils.checkpointing import find_latest_checkpoint, load_checkpoint, save_checkpoint
 from sonata.utils.experiment import make_run_paths
 from sonata.utils.io import save_npz, write_json
@@ -28,7 +33,13 @@ def run_diffusion_training(config: dict[str, Any], logger: logging.Logger, joint
     primitive_root = Path(config["primitive_root"]).resolve()
     output_root = Path(config["output_root"]).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    token_df, metadata, prior_lookup = load_diffusion_inputs(primitive_root, int(config["action_horizon"]), int(config["state_context_steps"]))
+    token_df, metadata, prior_lookup = load_diffusion_inputs(
+        primitive_root,
+        int(config["action_horizon"]),
+        int(config["state_context_steps"]),
+        family_mapping_mode=str(config.get("family_mapping_mode", "heuristic_stats")),
+        continuous_param_names=config.get("continuous_param_names"),
+    )
     run_paths = make_run_paths(output_root, "joint_refine" if joint_refine else "diffusion", config["experiment_name"], int(config["seed"]), resume=bool(config.get("resume", False)))
     write_json(config, run_paths.artifacts / "config.json")
     stage_name = "joint_refine" if joint_refine else "diffusion"
@@ -44,6 +55,7 @@ def run_diffusion_training(config: dict[str, Any], logger: logging.Logger, joint
         set_seed(int(config["seed"]), deterministic=bool(config.get("deterministic_eval", False)))
         train_dataset = DiffusionChunkDataset(
             token_df=token_df,
+            metadata=metadata,
             primitive_root=primitive_root,
             split="train",
             context_length=int(config["context_length"]),
@@ -52,6 +64,7 @@ def run_diffusion_training(config: dict[str, Any], logger: logging.Logger, joint
         )
         val_dataset = DiffusionChunkDataset(
             token_df=token_df,
+            metadata=metadata,
             primitive_root=primitive_root,
             split="val",
             context_length=int(config["context_length"]),
@@ -63,7 +76,7 @@ def run_diffusion_training(config: dict[str, Any], logger: logging.Logger, joint
         val_loader = DataLoader(val_dataset, batch_size=int(config["batch_size"]), shuffle=False, num_workers=int(config.get("num_workers", 0)), collate_fn=collate)
 
         device = torch.device(config["device"])
-        planner, planner_dim = maybe_load_planner(config, metadata, device)
+        planner, planner_dim, planner_config, planner_metadata = maybe_load_planner(config, metadata, device)
         if planner is not None and not joint_refine:
             planner.eval()
             for parameter in planner.parameters():
@@ -101,6 +114,7 @@ def run_diffusion_training(config: dict[str, Any], logger: logging.Logger, joint
                 "primitive_root": str(primitive_root),
                 "model/num_parameters": num_parameters,
                 "planner_checkpoint": config.get("planner_checkpoint"),
+                "planner_architecture": planner_config.get("planner_architecture") if planner_config else None,
             }
         )
         best_loss = float("inf")
@@ -113,7 +127,7 @@ def run_diffusion_training(config: dict[str, Any], logger: logging.Logger, joint
                 primitive_embed.load_state_dict(payload["primitive_embed"])
                 optimizer.load_state_dict(payload["optimizer"])
                 scheduler.load_state_dict(payload["scheduler"])
-                if planner is not None and "planner" in payload:
+                if planner is not None and "planner" in payload and payload["planner"] is not None:
                     planner.load_state_dict(payload["planner"])
                 start_epoch = int(payload["epoch"]) + 1
                 wandb_run.summary({"resume/checkpoint": str(checkpoint), "resume/start_epoch": start_epoch})
@@ -158,6 +172,8 @@ def run_diffusion_training(config: dict[str, Any], logger: logging.Logger, joint
                         "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(),
                         "planner": planner.state_dict() if planner is not None else None,
+                        "planner_config": planner_config,
+                        "planner_metadata": planner_metadata,
                         "config": config,
                     },
                 )
@@ -174,6 +190,8 @@ def run_diffusion_training(config: dict[str, Any], logger: logging.Logger, joint
                         "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(),
                         "planner": planner.state_dict() if planner is not None else None,
+                        "planner_config": planner_config,
+                        "planner_metadata": planner_metadata,
                         "config": config,
                     },
                 )
@@ -203,30 +221,63 @@ def run_diffusion_training(config: dict[str, Any], logger: logging.Logger, joint
         wandb_run.finish()
 
 
-def maybe_load_planner(config: dict[str, Any], metadata, device: torch.device):
+def maybe_load_planner(config: dict[str, Any], metadata: DiffusionMetadata, device: torch.device):
     variant = str(config["variant"])
     if variant in {"diffusion_only", "gmr_only"}:
-        return None, 0
+        return None, 0, None, None
     checkpoint_path = Path(config["planner_checkpoint"]).resolve() if config.get("planner_checkpoint") else None
     if checkpoint_path is None or not checkpoint_path.exists():
-        return None, 0
+        return None, 0, None, None
     payload = load_checkpoint(checkpoint_path, map_location=device)
-    planner_config = payload.get("config", {})
-    d_model = int(planner_config.get("d_model", config["planner_embedding_dim"]))
-    planner = PrimitivePlannerTransformer(
-        num_primitives=metadata.num_primitives,
-        num_duration_buckets=metadata.num_duration_buckets,
-        num_dynamics_buckets=metadata.num_dynamics_buckets,
-        score_dim=metadata.score_dim,
-        d_model=d_model,
-        nhead=int(planner_config.get("nhead", config["planner_nhead"])),
-        num_layers=int(planner_config.get("num_layers", config["planner_layers"])),
-        dim_feedforward=int(planner_config.get("dim_feedforward", config["planner_ffn"])),
-        dropout=float(planner_config.get("dropout", config["planner_dropout"])),
-        max_length=int(planner_config.get("context_length", config["context_length"])),
-    ).to(device)
-    planner.load_state_dict(payload["model"], strict=False)
-    return planner, d_model
+    planner_config = resolve_planner_checkpoint_config(payload)
+    planner_metadata_payload = payload.get("metadata") or payload.get("planner_metadata")
+    if payload.get("planner_architecture") not in {FACTORED_PLANNER_ARCHITECTURE, None}:
+        raise ValueError(f"Unsupported planner architecture in checkpoint {checkpoint_path}: {payload.get('planner_architecture')!r}")
+    if payload.get("planner_architecture") is None and str(planner_config.get("model_variant", "")) != "factored_goal_conditioned":
+        raise ValueError(
+            f"Planner checkpoint {checkpoint_path} predates the factored planner redesign. Retrain Stage 2 with the updated transformer configs."
+        )
+    validate_planner_metadata_compatibility(planner_metadata_payload, metadata, checkpoint_path)
+    planner = build_planner_from_config(metadata_to_planner(metadata), planner_config).to(device)
+    planner_state = extract_planner_state_dict(payload)
+    try:
+        planner.load_state_dict(planner_state)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"Planner checkpoint {checkpoint_path} is incompatible with the current factored planner architecture."
+        ) from exc
+    planner_config = dict(planner_config)
+    planner_config["planner_architecture"] = FACTORED_PLANNER_ARCHITECTURE
+    return planner, planner_output_dim_from_config(planner_config), planner_config, planner_metadata_payload
+
+
+def resolve_planner_checkpoint_config(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("planner_config"):
+        return dict(payload["planner_config"])
+    return dict(payload.get("config", {}))
+
+
+def extract_planner_state_dict(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("planner") is not None:
+        return payload["planner"]
+    model_state = payload.get("model", {})
+    if any(str(key).startswith("planner.") for key in model_state.keys()):
+        return {str(key)[len("planner."):]: value for key, value in model_state.items() if str(key).startswith("planner.")}
+    return model_state
+
+
+def validate_planner_metadata_compatibility(payload: dict[str, Any] | None, metadata: DiffusionMetadata, checkpoint_path: Path) -> None:
+    if not payload:
+        return
+    if int(payload.get("num_primitives", metadata.num_primitives)) != int(metadata.num_primitives):
+        raise ValueError(f"Planner checkpoint {checkpoint_path} was trained with a different primitive vocabulary size.")
+    if [int(item) for item in payload.get("primitive_to_family", metadata.primitive_to_family)] != [int(item) for item in metadata.primitive_to_family]:
+        raise ValueError(
+            f"Planner checkpoint {checkpoint_path} uses a different primitive-family mapping. "
+            "Use the same primitive_root and family_mapping_mode as the planner training run."
+        )
+    if int(payload.get("num_families", metadata.num_families)) != int(metadata.num_families):
+        raise ValueError(f"Planner checkpoint {checkpoint_path} was trained with a different number of planner families.")
 
 
 def diffusion_epoch(model, primitive_embed, planner, loader, optimizer, diffusion, device, config: dict[str, Any], train: bool):
@@ -295,12 +346,12 @@ def build_condition_vector(batch, primitive_embed, planner, config: dict[str, An
     state = torch.nan_to_num(batch["state_context"])
     scalar = torch.nan_to_num(
         torch.stack(
-        [
-            batch["duration_bucket"].float(),
-            batch["dynamics_bucket"].float(),
-            batch["primitive_index"].float(),
-        ],
-        dim=-1,
+            [
+                batch["duration_bucket"].float(),
+                batch["dynamics_bucket"].float(),
+                batch["primitive_index"].float(),
+            ],
+            dim=-1,
         )
     )
     if planner is not None and str(config["variant"]) != "diffusion_only":

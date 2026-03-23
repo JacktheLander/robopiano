@@ -25,6 +25,8 @@ The default Stage 1 path now computes compact downstream-ready rows online while
 
 The GMM is still fit globally across all segments, and the GMR library is still fit from the shared compact store after clustering.
 
+Stage 2 does not need Stage 1 to pre-write planner families. The factored planner derives deterministic primitive-family labels online from the cached Stage 1 token table plus primitive-library statistics, so this compact Stage 1 layout remains the canonical handoff to later stages.
+
 ## Storage rationale
 
 The online store keeps only:
