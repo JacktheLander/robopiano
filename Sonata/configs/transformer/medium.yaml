@@ -16,8 +16,8 @@ model_variant: factored_goal_conditioned
 context_length: 48
 batch_size: 64
 num_workers: 4
-epochs: 10
-learning_rate: 0.00003
+epochs: 40
+learning_rate: 0.00005
 min_learning_rate: 0.000003
 lr_warmup_epochs: 1
 warmup_start_factor: 0.1
@@ -27,7 +27,7 @@ d_model: 192
 nhead: 6
 num_layers: 4
 dim_feedforward: 512
-dropout: 0.3
+dropout: 0.2
 plan_embedding_dim: 192
 
 family_mapping_mode: heuristic_stats
