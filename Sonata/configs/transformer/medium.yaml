@@ -52,7 +52,7 @@ use_balanced_sampler: true
 balanced_sampler_target: family
 
 gradient_clip_norm: 0.5
-early_stopping_patience: 1
+early_stopping_patience: 5
 early_stopping_min_delta: 0.001
 checkpoint_interval: 1
 topk: 5
