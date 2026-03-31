@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from sonata.data.loading import build_manifest_lookup, load_stage1_source_manifest
 from sonata.evaluation.offline import stitch_segment_predictions
 from sonata.training.mjx_rollout import MJXRolloutBackend, mjx_availability
 from sonata.utils.io import write_json, write_table
@@ -51,6 +52,7 @@ def evaluate_dm_control_rollout(
         if (primitive_root / "tokens" / "primitive_tokens.parquet").exists()
         else pd.read_csv(primitive_root / "tokens" / "primitive_tokens.csv")
     )
+    manifest_lookup = _load_rollout_manifest_lookup(primitive_root=primitive_root, logger=logger)
     output_root.mkdir(parents=True, exist_ok=True)
     videos_root = output_root / "videos"
     frames_tmp_root = output_root / "frames_tmp"
@@ -76,12 +78,23 @@ def evaluate_dm_control_rollout(
             episode_predictions=episode_predictions,
             action_horizon=int(episode_predictions[0]["predicted"].shape[0]),
         )
-        env_name = str(episode_rows.iloc[0]["song_id"])
+        raw_song_id = str(episode_rows.iloc[0]["song_id"])
+        source = _resolve_rollout_source(
+            song_id=raw_song_id,
+            episode_id=str(episode_id),
+            manifest_lookup=manifest_lookup,
+            logger=logger,
+        )
         should_render = render_video and (max_render_episodes is None or rendered_episodes < max_render_episodes)
         env = None
         try:
             env = MidiEvaluationWrapper(
-                suite.load(environment_name=env_name, seed=0, task_kwargs={"control_timestep": 0.05, "n_steps_lookahead": 1}),
+                suite.load(
+                    environment_name=source["environment_name"],
+                    midi_file=source["midi_file"],
+                    seed=0,
+                    task_kwargs={"control_timestep": 0.05, "n_steps_lookahead": 1},
+                ),
                 deque_size=1,
             )
             timestep = env.reset()
@@ -120,7 +133,8 @@ def evaluate_dm_control_rollout(
                     try:
                         video_path, video_format, video_warning = _write_rollout_video(
                             frames=frames,
-                            output_path=videos_root / f"{_safe_filename(env_name)}_{_safe_filename(str(episode_id))}.mp4",
+                            output_path=videos_root
+                            / f"{_safe_filename(source['environment_name'])}_{_safe_filename(str(episode_id))}.mp4",
                             fps=video_fps,
                             temp_root=frames_tmp_root,
                         )
@@ -130,7 +144,10 @@ def evaluate_dm_control_rollout(
             episode_result = {
                 "episode_index": episode_index,
                 "episode_id": episode_id,
-                "song_id": env_name,
+                "song_id": raw_song_id,
+                "environment_name": source["environment_name"],
+                "midi_file": str(source["midi_file"]) if source["midi_file"] is not None else None,
+                "song_id_normalized": bool(source["song_id_normalized"]),
                 "reward": total_reward,
                 "actions_planned": int(stitched.shape[0]),
                 "actions_executed": actions_executed,
@@ -148,14 +165,23 @@ def evaluate_dm_control_rollout(
             if video_path is not None:
                 log_rollout_video(
                     wandb_run,
-                    key=f"rollout/videos/{_safe_filename(env_name)}_{_safe_filename(str(episode_id))}",
+                    key=f"rollout/videos/{_safe_filename(source['environment_name'])}_{_safe_filename(str(episode_id))}",
                     video_path=video_path,
                     caption=_build_video_caption(episode_result),
                     fps=video_fps,
                     logger=logger,
                 )
         except Exception as exc:  # pragma: no cover
-            results.append({"episode_id": episode_id, "song_id": env_name, "error": str(exc)})
+            results.append(
+                {
+                    "episode_id": episode_id,
+                    "song_id": raw_song_id,
+                    "environment_name": source["environment_name"],
+                    "midi_file": str(source["midi_file"]) if source["midi_file"] is not None else None,
+                    "song_id_normalized": bool(source["song_id_normalized"]),
+                    "error": str(exc),
+                }
+            )
         finally:
             _safe_close(env)
     summary = _summarize_rollout_results(results)
@@ -195,6 +221,59 @@ def evaluate_mjx_physics(
     }
     write_json(payload, output_root / "mjx_rollout.json")
     return payload
+
+
+def _load_rollout_manifest_lookup(
+    *,
+    primitive_root: Path,
+    logger: logging.Logger,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    try:
+        manifest_df = load_stage1_source_manifest(primitive_root)
+    except Exception as exc:
+        logger.warning("Unable to load Stage 1 source manifest for rollout: %s", exc)
+        return {}
+    return build_manifest_lookup(manifest_df)
+
+
+def _resolve_rollout_source(
+    *,
+    song_id: str,
+    episode_id: str,
+    manifest_lookup: dict[tuple[str, str], dict[str, Any]],
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    manifest_row = manifest_lookup.get((song_id, episode_id), {})
+    midi_file = _manifest_note_path(manifest_row)
+    environment_name = _canonicalize_environment_name(song_id)
+    song_id_normalized = environment_name != song_id
+    if midi_file is None and song_id_normalized:
+        logger.info(
+            "Normalized rollout environment name from `%s` to `%s` for episode `%s`.",
+            song_id,
+            environment_name,
+            episode_id,
+        )
+    return {
+        "environment_name": environment_name,
+        "midi_file": midi_file,
+        "song_id_normalized": song_id_normalized,
+    }
+
+
+def _manifest_note_path(manifest_row: dict[str, Any]) -> Path | None:
+    note_path = manifest_row.get("note_path") if manifest_row else None
+    if note_path is None:
+        return None
+    text = str(note_path).strip()
+    if not text or text.lower() == "nan":
+        return None
+    path = Path(text).resolve()
+    return path if path.exists() else None
+
+
+def _canonicalize_environment_name(song_id: str) -> str:
+    return re.sub(r"(-v\d+)_\d+$", r"\1", str(song_id))
 
 
 def _collect_musical_metrics(env: Any, *, episode_finished: bool) -> tuple[dict[str, float], str | None]:
