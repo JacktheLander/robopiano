@@ -9,21 +9,21 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
-def anthony_root() -> Path:
-    return repo_root() / "anthony"
+def robopianist_package_dir() -> Path:
+    return repo_root() / "robopianist"
 
 
 def ensure_local_robopianist_on_path() -> Path | None:
     if importlib.util.find_spec("robopianist.suite") is not None:
         return None
-    candidate = anthony_root()
-    package_dir = candidate / "robopianist"
+    candidate = repo_root()
+    package_dir = robopianist_package_dir()
     if not package_dir.exists():
         return None
     candidate_str = str(candidate.resolve())
     if candidate_str not in sys.path:
         sys.path.insert(0, candidate_str)
-    # Clear the namespace-only package from the repo root so Python re-resolves submodules.
+    # Clear any namespace-only robopianist module so Python re-resolves from the repo root.
     existing = sys.modules.get("robopianist")
     if existing is not None and getattr(existing, "__file__", None) is None:
         sys.modules.pop("robopianist", None)
@@ -41,5 +41,7 @@ def format_robopianist_import_error(exc: Exception) -> str:
     missing_text = ", ".join(missing)
     return (
         f"{exc}. Missing evaluation dependencies: {missing_text}. "
-        "Install Sonata full requirements plus the local RoboPianist package/environment before running DM Control evaluation."
+        "Expected local RoboPianist layout: {project_root}/robopianist with the Python package at "
+        "{project_root}/robopianist/robopianist. Install Sonata full requirements plus the local "
+        "RoboPianist package/environment before running DM Control evaluation."
     )

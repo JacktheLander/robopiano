@@ -23,6 +23,7 @@ from sonata.evaluation.external_midi import (
     extract_hand_joints,
     resolve_external_manifest_base,
 )
+from sonata.utils import robopianist as robopianist_utils
 
 
 class _Logger:
@@ -187,3 +188,17 @@ def test_resolve_external_manifest_base_accepts_csv_path(tmp_path: Path) -> None
     manifest_csv.write_text("song_id,episode_id\n")
 
     assert resolve_external_manifest_base(benchmark_manifest=manifest_csv) == tmp_path / "external_midi_manifest"
+
+
+def test_robopianist_helper_uses_repo_root_package_parent(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "project_root"
+    package_dir = repo_root / "robopianist"
+    package_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(robopianist_utils, "repo_root", lambda: repo_root)
+    monkeypatch.setattr(robopianist_utils.importlib.util, "find_spec", lambda name: None)
+
+    added = robopianist_utils.ensure_local_robopianist_on_path()
+
+    assert added == repo_root
+    assert str(repo_root.resolve()) in sys.path
