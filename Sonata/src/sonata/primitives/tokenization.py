@@ -42,9 +42,13 @@ def bucketize(values: np.ndarray, train_mask: np.ndarray, num_buckets: int) -> n
 
 def build_vocabulary_payload(token_df: pd.DataFrame) -> dict[str, Any]:
     primitive_ids = sorted(token_df["primitive_id"].astype(str).unique().tolist())
+    duration_buckets = sorted(token_df["duration_bucket"].astype(int).unique().tolist())
+    dynamics_buckets = sorted(token_df["dynamics_bucket"].astype(int).unique().tolist())
     return {
         "num_primitives": len(primitive_ids),
         "primitive_ids": primitive_ids,
-        "duration_buckets": sorted(token_df["duration_bucket"].astype(int).unique().tolist()),
-        "dynamics_buckets": sorted(token_df["dynamics_bucket"].astype(int).unique().tolist()),
+        "duration_buckets": duration_buckets,
+        "dynamics_buckets": dynamics_buckets,
+        "num_duration_buckets": (max(duration_buckets) + 1) if duration_buckets else 1,
+        "num_dynamics_buckets": (max(dynamics_buckets) + 1) if dynamics_buckets else 1,
     }

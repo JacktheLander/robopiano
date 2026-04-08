@@ -1,0 +1,45 @@
+{
+  "estimated_storage_reduction_vs_legacy": 3.185716036482778,
+  "feature_dim": 1776,
+  "gmm_sweep": [
+    {
+      "aic": 281423392.0,
+      "bic": 282912915.9408668,
+      "k": 16,
+      "selected_k": 40,
+      "silhouette": 0.01375134103000164
+    },
+    {
+      "aic": 277964576.0,
+      "bic": 280198884.4626458,
+      "k": 24,
+      "selected_k": 40,
+      "silhouette": 0.01375134103000164
+    },
+    {
+      "aic": 274416512.0,
+      "bic": 277395572.98442477,
+      "k": 32,
+      "selected_k": 40,
+      "silhouette": 0.01375134103000164
+    },
+    {
+      "aic": 271298752.0,
+      "bic": 275022597.5062038,
+      "k": 40,
+      "selected_k": 40,
+      "silhouette": 0.01375134103000164
+    }
+  ],
+  "gmr_target_dim": 39,
+  "gmr_target_steps": 32,
+  "mean_assignment_confidence": 0.9896697402000427,
+  "mean_reconstruction_mse": 0.26076469421386717,
+  "median_reconstruction_mse": 0.25947876274585724,
+  "num_primitives": 40,
+  "primitive_reuse_across_songs": 1.0,
+  "segment_store_bytes": 6795587225,
+  "segment_store_bytes_per_1000_segments": 11123894.622687837,
+  "selected_k": 40,
+  "usage_entropy": 3.341121196746826
+}

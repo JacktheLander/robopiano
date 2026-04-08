@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +12,11 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from sonata.primitives.features import build_gmr_target_from_arrays, load_feature_matrix_from_store
+from sonata.primitives.features import (
+    build_gmr_target_from_arrays,
+    extract_segment_features,
+    load_feature_matrix_from_store,
+)
 from sonata.primitives.slim_cache import (
     collect_slim_chunk_names,
     index_chunk_path,
@@ -119,3 +124,43 @@ def test_build_gmr_target_from_arrays_uses_fixed_resample_steps() -> None:
     assert target.shape == (5, 3)
     np.testing.assert_allclose(target[0], actions[0])
     np.testing.assert_allclose(target[-1], actions[-1])
+
+
+def test_extract_segment_features_reuses_slim_feature_store(tmp_path: Path) -> None:
+    config = {"slim_cache_dir": "slim", "force": True}
+    paths = resolve_slim_cache_paths(tmp_path, config)
+    feature_names = ["feature_0", "feature_1"]
+    write_slim_chunk(
+        paths=paths,
+        chunk_name="slim_chunk_00000.npz",
+        segment_rows=[
+            _segment_row("seg_a", "song_a", "ep_a"),
+            _segment_row("seg_b", "song_a", "ep_a"),
+        ],
+        feature_matrix=np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        feature_names=feature_names,
+        gmr_targets=np.zeros((2, 4, 3), dtype=np.float32),
+        target_names=["actions", "actions"],
+    )
+    segment_df = pd.DataFrame(
+        [
+            _segment_row("seg_b", "song_a", "ep_a") | {"chunk_path": "slim_chunk_00000.npz", "chunk_index": 1},
+            _segment_row("seg_a", "song_a", "ep_a") | {"chunk_path": "slim_chunk_00000.npz", "chunk_index": 0},
+        ]
+    )
+
+    outputs = extract_segment_features(
+        segment_df=segment_df,
+        segments_dir=tmp_path / "segments",
+        output_dir=tmp_path,
+        config=config,
+    )
+
+    bundle = np.load(outputs["feature_bundle_path"], allow_pickle=True)
+    manifest = json.loads(Path(outputs["manifest_path"]).read_text())
+    np.testing.assert_allclose(
+        np.asarray(bundle["feature_matrix"], dtype=np.float32),
+        np.asarray([[3.0, 4.0], [1.0, 2.0]], dtype=np.float32),
+    )
+    assert [str(item) for item in bundle["feature_names"].tolist()] == feature_names
+    assert manifest["source"] == "slim_store"

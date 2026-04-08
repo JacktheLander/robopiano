@@ -17,3 +17,4 @@ split_ratios:
   val: 0.33
   test: 0.33
 force: false
+scan_num_workers: 0

@@ -1,13 +1,13 @@
 # Sonata-3
-Segmented GMR -> Transformer -> Diffusion for RoboPianist
+Segmented GMR -> Factored Planner -> Diffusion for RoboPianist
 
 Sonata-3 is a research prototype for robot piano imitation learning on RoboPianist and RP1M. The policy is explicitly hierarchical:
 
 1. Primitive learning with segmented GMM/GMR.
-2. High-level primitive sequencing with an autoregressive transformer.
+2. Goal-conditioned primitive planning with a factored causal transformer.
 3. Low-level action refinement with a conditional diffusion model.
 
-The implementation is designed for incremental use on an HPC cluster: cached dataset manifests, chunked segment caches, stage-specific checkpoints, explicit artifact directories, and a workflow that keeps raw RP1M scanning/segmentation on CPU-oriented storage passes while reusing cached primitive outputs for later GPU training.
+The implementation is designed for incremental use on HPC: Stage 1 writes compact cached datasets on CPU-oriented storage, then Stage 2 and Stage 3 reuse those cached outputs on GPU jobs without recomputing segmentation or primitive discovery.
 
 ## Repository Layout
 
@@ -85,11 +85,11 @@ The slim cache keeps only:
 - clustering feature vectors
 - one fixed-horizon GMR target per segment
 
-The legacy raw `segment_chunk_*.npz` bundles are now optional debug artifacts. By default Sonata migrates existing raw chunks into the slim cache and continues new segmentation directly in slim mode. Keeping only the slim representation typically cuts Stage 1 cache storage by roughly 80% to 92%, because the large padded variable-length arrays are no longer retained after features and GMR targets have been materialized.
+The legacy raw `segment_chunk_*.npz` bundles are optional debug artifacts. By default Sonata migrates existing raw chunks into the slim cache and continues new segmentation directly in slim mode.
 
-Stage 2 consumes primitive tokens and writes run directories under `outputs/transformer/`.
+Stage 2 consumes primitive tokens and primitive-library summaries, derives planner families online, and writes run directories under `outputs/transformer/`.
 
-Stage 3 consumes primitive tokens, GMR priors, and a transformer checkpoint, then writes run directories under `outputs/diffusion/`.
+Stage 3 consumes primitive tokens, GMR priors, and a Stage 2 checkpoint, then writes run directories under `outputs/diffusion/`.
 
 Evaluation writes offline metrics into `<output-root>/offline/` and optional rollout outputs into `<output-root>/rollout/`.
 
@@ -102,19 +102,57 @@ Evaluation writes offline metrics into `<output-root>/offline/` and optional rol
 - Primitive discovery uses a GMM sweep over candidate `K`, chosen by BIC or AIC.
 - Each primitive fits a phase-conditioned GMR prior and exports a reusable coarse trajectory template.
 - Tokens are explicit and inspectable: primitive id, primitive index, duration bucket, dynamics bucket, and score context JSON.
-- Segment metadata keeps `chunk_path` / `chunk_index` pointed at the slim cache. If you enable `write_full_segment_cache: true`, the optional raw debug chunk location is preserved in `raw_chunk_path` / `raw_chunk_index`.
+- Segment metadata keeps `chunk_path` / `chunk_index` pointed at the slim cache. If `write_full_segment_cache: true`, the optional raw debug chunk location is preserved in `raw_chunk_path` / `raw_chunk_index`.
 
-### Stage 2: Transformer planner
+### Stage 2: Factored goal-conditioned planner
 
-- Autoregressive transformer over primitive histories.
-- Inputs: primitive id, duration bucket, dynamics bucket, positional embedding, and score context projection.
-- Outputs: next primitive, duration, and dynamics logits, plus a plan embedding for diffusion conditioning.
-- Baseline A is included through `model_variant: direct_transformer_action`.
+The old Stage 2 baseline treated primitive planning as plain next-token prediction over primitive ids. That was too sensitive to primitive imbalance: dominant press-like primitives could win the cross-entropy objective without learning useful planning structure.
+
+The current Stage 2 planner keeps causal autoregression over primitive histories, but predicts the next primitive in a factored way:
+
+- `primitive_family`: a deterministic coarse family derived online from Stage 1 metadata and primitive-library statistics
+- `primitive_id`: predicted within the family using a family-conditioned classifier and family-aware masking
+- `duration_bucket`
+- `dynamics_bucket`
+- optional continuous primitive parameters from cached Stage 1 metadata
+- `plan_embedding`: a fused embedding for Stage 3 diffusion conditioning
+
+Planner inputs:
+
+- primitive history
+- primitive-family history
+- duration and dynamics histories
+- history context from prior segments
+- explicit current goal context from score histogram, future density, active ratio, chord proxy, key center, and state summary
+
+Planner outputs:
+
+- family logits
+- primitive logits
+- duration logits
+- dynamics logits
+- optional continuous parameter regression
+- structured plan embedding
+
+The planner uses a shared causal transformer backbone, then separate heads for each prediction target. The plan embedding is not just the last hidden state: it fuses planner state, goal context, and predicted family / primitive / duration / dynamics intents before projection.
+
+### Imbalance robustness
+
+The planner includes configurable controls for highly imbalanced primitive vocabularies:
+
+- focal loss on selected heads
+- class-balanced weighting
+- family-aware balanced sampling
+- label smoothing
+- weighted factored losses
+- temperature-scaled evaluation
+- top-k metrics per head
+- family macro-F1 and balanced accuracy
 
 ### Stage 3: Diffusion refiner
 
 - 1D conditional denoiser over short action chunks.
-- Conditions: state context, score context, primitive token identity or transformer embedding, and GMR prior.
+- Conditions: state context, goal context, primitive token scalars, and either the factored planner embedding or a primitive embedding fallback.
 - Variants:
   - `full`
   - `planner_no_prior`
@@ -123,7 +161,90 @@ Evaluation writes offline metrics into `<output-root>/offline/` and optional rol
 
 ### Stage 4: Integration
 
-`sonata.models.pipeline.Sonata3Pipeline` loads primitive priors, the planner, and the diffusion model together for offline inference and rollout evaluation.
+`sonata.models.pipeline.Sonata3Pipeline` loads primitive priors, the factored planner, and the diffusion model together for offline inference and rollout evaluation.
+
+## Stage 2 training and evaluation
+
+Recommended planner config:
+
+- `configs/transformer/debug.yaml` for local smoke tests
+- `configs/transformer/medium.yaml` for medium-scale GPU runs
+- `configs/transformer/full.yaml` for full RP1M/HPC runs
+
+Train the planner:
+
+```bash
+python scripts/train_transformer.py --profile debug --no-wandb
+```
+
+Train diffusion against the planner checkpoint:
+
+```bash
+python scripts/train_diffusion.py \
+  --profile debug \
+  --planner-checkpoint /path/to/outputs/transformer/<run>/checkpoints/best.pt \
+  --no-wandb
+```
+
+Evaluate the full planner + diffusion stack offline:
+
+```bash
+python scripts/evaluate.py \
+  --primitive-root outputs/primitives/debug \
+  --diffusion-checkpoint /path/to/outputs/diffusion/<run>/checkpoints/best.pt \
+  --output-root outputs/eval/debug
+```
+
+Planner validation metrics are written during training into:
+
+- `outputs/transformer/<run>/metrics/metrics.csv`
+- `outputs/transformer/<run>/metrics/metrics.jsonl`
+- `outputs/transformer/<run>/artifacts/generated_sequences.csv`
+- `outputs/transformer/<run>/artifacts/family_confusion_best.csv`
+- `outputs/transformer/<run>/artifacts/primitive_family_mapping.csv`
+- `outputs/transformer/<run>/artifacts/planner_metadata.json`
+
+## Key Stage 2 config fields
+
+Planner architecture:
+
+- `model_variant`
+- `plan_embedding_dim`
+- `context_length`
+- `family_mapping_mode`
+- `continuous_param_names`
+
+Factored loss weights:
+
+- `family_loss_weight`
+- `primitive_loss_weight`
+- `duration_loss_weight`
+- `dynamics_loss_weight`
+- `param_loss_weight`
+- `normalize_loss_by_active_weights`
+
+Imbalance controls:
+
+- `use_focal_loss`
+- `focal_heads`
+- `focal_gamma`
+- `use_class_balanced_loss`
+- `class_balance_strategy`
+- `class_balance_beta`
+- `class_weight_power`
+- `class_weight_max`
+- `use_balanced_sampler`
+- `balanced_sampler_target`
+- `label_smoothing`
+- `eval_temperature`
+- `topk`
+
+## Migration notes
+
+- The shipped transformer configs now default to `model_variant: factored_goal_conditioned`.
+- Old Stage 2 checkpoints trained with the plain `token_prediction` planner are intentionally treated as incompatible. Retrain Stage 2 with the new configs before using those checkpoints in Stage 3.
+- Diffusion checkpoints now store the resolved planner config and planner metadata so offline inference does not rely on silently re-inferring the old planner shape.
+- Stage 1 outputs do not need to be regenerated for the planner redesign. Primitive families are derived deterministically inside Stage 2 / Stage 3 loading from cached Stage 1 token and library metadata.
 
 ## RP1M Assumptions
 
@@ -144,7 +265,7 @@ The current implementation assumes the RP1M dataset follows the layout already p
   - `robopianist/music/data/`
 - If `.proto` or MIDI files are missing, score events fall back to `goals`, then `piano_states`.
 
-These assumptions are encoded in [indexer.py](/home/jackthelander/robopianist/Sonata/src/sonata/data/indexer.py) and [score.py](/home/jackthelander/robopianist/Sonata/src/sonata/data/score.py). If score files are missing, segmentation falls back to `goals` and then `piano_states`; if neither is present, score-conditioned segmentation metadata becomes empty rather than forcing a crash.
+If score files are missing, segmentation falls back to `goals` and then `piano_states`; if neither is present, score-conditioned segmentation metadata becomes empty rather than forcing a crash.
 
 ## Recommended Usage
 
@@ -153,8 +274,8 @@ Debug run on the toy dataset:
 ```bash
 python scripts/prepare_rp1m.py --profile debug
 python scripts/train_primitives.py --profile debug
-python scripts/train_transformer.py --profile debug
-python scripts/train_diffusion.py --profile debug --planner-checkpoint /path/to/best.pt
+python scripts/train_transformer.py --profile debug --no-wandb
+python scripts/train_diffusion.py --profile debug --planner-checkpoint /path/to/best.pt --no-wandb
 ```
 
 If you already have legacy `segment_chunk_*.npz` files and want to materialize the slim cache before rerunning Stage 1:
@@ -169,55 +290,12 @@ To migrate existing raw chunks, continue the remaining segmentation directly in 
 python scripts/train_primitives.py --profile full
 ```
 
-To delete raw chunks immediately after each migrated chunk is verified:
-
-```bash
-python scripts/migrate_segment_chunks.py --profile full --delete-raw
-python scripts/train_primitives.py --profile full
-```
-
-W&B is enabled by default in the shipped Sonata configs. If you want uploads to the Santa Clara workspace, authenticate first:
-
-```bash
-wandb login
-```
-
-You can disable sync per run with `--no-wandb`, or switch to local buffering with `--wandb-mode offline`.
+W&B is enabled by default in the shipped Sonata configs. Disable sync per run with `--no-wandb`, or switch to local buffering with `--wandb-mode offline`.
 
 End-to-end debug pipeline:
 
 ```bash
-python scripts/run_pipeline.py --profile debug
-```
-
-Offline evaluation:
-
-```bash
-python scripts/evaluate.py \
-  --primitive-root outputs/primitives/debug \
-  --diffusion-checkpoint /path/to/best.pt \
-  --output-root outputs/eval/debug
-```
-
-DM Control rollout evaluation:
-
-```bash
-python scripts/evaluate.py \
-  --primitive-root outputs/primitives/debug \
-  --diffusion-checkpoint /path/to/best.pt \
-  --output-root outputs/eval/debug \
-  --backend dm_control
-```
-
-MJX physics smoke test:
-
-```bash
-python scripts/evaluate.py \
-  --primitive-root outputs/primitives/debug \
-  --diffusion-checkpoint /path/to/best.pt \
-  --output-root outputs/eval/debug \
-  --backend mjx_physics \
-  --xml-path /path/to/model.xml
+python scripts/run_pipeline.py --profile debug --no-wandb
 ```
 
 ## Config Profiles
@@ -234,18 +312,9 @@ python scripts/evaluate.py \
 export RP1M_300_ROOT=/project/$USER/rp1m_300.zarr
 ```
 
-If cluster score files live outside the repo checkout, you can also point `note_search_roots` at environment-expanded paths because Sonata resolves `$VARS` in config paths before use. If no score files are available, segmentation falls back to `goals` and then `piano_states`.
+If cluster score files live outside the repo checkout, you can point `note_search_roots` at environment-expanded paths because Sonata resolves `$VARS` in config paths before use.
 
-Primitive configs now also expose:
-
-- `write_full_segment_cache`
-- `write_slim_cache`
-- `migrate_existing_segment_chunks`
-- `delete_raw_chunks_after_migration`
-- `slim_cache_dir`
-- `slim_feature_dir`
-- `slim_gmr_target_dir`
-- `slim_index_dir`
+Primitive configs also expose the slim-cache migration knobs documented in `STAGE1_ONLINE_PRIMITIVES.md`.
 
 ## Evaluation Outputs
 
@@ -259,9 +328,13 @@ Stage 1:
 
 Stage 2:
 
-- loss, accuracy, top-k accuracy, perplexity
-- generated primitive prediction tables
-- `best.pt` plus periodic `epoch_XXXX.pt` checkpoints in the run directory
+- overall loss plus per-head losses
+- family / primitive / duration / dynamics accuracy
+- primitive and family top-k accuracy
+- family macro-F1 and balanced accuracy
+- family / primitive entropy and confidence diagnostics
+- primitive-family mapping artifacts and confusion matrix
+- `best.pt` plus periodic `epoch_XXXX.pt` checkpoints
 
 Stage 3 and full pipeline:
 
@@ -270,12 +343,12 @@ Stage 3 and full pipeline:
 - improvement over GMR prior
 - optional DM Control rollout reward and note metrics
 - optional MJX physics rollout metadata
-- `best.pt` plus periodic `epoch_XXXX.pt` checkpoints in the run directory
+- `best.pt` plus periodic `epoch_XXXX.pt` checkpoints
 
 ## Logging And Checkpoints
 
 - Primitive discovery writes stage outputs directly under `outputs/primitives/<profile>/`.
-- Transformer and diffusion use timestamped run directories similar to `tin/train.py`.
+- Transformer and diffusion use timestamped run directories.
 - Each run contains:
   - `checkpoints/`
   - `metrics/metrics.csv`
@@ -285,7 +358,6 @@ Stage 3 and full pipeline:
   - `logs/`
 - `resume: true` reuses the latest matching timestamped run directory for transformer/diffusion and restores the most recent `*.pt` checkpoint found there.
 - W&B logging mirrors run config, scalar metrics, summaries, checkpoint artifacts, and run-output directories when enabled in config or via CLI.
-- The `logs/` directory is reserved as part of the run structure, but the current scripts primarily emit structured logs to stdout/stderr rather than automatically writing a persistent per-run log file there.
 
 ## Slim Cache Migration
 
@@ -297,23 +369,13 @@ Use this flow when a profile already contains legacy `segment_chunk_*.npz` outpu
 
 Migration is idempotent and resumable: completed slim chunks are skipped on rerun, new segmentation appends new slim chunks, and the consolidated `segments/segment_index.csv` is rebuilt from the migrated slim records plus any remaining legacy rows.
 
-The slim cache layout is:
-
-- `outputs/primitives/<profile>/slim/index/slim_chunk_*.csv`
-- `outputs/primitives/<profile>/slim/features/slim_chunk_*.npz`
-- `outputs/primitives/<profile>/slim/gmr_targets/slim_chunk_*.npz`
-- `outputs/primitives/<profile>/slim/manifests/slim_chunk_*.json`
-- `outputs/primitives/<profile>/slim/progress/episode_progress.jsonl`
-
-Stage 2 and Stage 3 command-line inputs stay the same. Internally, the training loaders now reconstruct action and hand-joint slices from the Stage 0 dataset manifest referenced in `outputs/primitives/<profile>/run_config.json`, so the underlying dataset path used by Stage 0 must still be reachable when training those stages.
-
 ## Target Environment
 
-- `prepare_rp1m.py` and `train_primitives.py` are the CPU-heavy stages. They scan RP1M, load episodes one at a time, segment trajectories, and save the slim Stage 1 cache needed for clustering and GMR fitting.
-- `train_transformer.py` and `train_diffusion.py` consume the cached primitive outputs rather than recomputing segmentation. Their public inputs are unchanged; when they need action or hand-joint targets they recover them from the Stage 0 manifest and dataset referenced in `run_config.json`.
+- `prepare_rp1m.py` and `train_primitives.py` are the CPU-heavy stages.
+- `train_transformer.py` and `train_diffusion.py` consume cached Stage 1 outputs rather than recomputing segmentation.
 - `run_pipeline.py` is convenient for local debugging and end-to-end smoke runs, but on the cluster the more robust pattern is: run Stage 0 and Stage 1 on shared CPU storage first, then launch Stage 2 and Stage 3 jobs against those cached outputs.
 - The code does not assume Slurm locally. Cluster-specific scheduling remains outside Sonata itself; Sonata focuses on explicit filesystem outputs so CPU and GPU jobs can hand off work through shared storage cleanly.
 
 ## Notes On MJX
 
-The MJX module in this repo currently accelerates MuJoCo physics stepping, not the full RoboPianist task stack. Observation/reward parity with dm_control still needs task-specific glue. The exact remaining work is listed in [TODO_HPC.md](/home/jackthelander/robopianist/Sonata/TODO_HPC.md).
+The MJX module in this repo currently accelerates MuJoCo physics stepping, not the full RoboPianist task stack. Observation/reward parity with dm_control still needs task-specific glue. The remaining work is listed in `TODO_HPC.md`.

@@ -50,3 +50,5 @@ gmr_target_actions: true
 num_duration_buckets: 8
 num_dynamics_buckets: 6
 min_segments_per_primitive: 8
+segment_num_workers: 16
+feature_num_workers: 16

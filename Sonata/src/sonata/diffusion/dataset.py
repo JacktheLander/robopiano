@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,26 +10,27 @@ import torch
 from torch.utils.data import Dataset
 
 from sonata.data.loading import build_manifest_lookup, load_episode_record, load_stage1_source_manifest
-from sonata.transformer.dataset import build_planner_context, load_transformer_inputs, planner_collate_fn
+from sonata.transformer.dataset import (
+    PlannerMetadata,
+    build_goal_context,
+    build_history_context,
+    load_transformer_inputs,
+    normalize_param_row,
+    planner_collate_fn,
+)
 
 
 @dataclass
-class DiffusionMetadata:
+class DiffusionMetadata(PlannerMetadata):
     action_dim: int
     state_dim: int
-    score_dim: int
-    num_primitives: int
-    num_duration_buckets: int
-    num_dynamics_buckets: int
-    pad_primitive: int
-    pad_duration: int
-    pad_dynamics: int
 
 
 class DiffusionChunkDataset(Dataset):
     def __init__(
         self,
         token_df: pd.DataFrame,
+        metadata: DiffusionMetadata,
         primitive_root: Path,
         split: str,
         context_length: int,
@@ -38,6 +38,7 @@ class DiffusionChunkDataset(Dataset):
         state_context_steps: int,
     ) -> None:
         self.token_df = token_df[token_df["split"] == split].copy()
+        self.metadata = metadata
         self.primitive_root = primitive_root
         self.context_length = int(context_length)
         self.action_horizon = int(action_horizon)
@@ -48,10 +49,17 @@ class DiffusionChunkDataset(Dataset):
         for _, group in grouped:
             group_key = (str(group.iloc[0]["song_id"]), str(group.iloc[0]["episode_id"]))
             episode = load_episode_record(self.manifest_lookup[group_key])
-            primitive = group["primitive_index"].astype(int).to_numpy()
-            duration = group["duration_bucket"].astype(int).to_numpy()
-            dynamics = group["dynamics_bucket"].astype(int).to_numpy()
-            score_context = np.stack([build_planner_context(row) for _, row in group.iterrows()], axis=0).astype(np.float32)
+            primitive = group["primitive_index"].astype(int).to_numpy(dtype=np.int64)
+            family = group["primitive_family_index"].astype(int).to_numpy(dtype=np.int64)
+            duration = group["duration_bucket"].astype(int).to_numpy(dtype=np.int64)
+            dynamics = group["dynamics_bucket"].astype(int).to_numpy(dtype=np.int64)
+            history_context = np.stack([build_history_context(row) for _, row in group.iterrows()], axis=0).astype(np.float32)
+            goal_context = np.stack([build_goal_context(row) for _, row in group.iterrows()], axis=0).astype(np.float32)
+            params = (
+                np.stack([normalize_param_row(row, metadata) for _, row in group.iterrows()], axis=0).astype(np.float32)
+                if metadata.continuous_param_dim > 0
+                else np.zeros((len(group), 0), dtype=np.float32)
+            )
             for target_index in range(1, len(group)):
                 row = group.iloc[target_index]
                 hand_joints = slice_episode_array(episode.hand_joints, int(row["onset_step"]), int(row["end_step"]))
@@ -64,13 +72,20 @@ class DiffusionChunkDataset(Dataset):
                 self.samples.append(
                     {
                         "primitive_history": primitive[start:target_index],
+                        "family_history": family[start:target_index],
                         "duration_history": duration[start:target_index],
                         "dynamics_history": dynamics[start:target_index],
-                        "score_history": score_context[start:target_index],
+                        "history_context": history_context[start:target_index],
+                        "planner_context": goal_context[target_index],
+                        "score_context": goal_context[target_index],
+                        "target_primitive": int(primitive[target_index]),
+                        "target_family": int(family[target_index]),
+                        "target_duration": int(duration[target_index]),
+                        "target_dynamics": int(dynamics[target_index]),
+                        "target_params": params[target_index],
                         "primitive_index": int(row["primitive_index"]),
                         "duration_bucket": int(row["duration_bucket"]),
                         "dynamics_bucket": int(row["dynamics_bucket"]),
-                        "score_context": build_planner_context(row),
                         "state_context": state_context.astype(np.float32),
                         "action_target": action_target.astype(np.float32),
                         "primitive_id": str(row["primitive_id"]),
@@ -115,22 +130,10 @@ def build_prior_lookup(primitive_root: Path, action_horizon: int) -> dict[str, n
 
 
 def diffusion_collate_fn(batch: list[dict[str, Any]], metadata: DiffusionMetadata, prior_lookup: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
-    planner_batch = planner_collate_fn(
-        [
-            item
-            | {
-                "target_primitive": item["primitive_index"],
-                "target_duration": item["duration_bucket"],
-                "target_dynamics": item["dynamics_bucket"],
-            }
-            for item in batch
-        ],
-        metadata=metadata_to_planner(metadata),
-    )
+    planner_batch = planner_collate_fn(batch, metadata=metadata)
     planner_batch["primitive_index"] = torch.tensor([item["primitive_index"] for item in batch], dtype=torch.long)
     planner_batch["duration_bucket"] = torch.tensor([item["duration_bucket"] for item in batch], dtype=torch.long)
     planner_batch["dynamics_bucket"] = torch.tensor([item["dynamics_bucket"] for item in batch], dtype=torch.long)
-    planner_batch["score_context"] = torch.from_numpy(np.stack([item["score_context"] for item in batch], axis=0).astype(np.float32))
     planner_batch["state_context"] = torch.from_numpy(np.stack([item["state_context"] for item in batch], axis=0).astype(np.float32))
     planner_batch["action_target"] = torch.from_numpy(np.stack([item["action_target"] for item in batch], axis=0).astype(np.float32))
     planner_batch["gmr_prior"] = torch.from_numpy(np.stack([prior_lookup[item["primitive_id"]] for item in batch], axis=0).astype(np.float32))
@@ -140,36 +143,69 @@ def diffusion_collate_fn(batch: list[dict[str, Any]], metadata: DiffusionMetadat
     return planner_batch
 
 
-def metadata_to_planner(metadata: DiffusionMetadata):
-    from sonata.transformer.dataset import PlannerMetadata
-
+def metadata_to_planner(metadata: DiffusionMetadata) -> PlannerMetadata:
     return PlannerMetadata(
         num_primitives=metadata.num_primitives,
         num_duration_buckets=metadata.num_duration_buckets,
         num_dynamics_buckets=metadata.num_dynamics_buckets,
+        num_families=metadata.num_families,
         score_dim=metadata.score_dim,
+        history_dim=metadata.history_dim,
         pad_primitive=metadata.pad_primitive,
         pad_duration=metadata.pad_duration,
         pad_dynamics=metadata.pad_dynamics,
+        pad_family=metadata.pad_family,
+        primitive_ids=list(metadata.primitive_ids),
+        primitive_family_names=list(metadata.primitive_family_names),
+        primitive_to_family=list(metadata.primitive_to_family),
+        family_mapping_mode=metadata.family_mapping_mode,
+        continuous_param_names=list(metadata.continuous_param_names),
+        continuous_param_mean=list(metadata.continuous_param_mean),
+        continuous_param_std=list(metadata.continuous_param_std),
+        goal_context_features=list(metadata.goal_context_features),
+        history_context_features=list(metadata.history_context_features),
     )
 
 
-def load_diffusion_inputs(primitive_root: Path, action_horizon: int, state_context_steps: int) -> tuple[pd.DataFrame, DiffusionMetadata, dict[str, np.ndarray]]:
-    token_df, planner_metadata = load_transformer_inputs(primitive_root)
+def load_diffusion_inputs(
+    primitive_root: Path,
+    action_horizon: int,
+    state_context_steps: int,
+    *,
+    family_mapping_mode: str = "heuristic_stats",
+    continuous_param_names: list[str] | tuple[str, ...] | None = None,
+) -> tuple[pd.DataFrame, DiffusionMetadata, dict[str, np.ndarray]]:
+    token_df, planner_metadata = load_transformer_inputs(
+        primitive_root,
+        family_mapping_mode=family_mapping_mode,
+        continuous_param_names=continuous_param_names,
+    )
     source_manifest = load_stage1_source_manifest(primitive_root)
     action_dim = int(source_manifest["action_dim"].replace(0, np.nan).dropna().iloc[0]) if "action_dim" in source_manifest.columns and not source_manifest["action_dim"].replace(0, np.nan).dropna().empty else 39
     hand_dim = int(source_manifest["hand_joint_dim"].replace(0, np.nan).dropna().iloc[0]) if "hand_joint_dim" in source_manifest.columns and not source_manifest["hand_joint_dim"].replace(0, np.nan).dropna().empty else 46
     state_dim = int(state_context_steps * hand_dim)
     metadata = DiffusionMetadata(
-        action_dim=action_dim,
-        state_dim=state_dim,
-        score_dim=planner_metadata.score_dim,
         num_primitives=planner_metadata.num_primitives,
         num_duration_buckets=planner_metadata.num_duration_buckets,
         num_dynamics_buckets=planner_metadata.num_dynamics_buckets,
+        num_families=planner_metadata.num_families,
+        score_dim=planner_metadata.score_dim,
+        history_dim=planner_metadata.history_dim,
         pad_primitive=planner_metadata.pad_primitive,
         pad_duration=planner_metadata.pad_duration,
         pad_dynamics=planner_metadata.pad_dynamics,
+        pad_family=planner_metadata.pad_family,
+        primitive_ids=list(planner_metadata.primitive_ids),
+        primitive_family_names=list(planner_metadata.primitive_family_names),
+        primitive_to_family=list(planner_metadata.primitive_to_family),
+        family_mapping_mode=planner_metadata.family_mapping_mode,
+        continuous_param_names=list(planner_metadata.continuous_param_names),
+        continuous_param_mean=list(planner_metadata.continuous_param_mean),
+        continuous_param_std=list(planner_metadata.continuous_param_std),
+        goal_context_features=list(planner_metadata.goal_context_features),
+        history_context_features=list(planner_metadata.history_context_features),
+        action_dim=action_dim,
+        state_dim=state_dim,
     )
     prior_lookup = build_prior_lookup(primitive_root, action_horizon)
     return token_df, metadata, prior_lookup

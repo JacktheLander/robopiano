@@ -1,0 +1,53 @@
+{
+  "action_horizon": 32,
+  "batch_size": 48,
+  "beta_end": 0.02,
+  "beta_start": 0.0001,
+  "checkpoint_interval": 2,
+  "config_path": "/WAVE/projects2/ECEN-524-Wi26/robopiano/Sonata/configs/diffusion/medium.yaml",
+  "config_stage": "diffusion",
+  "context_length": 48,
+  "continuous_param_names": [
+    "motion_energy",
+    "chord_size",
+    "start_state_norm",
+    "end_state_norm"
+  ],
+  "deterministic_eval": true,
+  "device": "cuda",
+  "diffusion_steps": 100,
+  "epochs": 20,
+  "experiment_name": "Sonata-3-medium-diffusion",
+  "family_mapping_mode": "heuristic_stats",
+  "imitation_weight": 0.5,
+  "learning_rate": 0.0001,
+  "model_dim": 192,
+  "num_blocks": 8,
+  "num_workers": 2,
+  "output_root": "/WAVE/projects2/ECEN-524-Wi26/robopiano/Sonata/outputs/diffusion",
+  "planner_checkpoint": "/WAVE/projects/ECEN-524-Wi26/robopiano/Sonata/outputs/transformer/Sonata-3-transformer-Sonata-3-medium-planner-tuned-v1-seed7-20260322-191906/checkpoints/best.pt",
+  "planner_dropout": 0.1,
+  "planner_embedding_dim": 256,
+  "planner_ffn": 768,
+  "planner_layers": 6,
+  "planner_nhead": 8,
+  "primitive_embedding_dim": 128,
+  "primitive_root": "/WAVE/projects2/ECEN-524-Wi26/robopiano/Sonata/outputs/primitives/medium",
+  "resume": false,
+  "seed": 7,
+  "smoothness_weight": 0.05,
+  "state_context_steps": 8,
+  "variant": "full",
+  "wandb": {
+    "enabled": true,
+    "entity": "tnguyen31-santa-clara-university",
+    "mode": "online",
+    "project": "robopianist",
+    "tags": [
+      "sonata",
+      "diffusion",
+      "medium"
+    ]
+  },
+  "weight_decay": 0.0001
+}

@@ -13,6 +13,7 @@ device: cpu
 resume: false
 deterministic_eval: true
 variant: full
+
 context_length: 24
 batch_size: 16
 num_workers: 0
@@ -21,6 +22,7 @@ learning_rate: 0.0002
 weight_decay: 0.0001
 action_horizon: 32
 state_context_steps: 8
+
 model_dim: 128
 num_blocks: 6
 diffusion_steps: 50
@@ -29,6 +31,12 @@ beta_end: 0.02
 imitation_weight: 0.5
 smoothness_weight: 0.05
 checkpoint_interval: 2
+
+# These must match the planner run if you load a Stage 2 checkpoint.
+family_mapping_mode: heuristic_stats
+continuous_param_names: ["motion_energy", "chord_size", "start_state_norm", "end_state_norm"]
+
+# Fallback planner hyperparameters for checkpoints that do not embed planner_config.
 planner_embedding_dim: 192
 primitive_embedding_dim: 96
 planner_nhead: 6

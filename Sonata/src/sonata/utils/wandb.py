@@ -68,11 +68,15 @@ class WandbRun:
         raw_entity = raw.get("entity", DEFAULT_WANDB_ENTITY)
         raw_group = raw.get("group")
         raw_notes = raw.get("notes")
+        raw_mode = raw.get("mode", "online")
+        mode = str(raw_mode).strip() if raw_mode is not None else "online"
+        if not mode:
+            mode = "online"
         self.config = {
             "enabled": bool(raw.get("enabled", False)),
             "project": str(raw.get("project", DEFAULT_WANDB_PROJECT)),
             "entity": str(raw_entity).strip() if raw_entity is not None else None,
-            "mode": str(raw.get("mode", "online")),
+            "mode": mode,
             "group": str(raw_group).strip() if raw_group is not None and str(raw_group).strip() else None,
             "notes": str(raw_notes).strip() if raw_notes is not None and str(raw_notes).strip() else None,
             "tags": [str(tag).strip() for tag in raw_tags if str(tag).strip()],
@@ -81,7 +85,7 @@ class WandbRun:
         if tags:
             merged_tags = self.config["tags"] + [tag for tag in tags if tag not in self.config["tags"]]
             self.config["tags"] = merged_tags
-        self.enabled = bool(self.config["enabled"])
+        self.enabled = bool(self.config["enabled"]) and self.config["mode"] != "disabled"
         self.run = None
         self._wandb = None
         if not self.enabled:
@@ -123,11 +127,45 @@ class WandbRun:
             return
         self.run.log(_json_ready(payload), step=step)
 
+    def log_raw(self, payload: dict[str, Any], step: int | None = None) -> None:
+        if self.run is None:
+            return
+        self.run.log(payload, step=step)
+
     def summary(self, payload: dict[str, Any]) -> None:
         if self.run is None:
             return
         for key, value in _json_ready(payload).items():
             self.run.summary[key] = value
+
+    @property
+    def active(self) -> bool:
+        return self.run is not None and self._wandb is not None
+
+    def make_video(
+        self,
+        data_or_path: str | Path,
+        *,
+        caption: str | None = None,
+        fps: int | None = None,
+        format: str | None = None,
+    ) -> Any | None:
+        if self.run is None or self._wandb is None:
+            return None
+        kwargs: dict[str, Any] = {}
+        if caption is not None:
+            kwargs["caption"] = caption
+        if fps is not None:
+            kwargs["fps"] = fps
+        if format is not None:
+            kwargs["format"] = format
+        source = str(Path(data_or_path).resolve()) if isinstance(data_or_path, (str, Path)) else data_or_path
+        return self._wandb.Video(source, **kwargs)
+
+    def make_table(self, *, dataframe: Any) -> Any | None:
+        if self.run is None or self._wandb is None:
+            return None
+        return self._wandb.Table(dataframe=dataframe)
 
     def log_artifact_bundle(
         self,

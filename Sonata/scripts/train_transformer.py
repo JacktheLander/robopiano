@@ -16,7 +16,7 @@ from sonata.utils.wandb import add_wandb_arguments, apply_wandb_cli_overrides
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train the Sonata-3 transformer planner.")
+    parser = argparse.ArgumentParser(description="Train the Sonata-3 factored transformer planner.")
     parser.add_argument("--profile", default="debug")
     parser.add_argument("--config", default=None)
     parser.add_argument("--primitive-root", default=None)

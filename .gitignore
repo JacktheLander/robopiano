@@ -4,7 +4,7 @@ __pycache__/
 .venv/
 env/
 
-outputs/
+
 logs/
 checkpoints/
 .cache/
@@ -21,3 +21,7 @@ extracted_midis/
 !Sonata/configs/data/**
 !Sonata/src/sonata/data/
 !Sonata/src/sonata/data/**
+Sonata/outputs/primitives/medium/features/
+Sonata/outputs/primitives/medium/segments/
+Sonata/outputs/primitives/medium/tokens/
+Sonata/outputs/primitives/medium/slim/

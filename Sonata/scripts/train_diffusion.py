@@ -33,12 +33,13 @@ def main() -> None:
     config = load_stage_config("diffusion", profile=args.profile, config_path=args.config)
     config = apply_wandb_cli_overrides(config, args)
     config_dir = resolve_path(config["config_path"]).parent
+    cwd = Path.cwd()
     if args.primitive_root is not None:
-        config["primitive_root"] = args.primitive_root
+        config["primitive_root"] = str(resolve_path(args.primitive_root, cwd))
     if args.planner_checkpoint is not None:
-        config["planner_checkpoint"] = args.planner_checkpoint
+        config["planner_checkpoint"] = str(resolve_path(args.planner_checkpoint, cwd))
     if args.output_root is not None:
-        config["output_root"] = args.output_root
+        config["output_root"] = str(resolve_path(args.output_root, cwd))
     if args.variant is not None:
         config["variant"] = args.variant
     config["primitive_root"] = str(resolve_path(config["primitive_root"], config_dir))
