@@ -195,6 +195,36 @@ python scripts/evaluate.py \
   --output-root outputs/eval/debug
 ```
 
+Evaluate Sonata on unseen songs from an external MIDI corpus:
+
+1. Store the MIDI dataset outside the repo on shared persistent storage, for example:
+   `/project/$USER/datasets/external_midis/<dataset_name>/`
+2. Keep the Sonata checkout at `/project/$USER/robopianist` so the local RoboPianist package resolves from `/project/$USER/robopianist/robopianist`.
+3. Build an external-song benchmark manifest:
+
+```bash
+python scripts/prepare_external_midi.py \
+  --dataset-root /project/$USER/datasets/external_midis/<dataset_name> \
+  --output-root /project/$USER/eval/external_midis/<dataset_name>_manifest \
+  --force
+```
+
+4. Run the rollout benchmark against the prepared manifest:
+
+```bash
+MUJOCO_GL=egl python scripts/evaluate_external.py \
+  --primitive-root /project/$USER/<path-to-primitives-run> \
+  --diffusion-checkpoint /project/$USER/<path-to-diffusion-run>/checkpoints/best.pt \
+  --benchmark-root /project/$USER/eval/external_midis/<dataset_name>_manifest \
+  --output-root /project/$USER/eval/external_midis/<dataset_name>_results \
+  --benchmark-split test \
+  --device cuda
+```
+
+You can also point directly at the manifest CSV with
+`--benchmark-manifest /project/$USER/eval/external_midis/<dataset_name>_manifest/external_midi_manifest.csv`.
+The manifest stores absolute `note_path` entries, so do not move the MIDI files after preparing it.
+
 Planner validation metrics are written during training into:
 
 - `outputs/transformer/<run>/metrics/metrics.csv`
