@@ -58,6 +58,8 @@ def load_episode_record(row: dict[str, Any] | pd.Series) -> EpisodeRecord:
         arrays = _load_from_zarr(payload)
     elif backend == "npy_dir":
         arrays = _load_from_npy_dir(payload)
+    elif backend == "midi_only":
+        arrays = {name: None for name in ARRAY_FIELDS}
     else:
         raise ValueError(f"Unsupported Sonata dataset backend: {backend}")
     return EpisodeRecord(

@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from sonata.data.score import load_note_events
 from sonata.data.schema import ManifestRecord
 from sonata.utils.io import write_json, write_table
 
@@ -117,6 +118,118 @@ def scan_dataset(config: dict[str, Any], logger: logging.Logger) -> dict[str, Pa
     }
     write_json(summary, summary_path)
     logger.info("Indexed %d songs and %d episodes from %s", len(songs), len(manifest_df), dataset_root)
+    return {"manifest_base": manifest_base, "split_base": split_base, "summary_path": summary_path}
+
+
+def index_external_midi_dataset(config: dict[str, Any], logger: logging.Logger) -> dict[str, Path]:
+    output_root = Path(config["output_root"]).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    manifest_base = output_root / str(config.get("manifest_name", "external_midi_manifest"))
+    split_base = output_root / str(config.get("split_name", "external_midi_splits"))
+    summary_path = output_root / str(config.get("summary_name", "external_midi_summary.json"))
+    if manifest_base.with_suffix(".csv").exists() and not bool(config.get("force", False)):
+        return {"manifest_base": manifest_base, "split_base": split_base, "summary_path": summary_path}
+
+    dataset_root = Path(config["dataset_root"]).resolve()
+    control_timestep = float(config.get("control_timestep", 0.05))
+    recursive = bool(config.get("recursive", True))
+    split_name = str(config.get("split", "test"))
+    suffixes = {".mid", ".midi"}
+    midi_files = sorted(
+        path
+        for path in (dataset_root.rglob("*") if recursive else dataset_root.iterdir())
+        if path.is_file() and path.suffix.lower() in suffixes
+    )
+    if not midi_files:
+        raise FileNotFoundError(f"No MIDI files found under external dataset root: {dataset_root}")
+
+    manifest_rows: list[dict[str, Any]] = []
+    split_rows: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    song_ids = _dedupe_song_ids(midi_files)
+    for midi_path, song_id in zip(midi_files, song_ids):
+        episode_id = f"{song_id}__ep00000"
+        try:
+            events = load_note_events(
+                midi_path,
+                control_timestep=control_timestep,
+                chord_tolerance_steps=int(config.get("chord_tolerance_steps", 1)),
+                song_id=song_id,
+                episode_id=episode_id,
+            )
+        except Exception as exc:
+            skipped.append({"path": str(midi_path), "reason": f"parse_error: {exc}"})
+            logger.warning("Skipping external MIDI `%s`: %s", midi_path, exc)
+            continue
+        if not events:
+            skipped.append({"path": str(midi_path), "reason": "empty_or_out_of_range"})
+            logger.warning("Skipping external MIDI `%s`: no piano-range note events found.", midi_path)
+            continue
+        num_steps = max(int(event.end_step) for event in events)
+        record = ManifestRecord(
+            song_id=song_id,
+            episode_id=episode_id,
+            split=split_name,
+            backend="midi_only",
+            dataset_root=str(dataset_root),
+            song_key=song_id,
+            song_path=str(midi_path),
+            episode_index=0,
+            note_path=str(midi_path),
+            control_timestep=control_timestep,
+            num_steps=max(num_steps, 1),
+            action_dim=0,
+            goal_dim=0,
+            piano_state_dim=0,
+            hand_joint_dim=0,
+            hand_fingertip_dim=0,
+            joint_velocity_dim=0,
+            wrist_pose_dim=0,
+            hand_pose_dim=0,
+            has_actions=False,
+            has_goals=False,
+            has_piano_states=False,
+            has_hand_joints=False,
+            has_hand_fingertips=False,
+            has_joint_velocities=False,
+            has_wrist_pose=False,
+            has_hand_pose=False,
+        )
+        manifest_rows.append(record.as_row())
+        split_rows.append(
+            {
+                "song_id": song_id,
+                "split": split_name,
+                "num_episodes": 1,
+                "num_steps": max(num_steps, 1),
+                "note_path": str(midi_path),
+            }
+        )
+
+    if not manifest_rows:
+        raise FileNotFoundError(
+            f"No valid external MIDI songs were indexed from {dataset_root}; skipped={len(skipped)}"
+        )
+
+    manifest_df = pd.DataFrame(manifest_rows)
+    split_df = pd.DataFrame(split_rows)
+    write_table(manifest_df, manifest_base)
+    write_table(split_df, split_base)
+    summary = {
+        "dataset_root": str(dataset_root),
+        "backend": "midi_only",
+        "benchmark_name": str(config.get("benchmark_name", "external_midi_test")),
+        "num_songs": int(manifest_df["song_id"].nunique()),
+        "num_episodes": int(len(manifest_df)),
+        "control_timestep": control_timestep,
+        "split": split_name,
+        "recursive": recursive,
+        "songs": manifest_df["song_id"].astype(str).tolist(),
+        "skipped_count": int(len(skipped)),
+        "skipped": skipped,
+    }
+    write_json(summary, summary_path)
+    logger.info("Indexed %d external MIDI songs from %s", len(manifest_df), dataset_root)
     return {"manifest_base": manifest_base, "split_base": split_base, "summary_path": summary_path}
 
 
@@ -236,6 +349,22 @@ def _apply_subset(songs: list[dict[str, Any]], config: dict[str, Any]) -> list[d
         rng.shuffle(selected)
         return selected[:limit]
     return selected[:limit] if mode != "all" else selected
+
+
+def _dedupe_song_ids(paths: list[Path]) -> list[str]:
+    counts: dict[str, int] = {}
+    output: list[str] = []
+    for path in paths:
+        base = _sanitize_song_id(path.stem)
+        index = counts.get(base, 0)
+        counts[base] = index + 1
+        output.append(base if index == 0 else f"{base}__dup{index:02d}")
+    return output
+
+
+def _sanitize_song_id(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._-")
+    return cleaned or "song"
 
 
 def _build_song_split_df(songs: list[dict[str, Any]], seed: int, ratios: dict[str, Any]) -> pd.DataFrame:

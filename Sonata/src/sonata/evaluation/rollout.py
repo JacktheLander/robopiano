@@ -15,6 +15,7 @@ from sonata.data.loading import build_manifest_lookup, load_stage1_source_manife
 from sonata.evaluation.offline import stitch_segment_predictions
 from sonata.training.mjx_rollout import MJXRolloutBackend, mjx_availability
 from sonata.utils.io import write_json, write_table
+from sonata.utils.robopianist import ensure_local_robopianist_on_path, format_robopianist_import_error
 from sonata.utils.wandb_eval import log_prefixed_metrics, log_rollout_table, log_rollout_video
 
 LOGGER = logging.getLogger(__name__)
@@ -38,11 +39,12 @@ def evaluate_dm_control_rollout(
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
     logger = logger or LOGGER
+    ensure_local_robopianist_on_path()
     try:
         from robopianist import suite
         from robopianist.wrappers.evaluation import MidiEvaluationWrapper
     except Exception as exc:  # pragma: no cover
-        result = {"available": False, "error": str(exc)}
+        result = {"available": False, "error": format_robopianist_import_error(exc)}
         write_json(result, output_root / "dm_control_rollout.json")
         log_prefixed_metrics(wandb_run, result, prefix="rollout/dm_control", summary=True)
         return result
