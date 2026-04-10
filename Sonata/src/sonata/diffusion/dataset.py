@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 from sonata.data.loading import build_manifest_lookup, load_episode_record, load_stage1_source_manifest
+from sonata.diffusion.note_surrogate import build_note_state_targets
 from sonata.transformer.dataset import (
     PlannerMetadata,
     build_goal_context,
@@ -62,12 +63,26 @@ class DiffusionChunkDataset(Dataset):
             )
             for target_index in range(1, len(group)):
                 row = group.iloc[target_index]
-                hand_joints = slice_episode_array(episode.hand_joints, int(row["onset_step"]), int(row["end_step"]))
-                actions = slice_episode_array(episode.actions, int(row["onset_step"]), int(row["end_step"]))
-                if hand_joints is None or actions is None:
+                onset_step = int(row["onset_step"])
+                end_step = int(row["end_step"])
+                hand_joints = slice_episode_array(episode.hand_joints, onset_step, end_step)
+                actions = slice_episode_array(episode.actions, onset_step, end_step)
+                contact_roll_source = episode.goals if episode.goals is not None else episode.piano_states
+                contact_roll = slice_episode_array(contact_roll_source, onset_step, end_step)
+                if hand_joints is None or actions is None or contact_roll is None:
                     continue
                 state_context = resample_sequence(hand_joints, self.state_context_steps).reshape(-1)
                 action_target = resample_sequence(actions, self.action_horizon)
+                previous_contact = None
+                if contact_roll_source is not None and onset_step > 0:
+                    previous = slice_episode_array(contact_roll_source, onset_step - 1, onset_step)
+                    if previous is not None and previous.shape[0] > 0:
+                        previous_contact = previous[-1]
+                note_target, hold_target, sustain_target = build_note_state_targets(
+                    contact_roll,
+                    action_horizon=self.action_horizon,
+                    previous_frame=previous_contact,
+                )
                 start = max(0, target_index - self.context_length)
                 self.samples.append(
                     {
@@ -88,10 +103,13 @@ class DiffusionChunkDataset(Dataset):
                         "dynamics_bucket": int(row["dynamics_bucket"]),
                         "state_context": state_context.astype(np.float32),
                         "action_target": action_target.astype(np.float32),
+                        "note_target": note_target.astype(np.float32),
+                        "hold_target": hold_target.astype(np.float32),
+                        "sustain_target": sustain_target.astype(np.float32),
                         "primitive_id": str(row["primitive_id"]),
                         "episode_id": str(row["episode_id"]),
-                        "onset_step": int(row["onset_step"]),
-                        "end_step": int(row["end_step"]),
+                        "onset_step": onset_step,
+                        "end_step": end_step,
                     }
                 )
 
@@ -136,6 +154,9 @@ def diffusion_collate_fn(batch: list[dict[str, Any]], metadata: DiffusionMetadat
     planner_batch["dynamics_bucket"] = torch.tensor([item["dynamics_bucket"] for item in batch], dtype=torch.long)
     planner_batch["state_context"] = torch.from_numpy(np.stack([item["state_context"] for item in batch], axis=0).astype(np.float32))
     planner_batch["action_target"] = torch.from_numpy(np.stack([item["action_target"] for item in batch], axis=0).astype(np.float32))
+    planner_batch["note_target"] = torch.from_numpy(np.stack([item["note_target"] for item in batch], axis=0).astype(np.float32))
+    planner_batch["hold_target"] = torch.from_numpy(np.stack([item["hold_target"] for item in batch], axis=0).astype(np.float32))
+    planner_batch["sustain_target"] = torch.from_numpy(np.stack([item["sustain_target"] for item in batch], axis=0).astype(np.float32))
     planner_batch["gmr_prior"] = torch.from_numpy(np.stack([prior_lookup[item["primitive_id"]] for item in batch], axis=0).astype(np.float32))
     planner_batch["episode_id"] = [item["episode_id"] for item in batch]
     planner_batch["onset_step"] = [int(item["onset_step"]) for item in batch]

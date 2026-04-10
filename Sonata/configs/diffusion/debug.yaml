@@ -28,8 +28,16 @@ num_blocks: 6
 diffusion_steps: 50
 beta_start: 0.0001
 beta_end: 0.02
-imitation_weight: 0.5
-smoothness_weight: 0.05
+predict_residual: true
+note_loss_weight: 1.0
+hold_loss_weight: 0.5
+imitation_weight: 0.25
+smoothness_weight: 0.02
+residual_reg_weight: 0.05
+diffusion_weight: 0.25
+false_negative_weight: 4.0
+false_positive_weight: 1.0
+surrogate_ridge_lambda: 0.01
 checkpoint_interval: 2
 
 # These must match the planner run if you load a Stage 2 checkpoint.

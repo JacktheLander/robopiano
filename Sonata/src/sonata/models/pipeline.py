@@ -122,9 +122,12 @@ class Sonata3Pipeline:
         if local_variant in {"diffusion_only", "planner_no_prior"}:
             prior = torch.zeros_like(prior)
         condition = self._condition_vector(batch, variant=local_variant)
-        return self.diffusion.sample(
+        sampled = self.diffusion.sample(
             self.model,
             shape=tuple(batch["action_target"].shape),
             prior=prior,
             condition=condition,
         )
+        if bool(self.config.get("predict_residual", False)):
+            return prior + sampled
+        return sampled
