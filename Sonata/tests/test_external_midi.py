@@ -193,7 +193,10 @@ def test_resolve_external_manifest_base_accepts_csv_path(tmp_path: Path) -> None
 def test_robopianist_helper_uses_repo_root_package_parent(tmp_path: Path, monkeypatch) -> None:
     repo_root = tmp_path / "project_root"
     package_dir = repo_root / "robopianist"
-    package_dir.mkdir(parents=True, exist_ok=True)
+    suite_dir = package_dir / "suite"
+    suite_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("")
+    (suite_dir / "__init__.py").write_text("")
 
     monkeypatch.setattr(robopianist_utils, "repo_root", lambda: repo_root)
     monkeypatch.setattr(robopianist_utils.importlib.util, "find_spec", lambda name: None)
