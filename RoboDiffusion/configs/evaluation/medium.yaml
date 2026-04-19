@@ -1,0 +1,22 @@
+checkpoint_path: ./outputs/train/medium
+dataset_root: ./outputs/cache/medium
+output_root: ./outputs/eval/medium
+run_offline: true
+run_rollout: true
+split: val
+batch_size: 32
+max_steps: 256
+limit_episodes: 2
+control_timestep: 0.05
+n_steps_lookahead: 1
+environment_name: RoboPianist-debug-TwinkleTwinkleLittleStar-v0
+wandb:
+  enabled: true
+  entity: tnguyen31-santa-clara-university
+  project: robopianist
+  mode: online
+  group: robodiffusion-evaluation
+  tags:
+    - robodiffusion
+    - eval
+    - medium

@@ -1,0 +1,33 @@
+dataset_root: ./outputs/cache/debug
+output_root: ./outputs/train/debug
+experiment_name: rp1m-debug-diffusion
+seed: 7
+device: cpu
+epochs: 1
+batch_size: 8
+num_workers: 0
+learning_rate: 0.0001
+weight_decay: 0.0001
+checkpoint_interval: 1
+resume: false
+progress_bar: false
+model_dim: 128
+num_layers: 2
+num_heads: 4
+dropout: 0.1
+diffusion_steps: 20
+beta_start: 0.0001
+beta_end: 0.02
+action_execute_horizon: 4
+action_loss_weight: 1.0
+smoothness_weight: 0.05
+grad_clip_norm: 1.0
+wandb:
+  enabled: true
+  entity: tnguyen31-santa-clara-university
+  project: robopianist
+  mode: online
+  group: robodiffusion-training
+  tags:
+    - robodiffusion
+    - debug

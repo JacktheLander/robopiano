@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robodiffusion-policy"
+version = "0.1.0"
+description = "Diffusion Policy-style action generation for RoboPianist on RP1M."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "Jack Landers"}, {name = "OpenAI Codex"}]
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "PyYAML>=6.0",
+  "tqdm>=4.66",
+  "torch>=2.2",
+  "wandb>=0.17",
+]
+
+[project.optional-dependencies]
+full = [
+  "pyarrow>=15.0",
+  "zarr>=2.16,<3",
+  "mujoco>=3.1",
+  "dm-control>=1.0.14",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]

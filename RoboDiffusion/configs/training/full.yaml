@@ -1,0 +1,33 @@
+dataset_root: ./outputs/cache/full
+output_root: ./outputs/train/full
+experiment_name: rp1m-full-diffusion
+seed: 7
+device: cuda
+epochs: 50
+batch_size: 64
+num_workers: 8
+learning_rate: 0.0001
+weight_decay: 0.0001
+checkpoint_interval: 5
+resume: false
+progress_bar: true
+model_dim: 384
+num_layers: 8
+num_heads: 8
+dropout: 0.1
+diffusion_steps: 50
+beta_start: 0.0001
+beta_end: 0.02
+action_execute_horizon: 4
+action_loss_weight: 1.0
+smoothness_weight: 0.05
+grad_clip_norm: 1.0
+wandb:
+  enabled: true
+  entity: tnguyen31-santa-clara-university
+  project: robopianist
+  mode: online
+  group: robodiffusion-training
+  tags:
+    - robodiffusion
+    - full
