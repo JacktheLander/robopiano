@@ -25,3 +25,12 @@ Sonata/outputs/primitives/medium/features/
 Sonata/outputs/primitives/medium/segments/
 Sonata/outputs/primitives/medium/tokens/
 Sonata/outputs/primitives/medium/slim/
+Sonata/outputs/evaluation/primitives_online/**/primitive_instance_metrics.jsonl
+Sonata/outputs/evaluation/primitives_online/**/*.parquet
+Sonata/outputs/evaluation/primitives_online/**/primitive_instances_enriched.csv
+Sonata/outputs/evaluation/primitives_online/**/primitive_instance_metrics.csv
+Sonata/outputs/evaluation/primitives_online/**/config_snapshot.json
+Sonata/outputs/evaluation/primitives_online/**/preflight.json
+Sonata/outputs/evaluation/primitives_online/**/runtime_status.json
+Sonata/src/sonata/data/__pycache__/
+robopianist/

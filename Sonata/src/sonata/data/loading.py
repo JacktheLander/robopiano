@@ -25,6 +25,7 @@ def load_manifest(path_without_suffix: str | Path) -> pd.DataFrame:
     df = read_table(path_without_suffix).copy()
     defaults = {
         "split": "train",
+        "benchmark_name": "",
         "backend": "zarr",
         "song_key": "",
         "song_path": "",

@@ -74,6 +74,7 @@ def scan_dataset(config: dict[str, Any], logger: logging.Logger) -> dict[str, Pa
                 song_id=str(song["song_id"]),
                 episode_id=f"{song['song_id']}__ep{episode_index:05d}",
                 split=split,
+                benchmark_name="",
                 backend=backend,
                 dataset_root=str(dataset_root),
                 song_key=str(song.get("song_key", song["song_id"])),
@@ -133,7 +134,8 @@ def index_external_midi_dataset(config: dict[str, Any], logger: logging.Logger) 
     dataset_root = Path(config["dataset_root"]).resolve()
     control_timestep = float(config.get("control_timestep", 0.05))
     recursive = bool(config.get("recursive", True))
-    split_name = str(config.get("split", "test"))
+    split_name = str(config.get("split", "benchmark"))
+    benchmark_name = str(config.get("benchmark_name", "external_midi_benchmark"))
     suffixes = {".mid", ".midi"}
     midi_files = sorted(
         path
@@ -170,6 +172,7 @@ def index_external_midi_dataset(config: dict[str, Any], logger: logging.Logger) 
             song_id=song_id,
             episode_id=episode_id,
             split=split_name,
+            benchmark_name=benchmark_name,
             backend="midi_only",
             dataset_root=str(dataset_root),
             song_key=song_id,
@@ -200,6 +203,7 @@ def index_external_midi_dataset(config: dict[str, Any], logger: logging.Logger) 
             {
                 "song_id": song_id,
                 "split": split_name,
+                "benchmark_name": benchmark_name,
                 "num_episodes": 1,
                 "num_steps": max(num_steps, 1),
                 "note_path": str(midi_path),
@@ -218,7 +222,7 @@ def index_external_midi_dataset(config: dict[str, Any], logger: logging.Logger) 
     summary = {
         "dataset_root": str(dataset_root),
         "backend": "midi_only",
-        "benchmark_name": str(config.get("benchmark_name", "external_midi_test")),
+        "benchmark_name": benchmark_name,
         "num_songs": int(manifest_df["song_id"].nunique()),
         "num_episodes": int(len(manifest_df)),
         "control_timestep": control_timestep,

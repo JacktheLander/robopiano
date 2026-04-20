@@ -21,7 +21,9 @@ from sonata.evaluation.external_midi import (
     build_external_segment_rows,
     compute_external_reference_stats,
     extract_hand_joints,
+    normalize_external_benchmark_split,
     resolve_external_manifest_base,
+    resolve_external_benchmark_name,
 )
 from sonata.utils import robopianist as robopianist_utils
 
@@ -91,6 +93,8 @@ def test_index_external_midi_dataset_indexes_recursive_files(tmp_path: Path, mon
     summary = (tmp_path / "outputs" / "external_midi_summary.json").read_text()
 
     assert manifest_df["backend"].tolist() == ["midi_only", "midi_only"]
+    assert manifest_df["split"].tolist() == ["benchmark", "benchmark"]
+    assert manifest_df["benchmark_name"].tolist() == ["external_midi_benchmark", "external_midi_benchmark"]
     assert manifest_df["song_id"].tolist() == ["alpha", "alpha__dup01"]
     assert manifest_df["num_steps"].tolist() == [12, 12]
     assert '"skipped_count": 1' in summary
@@ -188,6 +192,32 @@ def test_resolve_external_manifest_base_accepts_csv_path(tmp_path: Path) -> None
     manifest_csv.write_text("song_id,episode_id\n")
 
     assert resolve_external_manifest_base(benchmark_manifest=manifest_csv) == tmp_path / "external_midi_manifest"
+
+
+def test_resolve_external_benchmark_name_prefers_manifest_metadata(tmp_path: Path) -> None:
+    manifest_df = pd.DataFrame(
+        [
+            {
+                "song_id": "song",
+                "episode_id": "song__ep00000",
+                "benchmark_name": "maestro",
+            }
+        ]
+    )
+
+    name = resolve_external_benchmark_name(
+        manifest_df=manifest_df,
+        manifest_base=tmp_path / "external_midi_manifest",
+    )
+
+    assert name == "maestro"
+
+
+def test_normalize_external_benchmark_split_allows_unfiltered_eval() -> None:
+    assert normalize_external_benchmark_split(None) is None
+    assert normalize_external_benchmark_split("") is None
+    assert normalize_external_benchmark_split("all") is None
+    assert normalize_external_benchmark_split("benchmark") == "benchmark"
 
 
 def test_robopianist_helper_uses_repo_root_package_parent(tmp_path: Path, monkeypatch) -> None:

@@ -13,6 +13,7 @@ class ManifestRecord:
     song_id: str
     episode_id: str
     split: str
+    benchmark_name: str
     backend: str
     dataset_root: str
     song_key: str

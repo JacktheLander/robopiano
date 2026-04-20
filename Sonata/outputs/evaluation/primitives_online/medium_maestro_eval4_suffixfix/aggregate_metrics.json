@@ -1,0 +1,18 @@
+{
+  "mean_abs_timing_error_frames": 0.0,
+  "mean_action_mse": 0.2949195833477591,
+  "mean_false_positive_key_events": 0.25,
+  "mean_missed_key_events": 4.870535714285714,
+  "mean_onset_f1": 0.4792977408651474,
+  "mean_onset_precision": 0.9294642857142856,
+  "mean_onset_recall": 0.3513843175673533,
+  "mean_piano_state_mse": 0.02702721616411249,
+  "num_assignment_rows": 681240,
+  "num_failed_rollouts": 0,
+  "num_primitives_evaluated": 56,
+  "num_result_rows": 224,
+  "num_sampled_rows": 224,
+  "num_successful_rollouts": 224,
+  "runtime_error": null,
+  "status": "completed"
+}

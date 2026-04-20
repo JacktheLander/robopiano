@@ -206,6 +206,7 @@ Evaluate Sonata on unseen songs from an external MIDI corpus:
 python scripts/prepare_external_midi.py \
   --dataset-root /project/$USER/datasets/external_midis/<dataset_name> \
   --output-root /project/$USER/eval/external_midis/<dataset_name>_manifest \
+  --benchmark-name <dataset_name> \
   --force
 ```
 
@@ -217,13 +218,48 @@ MUJOCO_GL=egl python scripts/evaluate_external.py \
   --diffusion-checkpoint /project/$USER/<path-to-diffusion-run>/checkpoints/best.pt \
   --benchmark-root /project/$USER/eval/external_midis/<dataset_name>_manifest \
   --output-root /project/$USER/eval/external_midis/<dataset_name>_results \
-  --benchmark-split test \
   --device cuda
 ```
 
 You can also point directly at the manifest CSV with
 `--benchmark-manifest /project/$USER/eval/external_midis/<dataset_name>_manifest/external_midi_manifest.csv`.
 The manifest stores absolute `note_path` entries, so do not move the MIDI files after preparing it.
+Prepared manifests default to a single `benchmark` split. Leave `--benchmark-split` unset to evaluate all indexed songs,
+or pass `--benchmark-split benchmark` to filter explicitly.
+
+For MAESTRO, a typical workflow is:
+
+```bash
+python scripts/prepare_external_midi.py \
+  --dataset-root /WAVE/datasets/ccoelho_lab-jlanders/maestro-v3.0.0/maestro-v3.0.0 \
+  --output-root /project/$USER/eval/external_midis/maestro_manifest \
+  --benchmark-name maestro \
+  --force
+
+MUJOCO_GL=egl python scripts/evaluate_external.py \
+  --primitive-root /project/$USER/<path-to-primitives-run> \
+  --diffusion-checkpoint /project/$USER/<path-to-diffusion-run>/checkpoints/best.pt \
+  --benchmark-root /project/$USER/eval/external_midis/maestro_manifest \
+  --output-root /project/$USER/eval/external_midis/maestro_results \
+  --device cuda
+```
+
+To replay Stage 1 primitive priors inside RoboPianist against the same MAESTRO corpus, use the dedicated config:
+
+```bash
+python scripts/evaluate_primitives_online.py \
+  --config configs/evaluation/primitives_online_maestro.yaml \
+  --profile medium \
+  --primitive-root outputs/primitives/medium \
+  --output-root outputs/evaluation/primitives_online/medium_maestro \
+  --external-midi-manifest /project/$USER/eval/external_midis/maestro_manifest/external_midi_manifest.csv \
+  --robopianist-root ../robopianist
+```
+
+When primitive online evaluation uses `external_midi_manifest` or `external_midi_dataset`, RoboPianist is driven by the
+external MIDI file, but rollout metrics remain anchored to the original Stage 1 segment arrays (`actions`, `goals`,
+`piano_states`, and derived key events). Treat those runs as cross-corpus qualitative stress tests rather than exact
+MAESTRO-grounded reconstruction scores.
 
 Planner validation metrics are written during training into:
 

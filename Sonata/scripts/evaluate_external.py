@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--benchmark-manifest", default=None)
     parser.add_argument("--benchmark-root", default=None)
-    parser.add_argument("--benchmark-split", default="test")
+    parser.add_argument("--benchmark-split", default=None)
     parser.add_argument("--variant", default=None)
     parser.add_argument("--limit-episodes", type=int, default=None)
     parser.add_argument("--device", default="cpu")

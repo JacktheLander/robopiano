@@ -18,11 +18,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--control-timestep", type=float, default=0.05)
+    parser.add_argument("--chord-tolerance-steps", type=int, default=1)
     parser.add_argument("--manifest-name", default="external_midi_manifest")
     parser.add_argument("--split-name", default="external_midi_splits")
     parser.add_argument("--summary-name", default="external_midi_summary.json")
-    parser.add_argument("--split", default="test")
-    parser.add_argument("--benchmark-name", default="external_midi_test")
+    parser.add_argument("--split", default="benchmark")
+    parser.add_argument("--benchmark-name", default="external_midi_benchmark")
     parser.add_argument("--recursive", action="store_true", default=True)
     parser.add_argument("--no-recursive", dest="recursive", action="store_false")
     parser.add_argument("--force", action="store_true")
@@ -38,6 +39,7 @@ def main() -> None:
             "dataset_root": str(Path(args.dataset_root).resolve()),
             "output_root": str(Path(args.output_root).resolve()),
             "control_timestep": float(args.control_timestep),
+            "chord_tolerance_steps": int(args.chord_tolerance_steps),
             "manifest_name": args.manifest_name,
             "split_name": args.split_name,
             "summary_name": args.summary_name,

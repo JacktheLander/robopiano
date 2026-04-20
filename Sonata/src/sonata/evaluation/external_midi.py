@@ -26,7 +26,7 @@ from sonata.evaluation.rollout import (
 )
 from sonata.models.pipeline import Sonata3Pipeline
 from sonata.transformer.dataset import build_goal_context, build_history_context, planner_collate_fn
-from sonata.utils.io import write_json, write_table
+from sonata.utils.io import read_json, write_json, write_table
 from sonata.utils.robopianist import ensure_local_robopianist_on_path, format_robopianist_import_error
 from sonata.utils.wandb_eval import log_prefixed_metrics, log_rollout_table, log_rollout_video
 
@@ -53,7 +53,7 @@ def evaluate_external_midi_benchmark(
     output_root: Path,
     benchmark_manifest: str | Path | None = None,
     benchmark_root: str | Path | None = None,
-    benchmark_split: str = "test",
+    benchmark_split: str | None = None,
     variant: str | None = None,
     limit_episodes: int | None = None,
     device: str = "cpu",
@@ -83,13 +83,15 @@ def evaluate_external_midi_benchmark(
         benchmark_root=benchmark_root,
     )
     manifest_df = load_manifest(manifest_base)
-    if benchmark_split:
-        manifest_df = manifest_df[manifest_df["split"].astype(str) == benchmark_split].copy()
+    benchmark_name = resolve_external_benchmark_name(manifest_df=manifest_df, manifest_base=manifest_base)
+    normalized_split = normalize_external_benchmark_split(benchmark_split)
+    if normalized_split is not None:
+        manifest_df = manifest_df[manifest_df["split"].astype(str) == normalized_split].copy()
     manifest_df = manifest_df.sort_values(["song_id", "episode_id"]).reset_index(drop=True)
     if limit_episodes is not None:
         manifest_df = manifest_df.head(int(limit_episodes)).copy()
     if manifest_df.empty:
-        raise FileNotFoundError(f"No benchmark episodes found in {manifest_base} for split={benchmark_split!r}")
+        raise FileNotFoundError(f"No benchmark episodes found in {manifest_base} for split={normalized_split!r}")
 
     pipeline = Sonata3Pipeline(
         primitive_root=primitive_root,
@@ -317,7 +319,7 @@ def evaluate_external_midi_benchmark(
                 "split": str(row.split),
                 "environment_name": environment_name,
                 "note_path": str(note_path),
-                "benchmark_name": "paper_aligned_external_test",
+                "benchmark_name": benchmark_name,
                 "paper_aligned_note": (
                     "Unseen external MIDI rollout benchmark; protocol-aligned with RoboPianist online evaluation but not "
                     "numerically interchangeable with RP1M paper tables."
@@ -364,8 +366,8 @@ def evaluate_external_midi_benchmark(
     summary = _summarize_rollout_results(results)
     summary.update(
         {
-            "benchmark_name": "paper_aligned_external_test",
-            "benchmark_split": benchmark_split,
+            "benchmark_name": benchmark_name,
+            "benchmark_split": normalized_split,
             "manifest_base": str(Path(manifest_base).resolve()),
             "paper_aligned_note": (
                 "Unseen external MIDI rollout benchmark; protocol-aligned with RoboPianist online evaluation but not "
@@ -376,7 +378,7 @@ def evaluate_external_midi_benchmark(
     )
     payload = {
         "available": True,
-        "benchmark_name": "paper_aligned_external_test",
+        "benchmark_name": benchmark_name,
         "summary": summary,
         "episodes": results,
         "segments_path": _relative_output_path((output_root / "external_midi_segments.csv"), output_root),
@@ -397,6 +399,33 @@ def evaluate_external_midi_benchmark(
             logger=logger,
         )
     return payload
+
+
+def normalize_external_benchmark_split(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"all", "any", "none"}:
+        return None
+    return text
+
+
+def resolve_external_benchmark_name(*, manifest_df: pd.DataFrame, manifest_base: Path) -> str:
+    if "benchmark_name" in manifest_df.columns:
+        names = [
+            str(item).strip()
+            for item in manifest_df["benchmark_name"].dropna().astype(str).tolist()
+            if str(item).strip()
+        ]
+        if names:
+            return names[0]
+    summary_path = manifest_base.parent / "external_midi_summary.json"
+    if summary_path.exists():
+        payload = read_json(summary_path)
+        name = str(payload.get("benchmark_name", "")).strip()
+        if name:
+            return name
+    return manifest_base.parent.name or manifest_base.name
 
 
 def resolve_external_manifest_base(

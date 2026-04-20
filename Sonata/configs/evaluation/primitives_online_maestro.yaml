@@ -29,7 +29,7 @@ events:
 
 rollout:
   validate_action_dim: true
-  source_mode: dataset_song
+  source_mode: external_midi_manifest
   example_midi_paths: []
   example_environment_names: []
   example_midi_labels: []

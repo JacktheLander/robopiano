@@ -248,3 +248,100 @@ def test_resolve_robopianist_import_root_accepts_clone_root_or_package_dir(tmp_p
 
     assert resolve_robopianist_import_root(clone_root) == clone_root
     assert resolve_robopianist_import_root(package_root) == clone_root
+
+
+def test_resolve_instance_rollout_source_uses_external_manifest(tmp_path: Path) -> None:
+    midi_a = tmp_path / "maestro_a.mid"
+    midi_b = tmp_path / "maestro_b.mid"
+    midi_a.write_bytes(b"MThd")
+    midi_b.write_bytes(b"MThd")
+    manifest_df = pd.DataFrame(
+        [
+            {
+                "song_id": "maestro_a",
+                "episode_id": "maestro_a__ep00000",
+                "split": "benchmark",
+                "benchmark_name": "maestro",
+                "note_path": str(midi_a),
+            },
+            {
+                "song_id": "maestro_b",
+                "episode_id": "maestro_b__ep00000",
+                "split": "benchmark",
+                "benchmark_name": "maestro",
+                "note_path": str(midi_b),
+            },
+        ]
+    )
+    write_table(manifest_df, tmp_path / "external_midi_manifest")
+
+    source = resolve_instance_rollout_source(
+        instance=_make_test_instance(primitive_id="primitive_001"),
+        rollout_config={
+            "source_mode": "external_midi_manifest",
+            "external_midi_manifest": str((tmp_path / "external_midi_manifest.csv").resolve()),
+        },
+    )
+
+    assert source["source_mode"] == "external_midi_manifest"
+    assert source["source_label"] in {"maestro:maestro_a", "maestro:maestro_b"}
+    assert source["midi_file"] in {midi_a.resolve(), midi_b.resolve()}
+
+
+def test_resolve_instance_rollout_source_uses_external_dataset_root(tmp_path: Path) -> None:
+    dataset_root = tmp_path / "maestro"
+    nested = dataset_root / "2018"
+    nested.mkdir(parents=True)
+    midi_path = nested / "piece_01.midi"
+    midi_path.write_bytes(b"MThd")
+
+    source = resolve_instance_rollout_source(
+        instance=_make_test_instance(primitive_id="primitive_000"),
+        rollout_config={
+            "source_mode": "external_midi_dataset",
+            "external_midi_dataset_root": str(dataset_root.resolve()),
+            "external_midi_recursive": True,
+        },
+    )
+
+    assert source["source_mode"] == "external_midi_dataset"
+    assert source["source_label"] == "2018/piece_01.midi"
+    assert source["midi_file"] == midi_path.resolve()
+
+
+def _make_test_instance(*, primitive_id: str) -> PrimitiveInstance:
+    return PrimitiveInstance(
+        segment_id=f"{primitive_id}_segment",
+        primitive_id=primitive_id,
+        song_id="song_a",
+        demo_id="song_a__ep00000",
+        episode_id="song_a__ep00000",
+        split="train",
+        start_frame=0,
+        end_frame=4,
+        duration_steps=4,
+        control_timestep=0.05,
+        hand=None,
+        start_joint_state=None,
+        start_joint_velocity=None,
+        start_fingertip_state=None,
+        start_piano_state=None,
+        intended_keys=(),
+        realized_keys_gt=(),
+        onset_frames_gt=(),
+        release_frames_gt=(),
+        conditioning_features=None,
+        chunk_path="",
+        chunk_index=0,
+        raw_chunk_path=None,
+        raw_chunk_index=None,
+        gmr_target_name="actions",
+        primitive_prior_path=None,
+        actions_gt=None,
+        goals=None,
+        piano_states_gt=None,
+        hand_joints_gt=None,
+        hand_fingertips_gt=None,
+        joint_velocities_gt=None,
+        source_midi_path=None,
+    )
