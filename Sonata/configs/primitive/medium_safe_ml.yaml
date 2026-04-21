@@ -1,0 +1,112 @@
+# Safe Stage 1 primitive discovery for RP1M 300 MEDIUM profile (20 trajectories per song).
+# Intended runtime dataset (cluster): export RP1M_300_ROOT=/WAVE/users/unix/jlanders/rp1m_300/rp1m_repertoire.zarr
+# Data manifest comes from configs/data/medium.yaml — run:
+#   python scripts/train_primitives.py --profile medium --config configs/primitive/medium_safe_ml.yaml
+
+output_root: ../../outputs/primitives/medium_safe_ml
+data_output_root: ../../outputs/data/medium
+data_manifest_name: dataset_manifest
+experiment_name: Sonata-3-medium-safe-ml-primitives
+wandb:
+  enabled: true
+  project: robopianist
+  entity: tnguyen31-santa-clara-university
+  mode: online
+  tags: ["sonata", "primitives", "medium", "safe_ml"]
+seed: 7
+force: false
+
+# Discovery path (no global full-covariance GMM K-sweep)
+primitive_discovery_method: hdbscan_then_local_gmm
+segmentation_strategy: learned_boundary_safe
+
+# Aliases / explicit storage (slim-only; no raw segment bundles)
+online_segment_processing: true
+write_slim_cache: true
+save_raw_segment_chunks: false
+write_full_segment_cache: false
+enable_raw_segment_cache: false
+migrate_existing_segment_chunks: false
+delete_raw_chunks_after_migration: false
+online_storage_format: npz_shards
+slim_cache_dir: slim
+slim_feature_dir: features
+slim_gmr_target_dir: gmr_targets
+slim_index_dir: index
+segment_chunk_size: 512
+
+# Compact discovery features (full vector PCA’d to embedding_dim_cap inside discovery)
+use_safe_discovery_embedding: true
+embedding_dim_cap: 64
+trajectory_resample_steps: 12
+include_action_trajectory: true
+fallback_action_dim: 39
+slim_feature_dtype: float32
+
+# Boundary scoring weights (conservative)
+boundary_score_action: 1.0
+boundary_score_vel_change: 0.85
+boundary_score_accel_change: 0.65
+boundary_score_goal_onset: 1.15
+boundary_score_goal_release: 0.95
+boundary_score_piano_change: 0.75
+boundary_snap_tolerance_steps: 3
+
+# Hard safety limits (24h cmp / 256GB)
+min_segment_length: 6
+max_segment_length: 40
+max_candidate_boundaries_per_episode: 48
+max_segments_per_song: 160
+max_total_segments: 180000
+max_clusters_total: 72
+min_cluster_size: 96
+max_large_cluster_refine_k: 3
+max_fit_rows: 180000
+max_gmr_primitives_to_fit: 72
+max_segments_per_primitive_for_gmr: 192
+max_storage_bytes_soft: 25000000000
+max_storage_bytes_hard: 40000000000
+max_episode_processing_seconds_warn: 180
+max_episode_processing_seconds_hard: 1200
+max_walltime_seconds: 86400
+runtime_log_every_n_episodes: 50
+
+# HDBSCAN (CPU-friendly; min sizes smaller than final GMR min_cluster_size)
+hdbscan_min_cluster_size: 48
+hdbscan_min_samples: 12
+large_cluster_min_size: 256
+local_gmm_covariance_type: diag
+
+# Pruning / merge (after clustering, before GMR)
+max_cluster_dispersion: 2.5
+min_assignment_confidence: 0.12
+max_reconstruction_mse_for_keep: 2.0
+primitive_merge_cosine_threshold: 0.985
+
+# Legacy GMM sweep keys kept only so YAML parsers see them; not used when primitive_discovery_method != gmm_sweep
+pca_components: 64
+gmm_k_candidates: [8]
+gmm_covariance_type: diag
+gmm_reg_covar: 0.0001
+model_selection_metric: bic
+silhouette_max_examples: 2048
+family_clustering:
+  enabled: false
+
+gmr_target_actions: true
+gmr_resample_steps: 32
+gmr_components: 4
+gmr_reg_covar: 0.0001
+num_duration_buckets: 8
+num_dynamics_buckets: 6
+min_segments_per_primitive: 6
+segment_num_workers: 16
+feature_num_workers: 16
+
+control_latent:
+  enabled: false
+
+post_training_eval:
+  enabled: false
+  config_path: ../evaluation/primitives_online_safe.yaml
+  output_root: null

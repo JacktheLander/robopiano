@@ -1,0 +1,37 @@
+# Capped CPU primitive online evaluation (pairs with medium_safe_ml Stage 1).
+primitive_root: null
+output_root: null
+robopianist_root: null
+seed: 7
+resume: true
+force: false
+save_plots: true
+save_debug: false
+rollout_device: cpu
+
+sampling:
+  split: null
+  max_instances: 128
+  max_instances_total: 128
+  instances_per_primitive: 2
+  primitive_ids: []
+  min_chord_size: null
+  max_chord_size: null
+  min_duration_steps: null
+  max_duration_steps: null
+
+events:
+  use_goals: true
+  use_piano_states: true
+  goal_key_threshold: 0.5
+  goal_sustain_threshold: 0.5
+  piano_state_threshold: 0.5
+  piano_sustain_threshold: 0.5
+  onset_tolerance_frames: 1
+
+rollout:
+  validate_action_dim: true
+
+aggregation:
+  top_k_examples: 2
+  max_plot_primitives: 16

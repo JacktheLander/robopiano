@@ -249,7 +249,8 @@ def _load_feature_rows_from_store_chunk(
         raise FileNotFoundError(f"Missing slim feature chunk: {chunk_path}")
     bundle = np.load(chunk_path, allow_pickle=True)
     segment_ids = np.asarray(bundle["segment_ids"], dtype=object)
-    feature_matrix = np.asarray(bundle["feature_matrix"], dtype=np.float32)
+    feature_matrix = np.asarray(bundle["feature_matrix"])
+    feature_matrix = feature_matrix.astype(np.float32, copy=False)
     feature_names = [str(item) for item in np.asarray(bundle["feature_names"], dtype=object).tolist()]
 
     ordered_rows = rows.sort_values("chunk_index", kind="stable")
@@ -521,3 +522,88 @@ def _positive_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def build_safe_discovery_embedding_from_arrays(row: Any, arrays: dict[str, np.ndarray | None], config: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
+    """Pooled segment embedding for capped Stage-1 clustering (pre-PCA in discovery)."""
+    hand_joints = arrays.get("hand_joints")
+    if hand_joints is None:
+        raise ValueError("safe embedding requires hand_joints")
+    velocity = arrays.get("joint_velocities")
+    if velocity is None:
+        velocity = np.gradient(hand_joints, axis=0).astype(np.float32)
+    actions = arrays.get("actions")
+    goals = arrays.get("goals")
+    piano_states = arrays.get("piano_states")
+    traj_steps = int(config.get("trajectory_resample_steps", 12))
+
+    joint_mean = hand_joints.mean(axis=0).astype(np.float32)
+    joint_std = hand_joints.std(axis=0).astype(np.float32)
+    joint_delta = (hand_joints[-1] - hand_joints[0]).astype(np.float32)
+    vel_mean = velocity.mean(axis=0).astype(np.float32)
+    vel_std = velocity.std(axis=0).astype(np.float32)
+
+    if actions is not None:
+        action_mean = actions.mean(axis=0).astype(np.float32)
+        action_std = actions.std(axis=0).astype(np.float32)
+        action_delta = (actions[-1] - actions[0]).astype(np.float32)
+    else:
+        adim = int(config.get("fallback_action_dim", 39))
+        action_mean = np.zeros((adim,), dtype=np.float32)
+        action_std = np.zeros((adim,), dtype=np.float32)
+        action_delta = np.zeros((adim,), dtype=np.float32)
+
+    rj = resample_time_axis(hand_joints, traj_steps).reshape(-1).astype(np.float32)
+    adim = int(config.get("fallback_action_dim", 39))
+    if actions is not None:
+        ra = resample_time_axis(actions, traj_steps).reshape(-1).astype(np.float32)
+    else:
+        ra = np.zeros((traj_steps * adim,), dtype=np.float32)
+
+    speed = np.linalg.norm(velocity, axis=1).astype(np.float32)
+    motion_energy = float(speed.mean())
+    duration = float(_row_value(row, "duration_steps"))
+    chord_size = float(_row_value(row, "chord_size"))
+    key_center = float(_row_value(row, "key_center"))
+
+    roll = goals if goals is not None else piano_states
+    if roll is not None and roll.size:
+        active = (roll > 0.5).astype(np.float32)
+        score_activity_ratio = float(active.mean())
+        hist = np.zeros((12,), dtype=np.float32)
+        for t in range(active.shape[0]):
+            keys = np.flatnonzero(active[t])
+            if keys.size:
+                pc = keys % 12
+                hist += np.bincount(pc, minlength=12).astype(np.float32)
+        hist /= max(float(hist.sum()), 1.0)
+    else:
+        score_activity_ratio = 0.0
+        hist = np.zeros((12,), dtype=np.float32)
+
+    pieces = [
+        joint_mean,
+        joint_std,
+        joint_delta,
+        vel_mean,
+        vel_std,
+        action_mean,
+        action_std,
+        action_delta,
+        rj,
+        ra,
+        np.asarray(
+            [duration, motion_energy, chord_size, key_center, score_activity_ratio],
+            dtype=np.float32,
+        ),
+        hist,
+    ]
+    vector = np.concatenate([p.reshape(-1) for p in pieces]).astype(np.float32)
+    names = [f"safe_emb_{idx:04d}" for idx in range(vector.shape[0])]
+    return vector, names
+
+
+def use_safe_discovery_embedding(config: dict[str, Any]) -> bool:
+    if bool(config.get("use_safe_discovery_embedding", False)):
+        return True
+    return str(config.get("segmentation_strategy", "")) == "learned_boundary_safe"

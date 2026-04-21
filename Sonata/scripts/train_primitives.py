@@ -18,8 +18,18 @@ from sonata.utils.wandb import add_wandb_arguments, apply_wandb_cli_overrides
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the Sonata-3 primitive library.")
     parser.add_argument("--profile", default="debug")
+    parser.add_argument(
+        "--data-profile",
+        default=None,
+        help="Optional data config profile name (defaults to --profile). Use e.g. medium with primitive medium_safe_ml.yaml.",
+    )
     parser.add_argument("--config", default=None)
     parser.add_argument("--output-root", default=None)
+    parser.add_argument(
+        "--data-output-root",
+        default=None,
+        help="Override primitive data_output_root and data stage output_root (manifest location).",
+    )
     parser.add_argument("--post-eval-config", default=None)
     parser.add_argument("--post-eval-output-root", default=None)
     parser.add_argument("--run-post-eval", action=argparse.BooleanOptionalAction, default=None)
@@ -40,12 +50,17 @@ def main() -> None:
     if args.output_root is not None:
         config["output_root"] = args.output_root
     config["output_root"] = str(resolve_path(config["output_root"], config_dir))
+    if args.data_output_root is not None:
+        config["data_output_root"] = args.data_output_root
     config["data_output_root"] = str(resolve_path(config["data_output_root"], config_dir))
     if args.robopianist_root is not None:
         config["robopianist_root"] = str(resolve_path(args.robopianist_root, config_dir))
-    data_config = load_stage_config("data", profile=args.profile)
+    data_profile = args.data_profile or args.profile
+    data_config = load_stage_config("data", profile=data_profile)
     data_config_dir = resolve_path(data_config["config_path"]).parent
     data_config["dataset_root"] = str(resolve_path(data_config["dataset_root"], data_config_dir))
+    if args.data_output_root is not None:
+        data_config["output_root"] = args.data_output_root
     data_config["output_root"] = str(resolve_path(data_config["output_root"], data_config_dir))
     data_config["note_search_roots"] = [str(resolve_path(path, data_config_dir)) for path in data_config.get("note_search_roots", [])]
     config["data_config"] = deep_update(data_config, {"force": bool(args.force or config.get("force", False))})

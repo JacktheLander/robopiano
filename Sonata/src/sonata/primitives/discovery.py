@@ -16,6 +16,8 @@ from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 
 from sonata.primitives.control_latent import learn_control_latent
+from sonata.primitives.guards import estimate_dir_bytes, normalize_primitive_storage_aliases, storage_guard
+from sonata.primitives.safe_clustering import NOISE_PRIMITIVE_ID, fit_hdbscan_then_local_gmm, prune_clusters_pre_gmr
 from sonata.data.indexer import scan_dataset
 from sonata.data.loading import load_manifest
 from sonata.primitives.features import extract_segment_features, resolve_gmr_resample_steps
@@ -43,7 +45,7 @@ def _read_stage_status(manifest_path: Path) -> str:
     return str(payload.get("status", "unknown"))
 
 def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> dict[str, Path]:
-    config = dict(config)
+    config = normalize_primitive_storage_aliases(dict(config))
     config.setdefault("online_segment_processing", True if config.get("write_slim_cache", True) else False)
     config.setdefault("save_raw_segment_chunks", save_raw_segment_chunks_enabled(config))
     config.setdefault("online_storage_format", resolve_online_storage_format(config))
@@ -104,12 +106,31 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
             }
         )
 
-        assignments_df, sweep_df, bundle = fit_primitive_gmm(
-            segment_df=segment_df,
-            feature_matrix=feature_matrix,
-            feature_names=feature_names,
-            config=config,
-        )
+        discovery_method = str(config.get("primitive_discovery_method", "gmm_sweep"))
+        discovery_diag: dict[str, Any] = {}
+        if discovery_method == "hdbscan_then_local_gmm":
+            assignments_df, sweep_df, bundle, _ = fit_hdbscan_then_local_gmm(
+                segment_df=segment_df,
+                feature_matrix=feature_matrix,
+                feature_names=feature_names,
+                config=config,
+                primitive_root=primitive_root,
+                logger=logger,
+            )
+            pre_prune = int(assignments_df.loc[assignments_df["primitive_id"].astype(str) != NOISE_PRIMITIVE_ID, "primitive_id"].nunique())
+            assignments_df, prune_diag = prune_clusters_pre_gmr(
+                assignments_df, feature_matrix, config=config, logger=logger
+            )
+            discovery_diag["pre_prune_primitive_count"] = pre_prune
+            discovery_diag["prune_diag"] = prune_diag
+            discovery_diag["noise_rows"] = int((assignments_df["primitive_id"].astype(str) == NOISE_PRIMITIVE_ID).sum())
+        else:
+            assignments_df, sweep_df, bundle = fit_primitive_gmm(
+                segment_df=segment_df,
+                feature_matrix=feature_matrix,
+                feature_names=feature_names,
+                config=config,
+            )
         clustering_dir = primitive_root / "clustering"
         clustering_dir.mkdir(parents=True, exist_ok=True)
         assignments_base = clustering_dir / "segment_assignments"
@@ -118,7 +139,23 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
         write_table(sweep_df, sweep_base)
         joblib.dump(bundle, clustering_dir / "primitive_model_bundle.joblib")
 
-        library_df, gmr_bundle = fit_gmr_library(assignments_df=assignments_df, segments_dir=primitive_root / "segments", output_dir=primitive_root, config=config)
+        soft_b = config.get("max_storage_bytes_soft")
+        hard_b = config.get("max_storage_bytes_hard")
+        if hard_b is not None:
+            storage_guard(
+                bytes_written=estimate_dir_bytes(primitive_root),
+                soft_limit=int(soft_b or hard_b),
+                hard_limit=int(hard_b),
+                logger=logger,
+            )
+
+        library_df, gmr_bundle, gmr_diag = fit_gmr_library(
+            assignments_df=assignments_df,
+            segments_dir=primitive_root / "segments",
+            output_dir=primitive_root,
+            config=config,
+            logger=logger,
+        )
         write_table(library_df, primitive_root / "library" / "primitive_library")
         joblib.dump(gmr_bundle, primitive_root / "library" / "primitive_gmr_bundle.joblib")
         online_selection_summary = None
@@ -131,17 +168,26 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
                 logger=logger,
             )
             write_table(assignments_df, assignments_base)
-            library_df, gmr_bundle = fit_gmr_library(
+            library_df, gmr_bundle, gmr_diag = fit_gmr_library(
                 assignments_df=assignments_df,
                 segments_dir=primitive_root / "segments",
                 output_dir=primitive_root,
                 config=config,
+                logger=logger,
             )
             write_table(library_df, primitive_root / "library" / "primitive_library")
             joblib.dump(gmr_bundle, primitive_root / "library" / "primitive_gmr_bundle.joblib")
 
+        token_assignments = assignments_df.loc[assignments_df["primitive_id"].astype(str) != NOISE_PRIMITIVE_ID].copy()
+        if token_assignments.empty or library_df.empty:
+            raise RuntimeError(
+                "Primitive tokenization requires at least one non-noise assignment and one library row. "
+                "Loosen clustering thresholds or increase data coverage."
+            )
         token_df = add_token_columns(
-            assignments_df=assignments_df.merge(library_df[["primitive_id", "reconstruction_mse"]], on="primitive_id", how="left"),
+            assignments_df=token_assignments.merge(
+                library_df[["primitive_id", "reconstruction_mse"]], on="primitive_id", how="left"
+            ),
             num_duration_buckets=int(config["num_duration_buckets"]),
             num_dynamics_buckets=int(config["num_dynamics_buckets"]),
         )
@@ -149,12 +195,15 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
         write_table(token_df, token_base)
         write_json(build_vocabulary_payload(token_df), primitive_root / "tokens" / "primitive_vocabulary.json")
 
+        combined_diag = dict(discovery_diag)
+        combined_diag.update(gmr_diag)
         metrics = compute_stage1_metrics(
             assignments_df=assignments_df,
             sweep_df=sweep_df,
             library_df=library_df,
             storage_summary=store_summary,
             online_selection_summary=online_selection_summary,
+            discovery_diag=combined_diag,
         )
         metrics_dir = primitive_root / "metrics"
         metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -167,7 +216,8 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
         plot_dir = primitive_root / "plots"
         plot_dir.mkdir(parents=True, exist_ok=True)
         plot_primitive_frequency(assignments_df, plot_dir / "primitive_frequency.png")
-        plot_gmr_reconstruction(library_df, plot_dir / "primitive_gmr_reconstruction.png")
+        if not library_df.empty:
+            plot_gmr_reconstruction(library_df, plot_dir / "primitive_gmr_reconstruction.png")
         plot_usage_entropy(assignments_df, plot_dir / "primitive_usage_entropy.png")
 
         wandb_run.log_artifact_bundle(
@@ -505,24 +555,53 @@ def _cluster_event_proxy(
     }
 
 
-def fit_gmr_library(assignments_df: pd.DataFrame, segments_dir: Path, output_dir: Path, config: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any]]:
+def fit_gmr_library(
+    assignments_df: pd.DataFrame,
+    segments_dir: Path,
+    output_dir: Path,
+    config: dict[str, Any],
+    logger: logging.Logger | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]:
+    log = logger or logging.getLogger(__name__)
     library_dir = output_dir / "library"
     library_dir.mkdir(parents=True, exist_ok=True)
     slim_paths = resolve_slim_cache_paths(output_dir, config)
     slim_cache: dict[str, Any] = {}
     raw_cache: dict[str, Any] = {}
-    grouped = assignments_df.groupby("primitive_id", sort=True)
+    grouped = list(assignments_df.groupby("primitive_id", sort=True))
+    grouped = [(pid, g) for pid, g in grouped if str(pid) != NOISE_PRIMITIVE_ID]
+    max_gmr = int(config.get("max_gmr_primitives_to_fit", 10**9))
+    if len(grouped) > max_gmr:
+        grouped.sort(key=lambda item: int((item[1]["split"].astype(str) == "train").sum()), reverse=True)
+        grouped = grouped[:max_gmr]
+        log.warning("GMR fit capped to max_gmr_primitives_to_fit=%d (largest train counts).", max_gmr)
+
     library_rows: list[dict[str, Any]] = []
     gmr_payload: dict[str, Any] = {"models": {}}
     prior_cfg = dict(config.get("prior_selection", {}))
     max_prototypes = max(int(prior_cfg.get("max_prototypes", 1)), 1)
     min_segments_per_prototype = max(int(prior_cfg.get("min_segments_per_prototype", 6)), 2)
+    max_per_prim = int(config.get("max_segments_per_primitive_for_gmr", 10**9))
+    min_cluster = int(config.get("min_cluster_size", 96))
+    max_disp = float(config.get("max_cluster_dispersion", 1e9))
+    max_mse_keep = float(config.get("max_reconstruction_mse_for_keep", 1e9))
+    rng = np.random.default_rng(int(config["seed"]))
+    candidate = len(grouped)
+    skipped = 0
     for primitive_id, group in grouped:
         train_group = group[group["split"] == "train"]
         source_group = train_group if len(train_group) >= int(config["min_segments_per_primitive"]) else group
+        if len(source_group) < min_cluster:
+            skipped += 1
+            log.info("Skipping GMR for %s: only %d segments (< min_cluster_size=%d).", primitive_id, len(source_group), min_cluster)
+            continue
+        rows_list = list(source_group.itertuples(index=False))
+        if len(rows_list) > max_per_prim:
+            idx = rng.choice(len(rows_list), size=max_per_prim, replace=False)
+            rows_list = [rows_list[i] for i in sorted(idx.tolist())]
         trajectories: list[np.ndarray] = []
         segment_rows: list[dict[str, Any]] = []
-        for row in source_group.itertuples(index=False):
+        for row in rows_list:
             trajectory = load_gmr_trajectory(
                 row=row,
                 slim_paths=slim_paths,
@@ -535,8 +614,16 @@ def fit_gmr_library(assignments_df: pd.DataFrame, segments_dir: Path, output_dir
                 trajectories.append(trajectory.astype(np.float32))
                 segment_rows.append(row._asdict())
         if not trajectories:
+            skipped += 1
             continue
         stacked = np.stack(trajectories, axis=0)
+        mean_traj = stacked.mean(axis=0)
+        dispersion = float(np.mean(np.linalg.norm(stacked - mean_traj[None, :, :], axis=(1, 2))))
+        if dispersion > max_disp:
+            skipped += 1
+            log.info("Skipping GMR for %s: dispersion %.4f > max_cluster_dispersion.", primitive_id, dispersion)
+            continue
+        mean_conf = float(pd.to_numeric(group.get("assignment_confidence", pd.Series(1.0)), errors="coerce").mean())
         prototypes = fit_primitive_prototypes(
             trajectories=stacked,
             segment_rows=segment_rows,
@@ -548,6 +635,10 @@ def fit_gmr_library(assignments_df: pd.DataFrame, segments_dir: Path, output_dir
         )
         predicted_mean = np.asarray(prototypes["default_prior_mean"], dtype=np.float32)
         reconstruction_mse = float(prototypes["mean_reconstruction_mse"])
+        if reconstruction_mse > max_mse_keep:
+            skipped += 1
+            log.info("Skipping GMR for %s: reconstruction_mse %.4f too high.", primitive_id, reconstruction_mse)
+            continue
         prior_path = library_dir / f"{primitive_id}_prior.npz"
         save_npz(
             prior_path,
@@ -573,6 +664,8 @@ def fit_gmr_library(assignments_df: pd.DataFrame, segments_dir: Path, output_dir
                 "mean_motion_energy": float(group["motion_energy"].mean()),
                 "mean_chord_size": float(group["chord_size"].mean()),
                 "reconstruction_mse": reconstruction_mse,
+                "cluster_dispersion": dispersion,
+                "mean_assignment_confidence": mean_conf,
                 "num_prototypes": int(len(prototypes["prototype_means"])),
                 "default_prototype_index": int(prototypes["default_prototype_index"]),
                 "prototype_weight_entropy": float(_weight_entropy(np.asarray(prototypes["prototype_weights"], dtype=np.float32))),
@@ -580,7 +673,20 @@ def fit_gmr_library(assignments_df: pd.DataFrame, segments_dir: Path, output_dir
             }
         )
     library_df = pd.DataFrame(library_rows).sort_values("primitive_id").reset_index(drop=True)
-    return library_df, gmr_payload
+    gmr_diag = {
+        "num_candidate_clusters": int(candidate),
+        "num_kept_clusters": int(len(library_df)),
+        "num_skipped_clusters": int(skipped),
+        "final_primitive_count": int(library_df["primitive_id"].nunique()) if not library_df.empty else 0,
+    }
+    log.info(
+        "GMR summary: candidates=%d kept=%d skipped=%d final_primitive_count=%d",
+        candidate,
+        gmr_diag["num_kept_clusters"],
+        skipped,
+        gmr_diag["final_primitive_count"],
+    )
+    return library_df, gmr_payload, gmr_diag
 
 
 def fit_primitive_prototypes(
@@ -926,6 +1032,7 @@ def compute_stage1_metrics(
     library_df: pd.DataFrame,
     storage_summary: dict[str, Any] | None = None,
     online_selection_summary: dict[str, Any] | None = None,
+    discovery_diag: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     probabilities = assignments_df["primitive_id"].value_counts(normalize=True).to_numpy(dtype=np.float32)
     usage_entropy = float(-(probabilities * np.log(probabilities + 1e-8)).sum())
@@ -960,4 +1067,18 @@ def compute_stage1_metrics(
         )
     if online_selection_summary:
         metrics["online_selection"] = online_selection_summary
+    if discovery_diag is not None:
+        for key, value in discovery_diag.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                metrics[key] = value
+        if "final_primitive_count" not in metrics:
+            metrics["final_primitive_count"] = int(library_df["primitive_id"].nunique()) if not library_df.empty else 0
+        metrics.setdefault(
+            "pre_prune_primitive_count",
+            int(assignments_df.loc[assignments_df["primitive_id"].astype(str) != NOISE_PRIMITIVE_ID, "primitive_id"].nunique())
+            if not assignments_df.empty
+            else 0,
+        )
+        noise_rows = int((assignments_df["primitive_id"].astype(str) == NOISE_PRIMITIVE_ID).sum()) if not assignments_df.empty else 0
+        metrics.setdefault("noise_rows", noise_rows)
     return metrics

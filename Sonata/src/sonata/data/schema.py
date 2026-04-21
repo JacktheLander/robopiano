@@ -106,6 +106,11 @@ class SegmentRecord:
     start_state_norm: float
     end_state_norm: float
     score_context_json: str
+    boundary_score_peak: float = 0.0
+    boundary_source: str = ""
+    snapped_to_score_event: int = -1
+    raw_segment_length: int = 0
+    segment_filter_reason: str = ""
     raw_chunk_path: str = ""
     raw_chunk_index: int = -1
     gmr_target_name: str = ""

@@ -230,6 +230,7 @@ def write_slim_chunk(
     target_names: list[str],
     source_raw_chunk: str | None = None,
     migrated: bool = False,
+    feature_storage_dtype: str = "float32",
 ) -> list[dict[str, Any]]:
     ensure_slim_dirs(paths)
     if slim_chunk_complete(paths, chunk_name):
@@ -255,10 +256,11 @@ def write_slim_chunk(
     rows_df = ensure_segment_index_columns(pd.DataFrame(updated_rows))
     segment_ids = rows_df["segment_id"].astype(str).to_numpy(dtype=object)
 
+    fdt = np.float16 if str(feature_storage_dtype).lower() == "float16" else np.float32
     _save_npz_atomic(
         feature_chunk_path(paths, chunk_name),
         segment_ids=segment_ids,
-        feature_matrix=np.asarray(feature_matrix, dtype=np.float32),
+        feature_matrix=np.asarray(feature_matrix, dtype=fdt),
         feature_names=np.asarray(feature_names, dtype=object),
     )
     _save_npz_atomic(

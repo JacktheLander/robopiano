@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,7 @@ from sonata.primitives.slim_cache import (
     write_compact_store_manifest,
     write_slim_chunk,
 )
+from sonata.primitives.guards import estimate_dir_bytes, runtime_guard_projected_walltime, storage_guard
 from sonata.utils.io import read_table, save_npz, write_json, write_table
 
 
@@ -61,6 +63,11 @@ class CandidateSegment:
     event_duration_steps: int
     chord_size: int
     key_center: float
+    boundary_score_peak: float = 0.0
+    boundary_source: str = ""
+    snapped_to_score_event: int = -1
+    raw_segment_length: int = 0
+    segment_filter_reason: str = ""
 
 
 @dataclass
@@ -479,6 +486,390 @@ def dtw_distance(sequence_a: np.ndarray, sequence_b: np.ndarray) -> float:
     return float(dp[a.size, b.size] / max(a.size + b.size, 1))
 
 
+class LearnedBoundarySafeSegmenter(BaseSegmenter):
+    """CPU-safe segmentation from multi-modal boundary evidence (bounded per episode)."""
+
+    name = "learned_boundary_safe"
+
+    def __init__(self, config: dict[str, Any]):
+        self._cfg = config
+        self._min_len = int(config["min_segment_length"])
+        self._max_len = int(config["max_segment_length"])
+        self._max_peaks = int(config["max_candidate_boundaries_per_episode"])
+        self._snap_tol = int(config.get("boundary_snap_tolerance_steps", 3))
+        self._max_per_song = int(config.get("max_segments_per_song", 10**9))
+
+    def segment(self, episode, score_events: list[ScoreEvent]) -> list[CandidateSegment]:
+        del score_events
+        hj = episode.hand_joints
+        if hj is None:
+            return []
+        t_total = int(hj.shape[0])
+        if t_total <= self._min_len:
+            return [
+                self._candidate_span(
+                    0,
+                    t_total,
+                    peak=0.0,
+                    source="trivial_episode",
+                    snapped=-1,
+                    raw_len=t_total,
+                    filter_reason="",
+                )
+            ]
+
+        actions = episode.actions
+        goals = episode.goals
+        piano = episode.piano_states
+        vel = episode.joint_velocities
+        if vel is None:
+            vel = np.gradient(hj, axis=0).astype(np.float32)
+        accel = np.gradient(vel, axis=0).astype(np.float32)
+
+        w_act = float(self._cfg.get("boundary_score_action", 1.0))
+        w_vc = float(self._cfg.get("boundary_score_vel_change", 0.85))
+        w_ac = float(self._cfg.get("boundary_score_accel_change", 0.65))
+        w_go = float(self._cfg.get("boundary_score_goal_onset", 1.15))
+        w_gr = float(self._cfg.get("boundary_score_goal_release", 0.95))
+        w_pc = float(self._cfg.get("boundary_score_piano_change", 0.75))
+
+        interior = np.zeros(t_total, dtype=np.float32)
+        for t in range(1, t_total):
+            parts: list[float] = []
+            if actions is not None and actions.shape[0] >= t_total:
+                parts.append(w_act * float(np.linalg.norm(actions[t] - actions[t - 1])))
+            parts.append(w_vc * float(np.linalg.norm(vel[t] - vel[t - 1])))
+            parts.append(w_ac * float(np.linalg.norm(accel[t] - accel[t - 1])))
+            roll = goals if goals is not None else piano
+            if roll is not None and roll.shape[0] >= t_total:
+                active = (roll > 0.5).astype(np.float32)
+                d = active[t] - active[t - 1]
+                parts.append(w_go * float(np.maximum(d, 0.0).sum()))
+                parts.append(w_gr * float(np.maximum(-d, 0.0).sum()))
+            if piano is not None and piano.shape[0] >= t_total:
+                parts.append(w_pc * float(np.linalg.norm(piano[t] - piano[t - 1])))
+            interior[t] = float(sum(parts))
+
+        scale = float(np.percentile(interior[1:], 95) + 1e-6)
+        scores = np.clip(interior / scale, 0.0, 12.0)
+
+        onset_idx, release_idx = _score_event_roll_indices(goals, piano, t_total)
+        peaks = _local_maxima_indices(scores)
+        ranked = sorted(peaks, key=lambda idx: float(scores[idx]), reverse=True)
+        chosen: list[int] = []
+        for idx in ranked:
+            if len(chosen) >= self._max_peaks:
+                break
+            if any(abs(idx - c) < self._min_len for c in chosen):
+                continue
+            snapped = _snap_boundary(idx, onset_idx, release_idx, self._snap_tol)
+            chosen.append(int(snapped))
+        chosen = sorted(set(chosen))
+        boundaries = [0] + [b for b in chosen if 0 < b < t_total] + [t_total]
+        boundaries = sorted(set(boundaries))
+
+        boundaries = _enforce_max_segment_length(boundaries, t_total, self._max_len)
+        boundaries = _merge_short_segments(boundaries, t_total, self._min_len)
+        spans = [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
+
+        segments: list[CandidateSegment] = []
+        for start, end in spans:
+            if end - start < 1:
+                continue
+            peak = float(scores[start : end].max()) if end > start else 0.0
+            src = "boundary_peak" if peak > 1e-3 else "forced_span"
+            snap_ev = _nearest_event_distance(start, onset_idx, release_idx)
+            segments.append(
+                self._candidate_span(
+                    start,
+                    end,
+                    peak=peak,
+                    source=src,
+                    snapped=snap_ev,
+                    raw_len=int(end - start),
+                    filter_reason="",
+                )
+            )
+
+        segments = _split_candidate_segments_max_len(segments, self._max_len)
+        segments = _reduce_segment_count_by_merging(
+            segments, self._max_per_song, scores, max_segment_length=self._max_len
+        )
+        segments = _split_candidate_segments_max_len(segments, self._max_len)
+        if len(segments) > self._max_per_song:
+            segments = _uniform_stride_fallback_segments(
+                t_total=t_total,
+                max_segments=self._max_per_song,
+                max_len=self._max_len,
+                min_len=self._min_len,
+                scores=scores,
+                source_name=self.name,
+            )
+        return segments
+
+    def _candidate_span(
+        self,
+        onset: int,
+        end: int,
+        *,
+        peak: float,
+        source: str,
+        snapped: int,
+        raw_len: int,
+        filter_reason: str,
+    ) -> CandidateSegment:
+        dur = max(int(end - onset), 1)
+        return CandidateSegment(
+            onset_step=int(onset),
+            end_step=int(end),
+            segment_source=self.name,
+            score_event_id="",
+            key_signature="",
+            heuristic_family="boundary_safe",
+            coarse_family="motion",
+            control_phase="whole_event",
+            phase_index=0,
+            phase_count=1,
+            event_duration_steps=dur,
+            chord_size=0,
+            key_center=0.0,
+            boundary_score_peak=float(peak),
+            boundary_source=str(source),
+            snapped_to_score_event=int(snapped),
+            raw_segment_length=int(raw_len),
+            segment_filter_reason=str(filter_reason),
+        )
+
+
+def _score_event_roll_indices(
+    goals: np.ndarray | None, piano: np.ndarray | None, t_total: int
+) -> tuple[np.ndarray, np.ndarray]:
+    roll = goals if goals is not None else piano
+    if roll is None or roll.shape[0] < 2:
+        return np.asarray([], dtype=np.int64), np.asarray([], dtype=np.int64)
+    active = (roll[:t_total] > 0.5).astype(np.float32)
+    if active.shape[0] < 2:
+        return np.asarray([], dtype=np.int64), np.asarray([], dtype=np.int64)
+    d = active[1:] - active[:-1]
+    onsets = np.flatnonzero(d.sum(axis=1) > 0) + 1
+    releases = np.flatnonzero((-d).sum(axis=1) > 0) + 1
+    return onsets.astype(np.int64), releases.astype(np.int64)
+
+
+def _local_maxima_indices(scores: np.ndarray) -> list[int]:
+    t = int(scores.shape[0])
+    out: list[int] = []
+    for i in range(1, max(t - 1, 1)):
+        if scores[i] >= scores[i - 1] and scores[i] >= scores[i + 1]:
+            out.append(i)
+    return out
+
+
+def _snap_boundary(b: int, onsets: np.ndarray, releases: np.ndarray, tol: int) -> int:
+    best = b
+    best_d = tol + 1
+    for arr in (onsets, releases):
+        for e in arr.tolist():
+            d = abs(int(e) - b)
+            if d <= tol and d < best_d:
+                best_d = d
+                best = int(e)
+    return best
+
+
+def _nearest_event_distance(b: int, onsets: np.ndarray, releases: np.ndarray) -> int:
+    best = -1
+    best_d = 10**9
+    for arr in (onsets, releases):
+        for e in arr.tolist():
+            d = abs(int(e) - b)
+            if d < best_d:
+                best_d = d
+                best = int(e)
+    return best if best_d <= 12 else -1
+
+
+def _enforce_max_segment_length(boundaries: list[int], t_total: int, max_len: int) -> list[int]:
+    b = sorted(set(boundaries))
+    if not b or b[0] != 0:
+        b = [0] + [x for x in b if x > 0]
+    if b[-1] != t_total:
+        b = b + [t_total]
+    out: list[int] = [b[0]]
+    for i in range(len(b) - 1):
+        start, end = int(b[i]), int(b[i + 1])
+        cur = start
+        while end - cur > max_len:
+            cur = cur + max_len
+            out.append(cur)
+        out.append(end)
+    return sorted(set(out))
+
+
+def _merge_short_segments(boundaries: list[int], t_total: int, min_len: int) -> list[int]:
+    b = sorted(set(boundaries))
+    if not b:
+        return [0, t_total]
+    if b[0] != 0:
+        b.insert(0, 0)
+    if b[-1] != t_total:
+        b.append(t_total)
+    changed = True
+    while changed:
+        changed = False
+        nb = [b[0]]
+        for k in range(1, len(b) - 1):
+            if b[k] - nb[-1] < min_len:
+                changed = True
+                continue
+            nb.append(b[k])
+        nb.append(b[-1])
+        if nb != b:
+            changed = True
+        b = nb
+    return b
+
+
+def _uniform_stride_fallback_segments(
+    *,
+    t_total: int,
+    max_segments: int,
+    max_len: int,
+    min_len: int,
+    scores: np.ndarray,
+    source_name: str,
+) -> list[CandidateSegment]:
+    """Last resort: partition [0, t_total) into at most max_segments spans, each in [min_len, max_len]."""
+    n = min(int(max_segments), max(1, t_total // max(min_len, 1)))
+    boundaries = [0]
+    approx = max(min_len, min(max_len, int(np.ceil(t_total / float(n)))))
+    cur = 0
+    while cur < t_total and len(boundaries) < n + 1:
+        nxt = min(cur + approx, t_total)
+        if nxt - cur < min_len and nxt < t_total:
+            nxt = min(cur + min_len, t_total)
+        if nxt <= cur:
+            nxt = min(cur + min_len, t_total)
+        boundaries.append(nxt)
+        cur = nxt
+    if boundaries[-1] != t_total:
+        boundaries[-1] = t_total
+    boundaries = _enforce_max_segment_length(boundaries, t_total, max_len)
+    boundaries = _merge_short_segments(boundaries, t_total, min_len)
+    out: list[CandidateSegment] = []
+    for i in range(len(boundaries) - 1):
+        s, e = int(boundaries[i]), int(boundaries[i + 1])
+        if e <= s:
+            continue
+        peak = float(scores[s:e].max()) if e > s else 0.0
+        out.append(
+            CandidateSegment(
+                onset_step=s,
+                end_step=e,
+                segment_source=source_name,
+                score_event_id="",
+                key_signature="",
+                heuristic_family="boundary_safe",
+                coarse_family="uniform_fallback",
+                control_phase="whole_event",
+                phase_index=0,
+                phase_count=1,
+                event_duration_steps=max(e - s, 1),
+                chord_size=0,
+                key_center=0.0,
+                boundary_score_peak=peak,
+                boundary_source="uniform_stride_fallback",
+                snapped_to_score_event=-1,
+                raw_segment_length=int(e - s),
+                segment_filter_reason="max_segments_per_song_fallback",
+            )
+        )
+    return out[:max_segments]
+
+
+def _split_candidate_segments_max_len(segments: list[CandidateSegment], max_len: int) -> list[CandidateSegment]:
+    out: list[CandidateSegment] = []
+    for seg in segments:
+        span = int(seg.end_step - seg.onset_step)
+        if span <= max_len:
+            out.append(seg)
+            continue
+        s = int(seg.onset_step)
+        end = int(seg.end_step)
+        while s < end:
+            e = min(s + max_len, end)
+            out.append(
+                CandidateSegment(
+                    onset_step=s,
+                    end_step=e,
+                    segment_source=seg.segment_source,
+                    score_event_id="",
+                    key_signature="",
+                    heuristic_family=seg.heuristic_family,
+                    coarse_family="motion_split",
+                    control_phase="whole_event",
+                    phase_index=0,
+                    phase_count=1,
+                    event_duration_steps=max(e - s, 1),
+                    chord_size=0,
+                    key_center=0.0,
+                    boundary_score_peak=float(seg.boundary_score_peak),
+                    boundary_source="max_length_split",
+                    snapped_to_score_event=-1,
+                    raw_segment_length=int(e - s),
+                    segment_filter_reason="split_exceeded_max_segment_length",
+                )
+            )
+            s = e
+    return out
+
+
+def _reduce_segment_count_by_merging(
+    segments: list[CandidateSegment], max_count: int, scores: np.ndarray, *, max_segment_length: int
+) -> list[CandidateSegment]:
+    if len(segments) <= max_count:
+        return segments
+    segs = list(segments)
+    while len(segs) > max_count:
+        best_i = 0
+        best_cost = float("inf")
+        for i in range(len(segs) - 1):
+            a, b = segs[i], segs[i + 1]
+            merged_len = int(b.end_step - a.onset_step)
+            if merged_len > max_segment_length:
+                continue
+            mid = a.end_step
+            cost = float(scores[mid]) if 0 <= mid < len(scores) else 0.0
+            if cost < best_cost:
+                best_cost = cost
+                best_i = i
+        if best_cost is float("inf"):
+            break
+        left, right = segs[best_i], segs[best_i + 1]
+        merged = CandidateSegment(
+            onset_step=int(left.onset_step),
+            end_step=int(right.end_step),
+            segment_source=left.segment_source,
+            score_event_id="",
+            key_signature="",
+            heuristic_family="boundary_safe",
+            coarse_family="motion_merge",
+            control_phase="whole_event",
+            phase_index=0,
+            phase_count=1,
+            event_duration_steps=int(right.end_step - left.onset_step),
+            chord_size=0,
+            key_center=0.0,
+            boundary_score_peak=float(max(left.boundary_score_peak, right.boundary_score_peak)),
+            boundary_source="merged_for_song_cap",
+            snapped_to_score_event=-1,
+            raw_segment_length=int(right.end_step - left.onset_step),
+            segment_filter_reason="downsampled_max_segments_per_song",
+        )
+        segs = segs[:best_i] + [merged] + segs[best_i + 2 :]
+    return segs
+
+
 def classify_interval_family(event: ScoreEvent) -> str:
     if event.chord_size >= 3:
         return "chord"
@@ -541,6 +932,8 @@ def build_segmenter(config: dict[str, Any]) -> BaseSegmenter:
             staccato_duration_steps=int(config.get("staccato_duration_steps", 6)),
             min_phase_duration_steps=int(config.get("min_phase_duration_steps", 2)),
         )
+    if strategy == "learned_boundary_safe":
+        return LearnedBoundarySafeSegmenter(config)
     raise ValueError(f"Unknown segmentation strategy: {strategy}")
 
 def _atomic_save_npz(path: Path, **payload: Any) -> None:
@@ -802,6 +1195,11 @@ def run_segmentation_legacy(manifest_df: pd.DataFrame, output_dir: Path, config:
                 start_state_norm=float(np.linalg.norm(hand_joints[0])),
                 end_state_norm=float(np.linalg.norm(hand_joints[-1])),
                 score_context_json=dumps_score_context(context),
+                boundary_score_peak=float(getattr(candidate, "boundary_score_peak", 0.0)),
+                boundary_source=str(getattr(candidate, "boundary_source", "")),
+                snapped_to_score_event=int(getattr(candidate, "snapped_to_score_event", -1)),
+                raw_segment_length=int(getattr(candidate, "raw_segment_length", 0)),
+                segment_filter_reason=str(getattr(candidate, "segment_filter_reason", "")),
             )
             writer.add(record.as_row() | {"split": row.split}, arrays)
 
@@ -918,6 +1316,15 @@ def run_segmentation_slim(
         )
 
     new_score_rows: list[dict[str, Any]] = []
+    song_totals: dict[str, int] = defaultdict(int)
+    if not existing_segment_df.empty and "song_id" in existing_segment_df.columns:
+        for sid, cnt in existing_segment_df.groupby("song_id").size().items():
+            song_totals[str(sid)] = int(cnt)
+    max_total_segments = int(config.get("max_total_segments", 10**12))
+    global_remaining = [max(0, max_total_segments - len(existing_segment_df))]
+    max_per_song = int(config.get("max_segments_per_song", 10**12))
+    seg_wall0 = time.perf_counter()
+    episodes_done_counter = 0
     if raw_writer is None:
         segment_num_workers = _positive_int(config.get("segment_num_workers")) or 0
         prepared_batches = _iter_prepared_episode_batches(
@@ -926,10 +1333,29 @@ def run_segmentation_slim(
             max_workers=segment_num_workers,
         )
         for batch in tqdm(prepared_batches, total=len(remaining_df), desc="Segment episodes"):
+            episodes_done_counter += 1
+            ep_wall0 = time.perf_counter()
             new_score_rows.extend(batch.score_rows)
             if batch.prepared_segments:
+                capped = apply_segment_volume_caps(
+                    list(batch.prepared_segments),
+                    song_id=batch.song_id,
+                    song_totals=song_totals,
+                    max_per_song=max_per_song,
+                    global_remaining=global_remaining,
+                    logger=logger,
+                )
+                ep_elapsed = time.perf_counter() - ep_wall0
+                hard_cap = config.get("max_episode_processing_seconds_hard")
+                if hard_cap is not None and ep_elapsed > float(hard_cap):
+                    raise RuntimeError(
+                        f"max_episode_processing_seconds_hard exceeded for episode {batch.episode_id}: {ep_elapsed:.1f}s > {hard_cap}s"
+                    )
+                warn_cap = config.get("max_episode_processing_seconds_warn")
+                if logger is not None and warn_cap is not None and ep_elapsed > float(warn_cap):
+                    logger.warning("Episode %s segmentation slow: %.1fs", batch.episode_id, ep_elapsed)
                 slim_writer.begin_episode(song_id=batch.song_id, episode_id=batch.episode_id)
-                for segment in batch.prepared_segments:
+                for segment in capped:
                     slim_writer.append_segment(
                         row=segment.row,
                         feature_vector=segment.feature_vector,
@@ -949,6 +1375,16 @@ def run_segmentation_slim(
                     ),
                 )
             processed_episode_ids.add(batch.episode_id)
+            log_every = int(config.get("runtime_log_every_n_episodes", 50))
+            if log_every > 0 and episodes_done_counter % log_every == 0:
+                elapsed = time.perf_counter() - seg_wall0
+                runtime_guard_projected_walltime(
+                    elapsed_seconds=elapsed,
+                    episodes_done=episodes_done_counter,
+                    episodes_total=max(len(remaining_df), 1),
+                    max_walltime_seconds=float(config.get("max_walltime_seconds", 86400)),
+                    logger=logger,
+                )
     else:
         for row in tqdm(remaining_df.itertuples(index=False), total=len(remaining_df), desc="Segment episodes"):
             episode_id = str(row.episode_id)
@@ -1202,7 +1638,12 @@ def iter_prepared_segments(
     segmenter: BaseSegmenter,
     config: dict[str, Any],
 ) -> Iterator[PreparedSegment]:
-    from sonata.primitives.features import build_feature_vector_from_arrays, build_gmr_target_from_arrays
+    from sonata.primitives.features import (
+        build_feature_vector_from_arrays,
+        build_gmr_target_from_arrays,
+        build_safe_discovery_embedding_from_arrays,
+        use_safe_discovery_embedding,
+    )
 
     if episode.hand_joints is None:
         return
@@ -1242,9 +1683,17 @@ def iter_prepared_segments(
             start_state_norm=float(np.linalg.norm(hand_joints[0])),
             end_state_norm=float(np.linalg.norm(hand_joints[-1])),
             score_context_json=dumps_score_context(context),
+            boundary_score_peak=float(candidate.boundary_score_peak),
+            boundary_source=str(candidate.boundary_source),
+            snapped_to_score_event=int(candidate.snapped_to_score_event),
+            raw_segment_length=int(candidate.raw_segment_length),
+            segment_filter_reason=str(candidate.segment_filter_reason),
         )
         row_payload = record.as_row() | {"split": manifest_row.split}
-        feature_vector, names = build_feature_vector_from_arrays(row=row_payload, arrays=arrays, config=config)
+        if use_safe_discovery_embedding(config):
+            feature_vector, names = build_safe_discovery_embedding_from_arrays(row=row_payload, arrays=arrays, config=config)
+        else:
+            feature_vector, names = build_feature_vector_from_arrays(row=row_payload, arrays=arrays, config=config)
         gmr_target, target_name = build_gmr_target_from_arrays(arrays=arrays, config=config)
         row_payload["gmr_target_name"] = target_name
         if not feature_names:
@@ -1260,6 +1709,36 @@ def iter_prepared_segments(
             arrays=arrays,
             raw_bytes_estimate=estimate_segment_storage_bytes(arrays),
         )
+
+
+def apply_segment_volume_caps(
+    segments: list[PreparedSegment],
+    *,
+    song_id: str,
+    song_totals: dict[str, int],
+    max_per_song: int,
+    global_remaining: list[int],
+    logger: logging.Logger | None,
+) -> list[PreparedSegment]:
+    if not segments:
+        return segments
+    out: list[PreparedSegment] = []
+    sid = str(song_id)
+    for seg in segments:
+        if global_remaining[0] <= 0:
+            if logger is not None:
+                logger.warning("max_total_segments reached; truncating episode %s", seg.row.get("episode_id"))
+            break
+        if int(song_totals.get(sid, 0)) >= int(max_per_song):
+            if logger is not None:
+                logger.warning("max_segments_per_song reached for song %s", sid)
+            break
+        song_totals[sid] = int(song_totals.get(sid, 0)) + 1
+        global_remaining[0] -= 1
+        out.append(seg)
+    if logger is not None and len(out) < len(segments):
+        logger.warning("Segment budget dropped %d/%d segments for song %s.", len(segments) - len(out), len(segments), sid)
+    return out
 
 
 def estimate_segment_storage_bytes(arrays: dict[str, np.ndarray | None]) -> int:
@@ -1367,6 +1846,7 @@ def migrate_existing_segment_chunks(
             target_names=target_names,
             source_raw_chunk=str(raw_chunk_name),
             migrated=True,
+            feature_storage_dtype=str(config.get("slim_feature_dtype", "float32")),
         )
         migrated_chunks += 1
         if bool(config.get("delete_raw_chunks_after_migration", False)):
@@ -1471,6 +1951,7 @@ class OnlineSegmentWriter:
             feature_names=self.feature_names,
             gmr_targets=np.stack(self.buffer_targets, axis=0).astype(np.float32),
             target_names=self.buffer_target_names,
+            feature_storage_dtype=str(self.config.get("slim_feature_dtype", "float32")),
         )
         chunk_bytes = int(sum(path.stat().st_size for path in (
             self.paths.feature_dir / chunk_name,
@@ -1481,6 +1962,16 @@ class OnlineSegmentWriter:
         self.stats["segments_written"] += len(self.buffer_rows)
         self.stats["feature_rows_written"] += len(self.buffer_rows)
         self.stats["bytes_written"] += chunk_bytes
+        soft_b = self.config.get("max_storage_bytes_soft")
+        hard_b = self.config.get("max_storage_bytes_hard")
+        if soft_b is not None or hard_b is not None:
+            total_disk = estimate_dir_bytes(self.output_dir)
+            storage_guard(
+                bytes_written=total_disk,
+                soft_limit=int(soft_b or hard_b or total_disk),
+                hard_limit=int(hard_b or soft_b or total_disk),
+                logger=self.logger,
+            )
         if self.logger is not None:
             per_1k = float(self.stats["bytes_written"] * 1000.0 / max(int(self.stats["segments_written"]), 1))
             self.logger.info(

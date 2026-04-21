@@ -10,3 +10,4 @@ zarr>=2.16,<3
 pyarrow>=15.0
 note-seq>=0.0.5
 wandb>=0.17
+hdbscan>=0.8.33

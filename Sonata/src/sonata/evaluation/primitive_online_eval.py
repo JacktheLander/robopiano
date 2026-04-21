@@ -477,6 +477,8 @@ def sample_primitive_assignment_rows(
             sampled_groups.append(group.iloc[np.sort(indices[:take])])
         frame = pd.concat(sampled_groups, ignore_index=True) if sampled_groups else frame.iloc[0:0].copy()
     max_instances = sampling_config.get("max_instances")
+    if max_instances is None:
+        max_instances = sampling_config.get("max_instances_total")
     if max_instances is not None and len(frame) > int(max_instances):
         indices = np.arange(len(frame), dtype=np.int64)
         rng.shuffle(indices)
