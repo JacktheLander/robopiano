@@ -49,8 +49,51 @@ The evaluator writes under `outputs/evaluation/primitives_online/<profile>/` by 
 - `plots/`
 - `debug/` when `--save-debug` is enabled
 
+## Rousseau Example Mode
+
+If your local RoboPianist checkout only includes the bundled Rousseau example MIDIs, you can still
+run qualitative primitive rollouts by pointing the evaluator at those files instead of the original
+Stage 1 song environment names.
+
+This mode replays each sampled primitive inside RoboPianist using one of:
+
+- `music/data/rousseau/twinkle-twinkle-trimmed.mid`
+- `music/data/rousseau/nocturne-trimmed.mid`
+
+Use the shipped config to sample one segment per primitive and save per-rollout debug arrays:
+
+```bash
+python scripts/evaluate_primitives_online.py \
+  --config configs/evaluation/primitives_online_rousseau.yaml \
+  --profile medium \
+  --primitive-root outputs/primitives/medium \
+  --output-root outputs/evaluation/primitives_online/medium_rousseau \
+  --robopianist-root ../robopianist
+```
+
+The output tables include `rollout_source_mode`, `rollout_source_label`,
+`rollout_environment_name`, and `rollout_midi_path` so each primitive example can be traced back
+to the Rousseau clip that was used.
+
+## Curated MAESTRO Mode
+
+For post-training primitive evaluation against a MAESTRO MIDI pool, use
+`configs/evaluation/primitives_online_maestro.yaml`. The evaluator now accepts
+`rollout.example_midi_globs`, so a cluster job can point at a MAESTRO root with:
+
+```bash
+export MAESTRO_MIDI_ROOT=/project/$USER/datasets/maestro-v3.0.0
+python scripts/evaluate_primitives_online.py \
+  --config configs/evaluation/primitives_online_maestro.yaml \
+  --profile medium_eventful \
+  --primitive-root /project/$USER/sonata/outputs/primitives/medium_eventful \
+  --output-root /project/$USER/sonata/outputs/evaluation/primitives_online/medium_eventful_maestro \
+  --robopianist-root ../robopianist
+```
+
 ## Current Limitations
 
 - The current implementation restores hand joint positions and piano key states directly when the RoboPianist task exposes those internals. It does not reconstruct every hidden MuJoCo state perfectly.
 - When Stage 1 priors were fit on non-action targets such as `hand_joints`, those primitives are marked as unsupported for online replay instead of silently substituting ground-truth actions.
 - If the upstream RoboPianist task API changes its hand joint ordering or internal state fields, the direct restore path may need a small adapter update.
+

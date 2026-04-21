@@ -298,9 +298,14 @@ def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | No
     if velocity is None:
         velocity = np.gradient(hand_joints, axis=0).astype(np.float32)
     acceleration = np.gradient(velocity, axis=0).astype(np.float32)
+    speed = np.linalg.norm(velocity, axis=1).astype(np.float32)
     score_context = json.loads(str(_row_value(row, "score_context_json")))
     contact_roll = goals if goals is not None else piano_states
-    contact_roll = np.asarray(contact_roll[:, :-1] > 0.5, dtype=np.float32) if contact_roll is not None else np.zeros((hand_joints.shape[0], 88), dtype=np.float32)
+    contact_roll = (
+        np.asarray(contact_roll[:, :-1] > 0.5, dtype=np.float32)
+        if contact_roll is not None
+        else np.zeros((hand_joints.shape[0], 88), dtype=np.float32)
+    )
 
     pieces: list[np.ndarray] = []
     names: list[str] = []
@@ -343,11 +348,37 @@ def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | No
         names.extend([f"traj_action_{idx:04d}" for idx in range(resampled_actions.size)])
 
     histogram = np.asarray(score_context.get("goal_histogram", [0.0] * 12), dtype=np.float32)
+    local_window = max(1, min(hand_joints.shape[0], max(2, int(np.ceil(hand_joints.shape[0] / 4.0)))))
+    overall_motion = float(max(speed.mean(), 1e-6))
+    early_motion = float(speed[:local_window].mean())
+    late_motion = float(speed[-local_window:].mean())
+    motion_shape = np.asarray(
+        [
+            early_motion / overall_motion,
+            late_motion / overall_motion,
+        ],
+        dtype=np.float32,
+    )
+    if contact_roll.shape[0] > 1:
+        contact_delta = np.diff(contact_roll, axis=0)
+        contact_onsets = np.clip(contact_delta, 0.0, None)
+        contact_releases = np.clip(-contact_delta, 0.0, None)
+        onset_front_window = max(1, min(local_window, contact_onsets.shape[0]))
+        transition_shape = np.asarray(
+            [
+                float(contact_onsets[:onset_front_window].sum() / max(float(contact_onsets.sum()), 1.0)),
+                float(contact_releases.sum() / max(float(contact_roll.shape[0] - 1), 1.0)),
+            ],
+            dtype=np.float32,
+        )
+    else:
+        transition_shape = np.zeros((2,), dtype=np.float32)
     scalar_context = np.asarray(
         [
             float(score_context.get("active_ratio", 0.0)),
             float(score_context.get("future_density", 0.0)),
             float(_row_value(row, "duration_steps")),
+            float(_row_value_or(row, "event_duration_steps", _row_value(row, "duration_steps"))),
             float(_row_value(row, "motion_energy")),
             float(_row_value(row, "chord_size")),
             float(_row_value(row, "key_center")),
@@ -364,13 +395,50 @@ def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | No
         ],
         dtype=np.float32,
     )
-    pieces.extend([histogram, scalar_context, contact_summary])
+    control_phase = str(_row_value_or(row, "control_phase", "whole_event") or "whole_event")
+    coarse_family = str(_row_value_or(row, "coarse_family", _row_value_or(row, "heuristic_family", "other")) or "other")
+    control_phase_names = ["whole_event", "approach", "press_onset", "hold", "release", "local_transition"]
+    coarse_family_names = ["move", "single_press", "chord_press", "hold", "release", "short_sequence", "transition"]
+    control_phase_vector = np.asarray(
+        [1.0 if control_phase == name else 0.0 for name in control_phase_names],
+        dtype=np.float32,
+    )
+    coarse_family_vector = np.asarray(
+        [1.0 if coarse_family == name else 0.0 for name in coarse_family_names],
+        dtype=np.float32,
+    )
+    active_keys_per_frame = contact_roll.sum(axis=1).astype(np.float32) if contact_roll.size else np.zeros((0,), dtype=np.float32)
+    contact_delta_abs = np.abs(np.diff(contact_roll, axis=0)).astype(np.float32) if contact_roll.shape[0] > 1 else np.zeros((0, contact_roll.shape[1]), dtype=np.float32)
+    action_norm = np.linalg.norm(actions, axis=1).astype(np.float32) if actions is not None and actions.size else np.zeros((0,), dtype=np.float32)
+    dynamics_summary = np.asarray(
+        [
+            float(active_keys_per_frame.max()) if active_keys_per_frame.size else 0.0,
+            float(active_keys_per_frame.mean()) if active_keys_per_frame.size else 0.0,
+            float(contact_delta_abs.sum(axis=1).mean()) if contact_delta_abs.size else 0.0,
+            float(action_norm.mean()) if action_norm.size else 0.0,
+            float(action_norm.max()) if action_norm.size else 0.0,
+        ],
+        dtype=np.float32,
+    )
+    pieces.extend(
+        [
+            histogram,
+            scalar_context,
+            contact_summary,
+            motion_shape,
+            transition_shape,
+            control_phase_vector,
+            coarse_family_vector,
+            dynamics_summary,
+        ]
+    )
     names.extend([f"score_hist_{idx:02d}" for idx in range(histogram.size)])
     names.extend(
         [
             "score_active_ratio",
             "score_future_density",
             "duration_steps",
+            "event_duration_steps",
             "motion_energy",
             "chord_size",
             "key_center",
@@ -379,6 +447,25 @@ def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | No
         ]
     )
     names.extend(["contact_mean", "contact_density", "contact_nonzero_ratio"])
+    names.extend(
+        [
+            "motion_frontload_ratio",
+            "motion_tail_ratio",
+            "contact_onset_frontload_ratio",
+            "contact_release_density",
+        ]
+    )
+    names.extend([f"control_phase_{name}" for name in control_phase_names])
+    names.extend([f"coarse_family_{name}" for name in coarse_family_names])
+    names.extend(
+        [
+            "active_keys_peak",
+            "active_keys_mean",
+            "contact_toggle_density",
+            "action_norm_mean",
+            "action_norm_peak",
+        ]
+    )
     return np.concatenate(pieces).astype(np.float32), names
 
 
@@ -401,6 +488,12 @@ def _row_value(row: Any, name: str) -> Any:
     if isinstance(row, dict):
         return row[name]
     return getattr(row, name)
+
+
+def _row_value_or(row: Any, name: str, default: Any) -> Any:
+    if isinstance(row, dict):
+        return row.get(name, default)
+    return getattr(row, name, default)
 
 
 def resample_time_axis(array: np.ndarray, steps: int) -> np.ndarray:

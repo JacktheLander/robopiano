@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -13,10 +14,12 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from sonata.primitives.features import (
+    build_feature_vector_from_arrays,
     build_gmr_target_from_arrays,
     extract_segment_features,
     load_feature_matrix_from_store,
 )
+from sonata.primitives.segmenters import EventPhaseSegmenter, NoteAlignedSegmenter
 from sonata.primitives.slim_cache import (
     collect_slim_chunk_names,
     index_chunk_path,
@@ -25,6 +28,7 @@ from sonata.primitives.slim_cache import (
     resolve_slim_cache_paths,
     write_slim_chunk,
 )
+from sonata.data.schema import ScoreEvent
 
 
 def _segment_row(segment_id: str, song_id: str, episode_id: str) -> dict[str, object]:
@@ -164,3 +168,147 @@ def test_extract_segment_features_reuses_slim_feature_store(tmp_path: Path) -> N
     )
     assert [str(item) for item in bundle["feature_names"].tolist()] == feature_names
     assert manifest["source"] == "slim_store"
+
+
+def test_note_aligned_segmenter_caps_long_note_with_local_horizon() -> None:
+    segmenter = NoteAlignedSegmenter(pre_steps=4, post_steps=4, note_local_horizon_steps=8)
+    episode = SimpleNamespace(hand_joints=np.zeros((32, 4), dtype=np.float32))
+    score_events = [
+        ScoreEvent(
+            event_id="event_0",
+            song_id="song_a",
+            episode_id="ep_a",
+            onset_step=10,
+            end_step=24,
+            start_time_sec=0.5,
+            end_time_sec=1.2,
+            key_numbers=(40,),
+            chord_size=1,
+            key_center=0.5,
+            inter_onset_steps=0,
+            source="goals",
+        )
+    ]
+
+    segments = segmenter.segment(episode, score_events)
+
+    assert len(segments) == 1
+    assert segments[0].onset_step == 6
+    assert segments[0].end_step == 18
+
+
+def test_build_feature_vector_from_arrays_includes_local_purity_signals() -> None:
+    hand_joints = np.asarray(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    goals = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    feature_vector, names = build_feature_vector_from_arrays(
+        row={
+            "segment_id": "seg_attack",
+            "duration_steps": 4,
+            "motion_energy": 1.0,
+            "chord_size": 1,
+            "key_center": 0.0,
+            "start_state_norm": 0.0,
+            "end_state_norm": 2.0,
+            "score_context_json": "{}",
+        },
+        arrays={
+            "hand_joints": hand_joints,
+            "joint_velocities": np.asarray(
+                [
+                    [4.0, 0.0],
+                    [4.0, 0.0],
+                    [0.5, 0.0],
+                    [0.0, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            "actions": None,
+            "goals": goals,
+            "piano_states": None,
+        },
+        config={"trajectory_resample_steps": 4, "fallback_action_dim": 2},
+    )
+
+    feature_map = {name: float(value) for name, value in zip(names, feature_vector.tolist())}
+
+    assert "motion_frontload_ratio" in feature_map
+    assert "contact_onset_frontload_ratio" in feature_map
+    assert feature_map["motion_frontload_ratio"] > feature_map["motion_tail_ratio"]
+    assert feature_map["contact_onset_frontload_ratio"] == 1.0
+    assert feature_map["contact_release_density"] > 0.0
+    assert feature_map["control_phase_press_onset"] == 0.0
+    assert feature_map["control_phase_whole_event"] == 1.0
+
+
+def test_event_phase_segmenter_emits_phase_specific_segments() -> None:
+    segmenter = EventPhaseSegmenter(
+        pre_steps=4,
+        post_steps=6,
+        note_local_horizon_steps=16,
+        onset_window_steps_single=4,
+        onset_window_steps_chord=6,
+        approach_window_steps=4,
+        release_window_steps=4,
+        hold_min_duration_steps=6,
+        transition_max_gap_steps=6,
+        transition_window_steps=6,
+        staccato_duration_steps=4,
+        min_phase_duration_steps=2,
+    )
+    episode = SimpleNamespace(hand_joints=np.zeros((32, 4), dtype=np.float32))
+    score_events = [
+        ScoreEvent(
+            event_id="event_0",
+            song_id="song_a",
+            episode_id="ep_a",
+            onset_step=10,
+            end_step=22,
+            start_time_sec=0.5,
+            end_time_sec=1.1,
+            key_numbers=(40, 44, 47),
+            chord_size=3,
+            key_center=0.5,
+            inter_onset_steps=4,
+            source="goals",
+        ),
+        ScoreEvent(
+            event_id="event_1",
+            song_id="song_a",
+            episode_id="ep_a",
+            onset_step=25,
+            end_step=29,
+            start_time_sec=1.25,
+            end_time_sec=1.45,
+            key_numbers=(50,),
+            chord_size=1,
+            key_center=0.6,
+            inter_onset_steps=3,
+            source="goals",
+        ),
+    ]
+
+    segments = segmenter.segment(episode, score_events)
+    phases = {(segment.score_event_id, segment.control_phase) for segment in segments}
+
+    assert ("event_0", "approach") in phases
+    assert ("event_0", "press_onset") in phases
+    assert ("event_0", "hold") in phases
+    assert ("event_0", "release") in phases
+    assert any(segment.coarse_family == "chord_press" for segment in segments if segment.score_event_id == "event_0")
+    assert any(segment.control_phase == "local_transition" for segment in segments if segment.score_event_id == "event_0")

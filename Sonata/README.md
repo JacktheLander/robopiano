@@ -199,7 +199,7 @@ Evaluate Sonata on unseen songs from an external MIDI corpus:
 
 1. Store the MIDI dataset outside the repo on shared persistent storage, for example:
    `/project/$USER/datasets/external_midis/<dataset_name>/`
-2. Keep the Sonata checkout at `/project/$USER/robopianist` so the local RoboPianist package resolves from `/project/$USER/robopianist/robopianist`.
+2. Keep the Sonata checkout at `/project/$USER/robopianist` so the local RoboPianist package resolves from `/project/$USER/robopianist`.
 3. Build an external-song benchmark manifest:
 
 ```bash
@@ -331,7 +331,9 @@ python scripts/run_pipeline.py --profile debug --no-wandb
 ## Config Profiles
 
 - `configs/data/debug.yaml`, `medium.yaml`, `full.yaml`
+- `configs/data/medium_eventful.yaml`
 - `configs/primitive/debug.yaml`, `medium.yaml`, `full.yaml`
+- `configs/primitive/medium_eventful.yaml`
 - `configs/transformer/debug.yaml`, `medium.yaml`, `full.yaml`
 - `configs/diffusion/debug.yaml`, `medium.yaml`, `full.yaml`
 - `configs/pipeline/debug.yaml`, `medium.yaml`, `full.yaml`
@@ -345,6 +347,14 @@ export RP1M_300_ROOT=/project/$USER/rp1m_300.zarr
 If cluster score files live outside the repo checkout, you can point `note_search_roots` at environment-expanded paths because Sonata resolves `$VARS` in config paths before use.
 
 Primitive configs also expose the slim-cache migration knobs documented in `STAGE1_ONLINE_PRIMITIVES.md`.
+
+The event-faithful Stage 1 profile lives at `configs/primitive/medium_eventful.yaml`. It adds:
+
+- adaptive phase-aware segmentation (`event_phase_aligned`)
+- family-first clustering partitions
+- a learned control-aware latent before clustering
+- multi-prototype primitive priors
+- sampled online primitive cleanup plus automatic post-training MAESTRO evaluation
 
 ## Evaluation Outputs
 
@@ -405,6 +415,12 @@ Migration is idempotent and resumable: completed slim chunks are skipped on reru
 - `train_transformer.py` and `train_diffusion.py` consume cached Stage 1 outputs rather than recomputing segmentation.
 - `run_pipeline.py` is convenient for local debugging and end-to-end smoke runs, but on the cluster the more robust pattern is: run Stage 0 and Stage 1 on shared CPU storage first, then launch Stage 2 and Stage 3 jobs against those cached outputs.
 - The code does not assume Slurm locally. Cluster-specific scheduling remains outside Sonata itself; Sonata focuses on explicit filesystem outputs so CPU and GPU jobs can hand off work through shared storage cleanly.
+
+For the checked-in Stage 1 eventful CPU workflow, use:
+
+- `scripts/slurm/train_primitives_eventful.slurm`
+- `scripts/slurm/launch_stage1_eventful_tmux.sh`
+- `scripts/slurm/README.md`
 
 ## Notes On MJX
 

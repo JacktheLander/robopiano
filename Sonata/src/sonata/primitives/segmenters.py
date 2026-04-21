@@ -54,6 +54,11 @@ class CandidateSegment:
     score_event_id: str
     key_signature: str
     heuristic_family: str
+    coarse_family: str
+    control_phase: str
+    phase_index: int
+    phase_count: int
+    event_duration_steps: int
     chord_size: int
     key_center: float
 
@@ -106,6 +111,11 @@ class FixedWindowSegmenter(BaseSegmenter):
                     score_event_id="",
                     key_signature="",
                     heuristic_family="window",
+                    coarse_family="transition",
+                    control_phase="whole_event",
+                    phase_index=0,
+                    phase_count=1,
+                    event_duration_steps=max(int(end - start), 1),
                     chord_size=0,
                     key_center=0.0,
                 )
@@ -152,6 +162,11 @@ class ChangePointSegmenter(BaseSegmenter):
                     score_event_id="",
                     key_signature="",
                     heuristic_family="changepoint",
+                    coarse_family="transition",
+                    control_phase="whole_event",
+                    phase_index=0,
+                    phase_count=1,
+                    event_duration_steps=max(int(end - start), 1),
                     chord_size=0,
                     key_center=0.0,
                 )
@@ -162,15 +177,21 @@ class ChangePointSegmenter(BaseSegmenter):
 class NoteAlignedSegmenter(BaseSegmenter):
     name = "note_aligned"
 
-    def __init__(self, pre_steps: int, post_steps: int):
+    def __init__(self, pre_steps: int, post_steps: int, note_local_horizon_steps: int | None = None):
         self.pre_steps = int(pre_steps)
         self.post_steps = int(post_steps)
+        self.note_local_horizon_steps = (
+            int(note_local_horizon_steps) if note_local_horizon_steps is not None and int(note_local_horizon_steps) > 0 else None
+        )
 
     def segment(self, episode, score_events: list[ScoreEvent]) -> list[CandidateSegment]:
         segments: list[CandidateSegment] = []
         for event in score_events:
             start = max(event.onset_step - self.pre_steps, 0)
-            end = max(start + 1, min(event.end_step + self.post_steps, episode.hand_joints.shape[0]))
+            end = event.end_step + self.post_steps
+            if self.note_local_horizon_steps is not None:
+                end = min(end, event.onset_step + self.note_local_horizon_steps)
+            end = max(start + 1, min(end, episode.hand_joints.shape[0]))
             family = classify_interval_family(event)
             segments.append(
                 CandidateSegment(
@@ -180,6 +201,11 @@ class NoteAlignedSegmenter(BaseSegmenter):
                     score_event_id=event.event_id,
                     key_signature="-".join(str(item) for item in event.key_numbers),
                     heuristic_family=family,
+                    coarse_family=coarse_family_for_event(event),
+                    control_phase="whole_event",
+                    phase_index=0,
+                    phase_count=1,
+                    event_duration_steps=max(int(event.end_step - event.onset_step), 1),
                     chord_size=event.chord_size,
                     key_center=event.key_center,
                 )
@@ -187,11 +213,205 @@ class NoteAlignedSegmenter(BaseSegmenter):
         return segments
 
 
+class EventPhaseSegmenter(BaseSegmenter):
+    name = "event_phase_aligned"
+
+    def __init__(
+        self,
+        pre_steps: int,
+        post_steps: int,
+        note_local_horizon_steps: int | None = None,
+        *,
+        onset_window_steps_single: int = 4,
+        onset_window_steps_chord: int = 6,
+        approach_window_steps: int = 6,
+        release_window_steps: int = 6,
+        hold_min_duration_steps: int = 8,
+        hold_tail_steps: int = 2,
+        transition_max_gap_steps: int = 8,
+        transition_window_steps: int = 8,
+        staccato_duration_steps: int = 6,
+        min_phase_duration_steps: int = 2,
+    ):
+        self.pre_steps = int(pre_steps)
+        self.post_steps = int(post_steps)
+        self.note_local_horizon_steps = (
+            int(note_local_horizon_steps) if note_local_horizon_steps is not None and int(note_local_horizon_steps) > 0 else None
+        )
+        self.onset_window_steps_single = int(onset_window_steps_single)
+        self.onset_window_steps_chord = int(onset_window_steps_chord)
+        self.approach_window_steps = int(approach_window_steps)
+        self.release_window_steps = int(release_window_steps)
+        self.hold_min_duration_steps = int(hold_min_duration_steps)
+        self.hold_tail_steps = int(hold_tail_steps)
+        self.transition_max_gap_steps = int(transition_max_gap_steps)
+        self.transition_window_steps = int(transition_window_steps)
+        self.staccato_duration_steps = int(staccato_duration_steps)
+        self.min_phase_duration_steps = int(min_phase_duration_steps)
+
+    def segment(self, episode, score_events: list[ScoreEvent]) -> list[CandidateSegment]:
+        if episode.hand_joints is None:
+            return []
+        horizon = int(episode.hand_joints.shape[0])
+        segments: list[CandidateSegment] = []
+        for index, event in enumerate(score_events):
+            next_event = score_events[index + 1] if index + 1 < len(score_events) else None
+            event_duration = max(int(event.end_step - event.onset_step), 1)
+            heuristic_family = classify_interval_family(event)
+            key_signature = "-".join(str(item) for item in event.key_numbers)
+            onset_window = (
+                self.onset_window_steps_chord if int(event.chord_size) >= 2 else self.onset_window_steps_single
+            )
+            if event_duration <= self.staccato_duration_steps and int(event.chord_size) <= 1:
+                onset_window = max(2, min(onset_window, self.staccato_duration_steps))
+            approach_steps = min(self.approach_window_steps, max(self.pre_steps, 0))
+            release_steps = min(self.release_window_steps, max(self.post_steps, 0))
+            phase_segments: list[CandidateSegment] = []
+            self._append_phase(
+                phase_segments,
+                onset_step=max(int(event.onset_step) - approach_steps, 0),
+                end_step=int(event.onset_step),
+                score_event=event,
+                heuristic_family=heuristic_family,
+                key_signature=key_signature,
+                control_phase="approach",
+                coarse_family="move",
+                event_duration_steps=event_duration,
+                horizon=horizon,
+            )
+            onset_end = min(int(event.onset_step) + onset_window, horizon)
+            self._append_phase(
+                phase_segments,
+                onset_step=max(int(event.onset_step) - min(2, approach_steps // 2), 0),
+                end_step=onset_end,
+                score_event=event,
+                heuristic_family=heuristic_family,
+                key_signature=key_signature,
+                control_phase="press_onset",
+                coarse_family="chord_press" if int(event.chord_size) >= 2 else "single_press",
+                event_duration_steps=event_duration,
+                horizon=horizon,
+            )
+            if event_duration >= self.hold_min_duration_steps:
+                hold_start = min(int(event.onset_step) + max(onset_window // 2, 1), max(horizon - 1, 0))
+                hold_end = min(int(event.end_step) + self.hold_tail_steps, horizon)
+                self._append_phase(
+                    phase_segments,
+                    onset_step=hold_start,
+                    end_step=hold_end,
+                    score_event=event,
+                    heuristic_family=heuristic_family,
+                    key_signature=key_signature,
+                    control_phase="hold",
+                    coarse_family="hold",
+                    event_duration_steps=event_duration,
+                    horizon=horizon,
+                )
+            release_start = max(min(int(event.end_step) - 1, horizon - 1), int(event.onset_step))
+            self._append_phase(
+                phase_segments,
+                onset_step=release_start,
+                end_step=min(int(event.end_step) + release_steps, horizon),
+                score_event=event,
+                heuristic_family=heuristic_family,
+                key_signature=key_signature,
+                control_phase="release",
+                coarse_family="release",
+                event_duration_steps=event_duration,
+                horizon=horizon,
+            )
+            if next_event is not None:
+                gap = int(next_event.onset_step) - int(event.end_step)
+                if gap >= 0 and gap <= self.transition_max_gap_steps:
+                    transition_end = min(int(next_event.onset_step) + min(self.transition_window_steps, onset_window), horizon)
+                    self._append_phase(
+                        phase_segments,
+                        onset_step=max(int(event.end_step) - 1, int(event.onset_step)),
+                        end_step=transition_end,
+                        score_event=event,
+                        heuristic_family=heuristic_family,
+                        key_signature=key_signature,
+                        control_phase="local_transition",
+                        coarse_family="short_sequence" if gap <= max(self.transition_max_gap_steps // 2, 1) else "transition",
+                        event_duration_steps=event_duration,
+                        horizon=horizon,
+                    )
+            if not phase_segments:
+                fallback_end = int(event.end_step) + self.post_steps
+                if self.note_local_horizon_steps is not None:
+                    fallback_end = min(fallback_end, int(event.onset_step) + self.note_local_horizon_steps)
+                self._append_phase(
+                    phase_segments,
+                    onset_step=max(int(event.onset_step) - self.pre_steps, 0),
+                    end_step=min(max(fallback_end, int(event.onset_step) + 1), horizon),
+                    score_event=event,
+                    heuristic_family=heuristic_family,
+                    key_signature=key_signature,
+                    control_phase="whole_event",
+                    coarse_family=coarse_family_for_event(event),
+                    event_duration_steps=event_duration,
+                    horizon=horizon,
+                )
+            total = len(phase_segments)
+            for phase_index, segment in enumerate(phase_segments):
+                segment.phase_index = int(phase_index)
+                segment.phase_count = int(total)
+            segments.extend(phase_segments)
+        return segments
+
+    def _append_phase(
+        self,
+        output: list[CandidateSegment],
+        *,
+        onset_step: int,
+        end_step: int,
+        score_event: ScoreEvent,
+        heuristic_family: str,
+        key_signature: str,
+        control_phase: str,
+        coarse_family: str,
+        event_duration_steps: int,
+        horizon: int,
+    ) -> None:
+        start = int(np.clip(onset_step, 0, max(horizon - 1, 0)))
+        end = int(np.clip(end_step, start + 1, horizon))
+        if end - start < self.min_phase_duration_steps:
+            return
+        output.append(
+            CandidateSegment(
+                onset_step=start,
+                end_step=end,
+                segment_source=self.name,
+                score_event_id=score_event.event_id,
+                key_signature=key_signature,
+                heuristic_family=heuristic_family,
+                coarse_family=coarse_family,
+                control_phase=control_phase,
+                phase_index=0,
+                phase_count=1,
+                event_duration_steps=max(int(event_duration_steps), 1),
+                chord_size=int(score_event.chord_size),
+                key_center=float(score_event.key_center),
+            )
+        )
+
+
 class DTWAssistedSegmenter(NoteAlignedSegmenter):
     name = "dtw_assisted"
 
-    def __init__(self, pre_steps: int, post_steps: int, alignment_radius: int, template_window: int):
-        super().__init__(pre_steps=pre_steps, post_steps=post_steps)
+    def __init__(
+        self,
+        pre_steps: int,
+        post_steps: int,
+        alignment_radius: int,
+        template_window: int,
+        note_local_horizon_steps: int | None = None,
+    ):
+        super().__init__(
+            pre_steps=pre_steps,
+            post_steps=post_steps,
+            note_local_horizon_steps=note_local_horizon_steps,
+        )
         self.alignment_radius = int(alignment_radius)
         self.template_window = int(template_window)
 
@@ -235,6 +455,11 @@ class DTWAssistedSegmenter(NoteAlignedSegmenter):
                     score_event_id=segment.score_event_id,
                     key_signature=segment.key_signature,
                     heuristic_family=segment.heuristic_family,
+                    coarse_family=segment.coarse_family,
+                    control_phase=segment.control_phase,
+                    phase_index=segment.phase_index,
+                    phase_count=segment.phase_count,
+                    event_duration_steps=segment.event_duration_steps,
                     chord_size=segment.chord_size,
                     key_center=segment.key_center,
                 )
@@ -262,6 +487,19 @@ def classify_interval_family(event: ScoreEvent) -> str:
     return "single"
 
 
+def coarse_family_for_event(event: ScoreEvent) -> str:
+    duration = max(int(event.end_step - event.onset_step), 1)
+    if int(event.chord_size) >= 3:
+        return "chord_press"
+    if duration >= 24:
+        return "hold"
+    if int(event.inter_onset_steps) <= 2 and duration <= 10:
+        return "short_sequence"
+    if int(event.chord_size) >= 2:
+        return "chord_press"
+    return "single_press"
+
+
 def build_segmenter(config: dict[str, Any]) -> BaseSegmenter:
     strategy = str(config["segmentation_strategy"])
     if strategy == "fixed_window":
@@ -274,13 +512,34 @@ def build_segmenter(config: dict[str, Any]) -> BaseSegmenter:
             acceleration_quantile=config["acceleration_quantile"],
         )
     if strategy == "note_aligned":
-        return NoteAlignedSegmenter(pre_steps=config["pre_steps"], post_steps=config["post_steps"])
+        return NoteAlignedSegmenter(
+            pre_steps=config["pre_steps"],
+            post_steps=config["post_steps"],
+            note_local_horizon_steps=config.get("note_local_horizon_steps"),
+        )
     if strategy == "dtw_assisted":
         return DTWAssistedSegmenter(
             pre_steps=config["pre_steps"],
             post_steps=config["post_steps"],
             alignment_radius=config["alignment_radius"],
             template_window=config["dtw_template_window"],
+            note_local_horizon_steps=config.get("note_local_horizon_steps"),
+        )
+    if strategy == "event_phase_aligned":
+        return EventPhaseSegmenter(
+            pre_steps=config["pre_steps"],
+            post_steps=config["post_steps"],
+            note_local_horizon_steps=config.get("note_local_horizon_steps"),
+            onset_window_steps_single=int(config.get("onset_window_steps_single", 4)),
+            onset_window_steps_chord=int(config.get("onset_window_steps_chord", 6)),
+            approach_window_steps=int(config.get("approach_window_steps", config.get("pre_steps", 4))),
+            release_window_steps=int(config.get("release_window_steps", config.get("post_steps", 4))),
+            hold_min_duration_steps=int(config.get("hold_min_duration_steps", 8)),
+            hold_tail_steps=int(config.get("hold_tail_steps", 2)),
+            transition_max_gap_steps=int(config.get("transition_max_gap_steps", 8)),
+            transition_window_steps=int(config.get("transition_window_steps", 8)),
+            staccato_duration_steps=int(config.get("staccato_duration_steps", 6)),
+            min_phase_duration_steps=int(config.get("min_phase_duration_steps", 2)),
         )
     raise ValueError(f"Unknown segmentation strategy: {strategy}")
 
@@ -532,6 +791,11 @@ def run_segmentation_legacy(manifest_df: pd.DataFrame, output_dir: Path, config:
                 chunk_path="",
                 chunk_index=-1,
                 heuristic_family=candidate.heuristic_family,
+                coarse_family=candidate.coarse_family,
+                control_phase=candidate.control_phase,
+                phase_index=int(candidate.phase_index),
+                phase_count=int(candidate.phase_count),
+                event_duration_steps=int(candidate.event_duration_steps),
                 motion_energy=float(np.linalg.norm(velocity, axis=1).mean()),
                 chord_size=int(candidate.chord_size),
                 key_center=float(candidate.key_center),
@@ -967,6 +1231,11 @@ def iter_prepared_segments(
             chunk_path="",
             chunk_index=-1,
             heuristic_family=candidate.heuristic_family,
+            coarse_family=candidate.coarse_family,
+            control_phase=candidate.control_phase,
+            phase_index=int(candidate.phase_index),
+            phase_count=int(candidate.phase_count),
+            event_duration_steps=int(candidate.event_duration_steps),
             motion_energy=float(np.linalg.norm(velocity, axis=1).mean()),
             chord_size=int(candidate.chord_size),
             key_center=float(candidate.key_center),

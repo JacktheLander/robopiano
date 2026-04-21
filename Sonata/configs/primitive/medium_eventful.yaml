@@ -1,0 +1,119 @@
+output_root: /WAVE/datasets/ccoelho_lab-jlanders/sonata/outputs/primitives/medium_eventful
+data_output_root: /WAVE/datasets/ccoelho_lab-jlanders/sonata/outputs/data/medium_eventful
+data_manifest_name: dataset_manifest
+experiment_name: Sonata-3-medium-eventful-primitives
+wandb:
+  enabled: true
+  project: robopianist
+  entity: tnguyen31-santa-clara-university
+  mode: online
+  tags: ["sonata", "primitives", "medium", "eventful"]
+seed: 7
+force: false
+segmentation_strategy: event_phase_aligned
+window_steps: 24
+stride_steps: 12
+pre_steps: 4
+post_steps: 8
+note_local_horizon_steps: 16
+min_gap_steps: 8
+velocity_quantile: 0.85
+acceleration_quantile: 0.85
+alignment_radius: 4
+dtw_template_window: 20
+chord_tolerance_steps: 0
+onset_window_steps_single: 4
+onset_window_steps_chord: 6
+approach_window_steps: 6
+release_window_steps: 6
+hold_min_duration_steps: 8
+hold_tail_steps: 2
+transition_max_gap_steps: 8
+transition_window_steps: 8
+staccato_duration_steps: 6
+min_phase_duration_steps: 2
+segment_chunk_size: 512
+online_segment_processing: true
+save_raw_segment_chunks: false
+online_storage_format: npz_shards
+write_full_segment_cache: false
+write_slim_cache: true
+migrate_existing_segment_chunks: true
+delete_raw_chunks_after_migration: false
+slim_cache_dir: slim
+slim_feature_dir: features
+slim_gmr_target_dir: gmr_targets
+slim_index_dir: index
+trajectory_resample_steps: 16
+include_action_trajectory: true
+fallback_action_dim: 39
+pca_components: 32
+gmm_k_candidates: [4, 6, 8, 12, 16, 24]
+model_selection_metric: bic
+gmm_covariance_type: full
+gmm_reg_covar: 0.0001
+silhouette_max_examples: 1024
+gmr_resample_steps: 24
+gmr_horizon: 24
+gmr_components: 6
+gmr_reg_covar: 0.0001
+gmr_target_actions: true
+num_duration_buckets: 8
+num_dynamics_buckets: 6
+min_segments_per_primitive: 6
+segment_num_workers: 16
+feature_num_workers: 16
+
+family_clustering:
+  enabled: true
+  split_by_phase: true
+  split_by_region: true
+  region_buckets: 4
+  split_by_chord_size: true
+
+control_latent:
+  enabled: true
+  hidden_dim: 128
+  latent_dim: 32
+  epochs: 12
+  batch_size: 256
+  triplet_margin: 0.2
+  family_loss_weight: 1.0
+  phase_loss_weight: 0.5
+  triplet_loss_weight: 0.5
+  learning_rate: 0.001
+  device: cpu
+
+hybrid_selection:
+  shortlist_size: 3
+
+prior_selection:
+  max_prototypes: 3
+  min_segments_per_prototype: 6
+
+online_selection:
+  enabled: true
+  split: val
+  instances_per_primitive: 1
+  max_instances: 96
+  onset_tolerance_frames: 1
+  min_onset_f1: 0.12
+  max_false_positive_rate: 12.0
+  max_missed_note_rate: 24.0
+  merge_prior_distance_threshold: 0.2
+  top_k_examples: 2
+  max_plot_primitives: 24
+  save_plots: true
+  save_debug: false
+  rollout:
+    source_mode: example_midi_pool
+    example_midi_globs:
+      - ${MAESTRO_MIDI_ROOT}/**/*.midi
+      - ${MAESTRO_MIDI_ROOT}/**/*.mid
+    max_example_midis: 8
+    validate_action_dim: true
+
+post_training_eval:
+  enabled: true
+  config_path: ../../configs/evaluation/primitives_online_maestro.yaml
+  output_root: /WAVE/datasets/ccoelho_lab-jlanders/sonata/outputs/evaluation/primitives_online/medium_eventful_maestro

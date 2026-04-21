@@ -13,14 +13,15 @@ force: false
 segmentation_strategy: note_aligned
 window_steps: 24
 stride_steps: 12
-pre_steps: 6
-post_steps: 12
+pre_steps: 4
+post_steps: 4
+note_local_horizon_steps: 8
 min_gap_steps: 8
 velocity_quantile: 0.85
 acceleration_quantile: 0.85
 alignment_radius: 4
 dtw_template_window: 20
-chord_tolerance_steps: 1
+chord_tolerance_steps: 0
 segment_chunk_size: 512
 online_segment_processing: true
 save_raw_segment_chunks: false
@@ -33,22 +34,22 @@ slim_cache_dir: slim
 slim_feature_dir: features
 slim_gmr_target_dir: gmr_targets
 slim_index_dir: index
-trajectory_resample_steps: 16
+trajectory_resample_steps: 12
 include_action_trajectory: true
 fallback_action_dim: 39
 pca_components: 128
-gmm_k_candidates: [16, 24, 32, 40]
+gmm_k_candidates: [24, 32, 40, 48, 56]
 model_selection_metric: bic
 gmm_covariance_type: full
 gmm_reg_covar: 0.0001
 silhouette_max_examples: 2048
-gmr_resample_steps: 32
-gmr_horizon: 32
-gmr_components: 6
+gmr_resample_steps: 16
+gmr_horizon: 16
+gmr_components: 4
 gmr_reg_covar: 0.0001
 gmr_target_actions: true
 num_duration_buckets: 8
 num_dynamics_buckets: 6
-min_segments_per_primitive: 8
+min_segments_per_primitive: 6
 segment_num_workers: 16
 feature_num_workers: 16

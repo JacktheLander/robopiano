@@ -95,6 +95,11 @@ class SegmentRecord:
     chunk_path: str
     chunk_index: int
     heuristic_family: str
+    coarse_family: str
+    control_phase: str
+    phase_index: int
+    phase_count: int
+    event_duration_steps: int
     motion_energy: float
     chord_size: int
     key_center: float

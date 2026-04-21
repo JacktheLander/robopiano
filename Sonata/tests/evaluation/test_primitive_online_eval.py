@@ -13,12 +13,16 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from sonata.evaluation.primitive_online_eval import (
+    PrimitiveInstance,
+    PrimitiveLibraryEntry,
     build_primitive_instances,
     extract_key_events_from_goals,
     extract_key_events_from_piano_states,
     load_primitive_online_artifacts,
     match_key_events,
+    resolve_instance_rollout_source,
     sample_primitive_assignment_rows,
+    select_primitive_prior_mean,
 )
 from sonata.primitives.slim_cache import resolve_slim_cache_paths, write_slim_chunk
 from sonata.utils.io import save_npz, write_table
@@ -248,3 +252,163 @@ def test_resolve_robopianist_import_root_accepts_clone_root_or_package_dir(tmp_p
 
     assert resolve_robopianist_import_root(clone_root) == clone_root
     assert resolve_robopianist_import_root(package_root) == clone_root
+
+
+def test_resolve_instance_rollout_source_uses_example_midi_pool(tmp_path: Path) -> None:
+    package_root = tmp_path / "robopianist"
+    rousseau_dir = package_root / "music" / "data" / "rousseau"
+    rousseau_dir.mkdir(parents=True)
+    twinkle_path = rousseau_dir / "twinkle-twinkle-trimmed.mid"
+    nocturne_path = rousseau_dir / "nocturne-trimmed.mid"
+    twinkle_path.write_bytes(b"MThd")
+    nocturne_path.write_bytes(b"MThd")
+
+    instance = PrimitiveInstance(
+        segment_id="segment_0",
+        primitive_id="primitive_001",
+        song_id="unused_song",
+        demo_id=None,
+        episode_id="episode_0",
+        split="train",
+        start_frame=0,
+        end_frame=4,
+        duration_steps=4,
+        control_timestep=0.05,
+        hand=None,
+        start_joint_state=None,
+        start_joint_velocity=None,
+        start_fingertip_state=None,
+        start_piano_state=None,
+        intended_keys=(),
+        realized_keys_gt=(),
+        onset_frames_gt=(),
+        release_frames_gt=(),
+        conditioning_features=None,
+        chunk_path="",
+        chunk_index=0,
+        raw_chunk_path=None,
+        raw_chunk_index=None,
+        gmr_target_name="actions",
+        primitive_prior_path=None,
+    )
+
+    source = resolve_instance_rollout_source(
+        instance=instance,
+        rollout_config={
+            "source_mode": "example_midi_pool",
+            "example_environment_names": [
+                "RoboPianist-debug-TwinkleTwinkleRousseau-v0",
+                "RoboPianist-debug-NocturneRousseau-v0",
+            ],
+            "example_midi_paths": [
+                "music/data/rousseau/twinkle-twinkle-trimmed.mid",
+                "music/data/rousseau/nocturne-trimmed.mid",
+            ],
+        },
+        robopianist_root=package_root,
+    )
+
+    assert source["source_mode"] == "example_midi_pool"
+    assert source["source_label"] in {"twinkle-twinkle-trimmed", "nocturne-trimmed"}
+    assert Path(source["midi_file"]).exists()
+    assert source["environment_name"] in {
+        "RoboPianist-debug-TwinkleTwinkleRousseau-v0",
+        "RoboPianist-debug-NocturneRousseau-v0",
+    }
+
+
+def test_resolve_instance_rollout_source_supports_example_midi_globs(tmp_path: Path) -> None:
+    package_root = tmp_path / "robopianist"
+    maestro_dir = package_root / "music" / "data" / "maestro"
+    maestro_dir.mkdir(parents=True)
+    first = maestro_dir / "piece_a.midi"
+    second = maestro_dir / "piece_b.mid"
+    first.write_bytes(b"MThd")
+    second.write_bytes(b"MThd")
+
+    instance = PrimitiveInstance(
+        segment_id="segment_0",
+        primitive_id="primitive_001",
+        song_id="unused_song",
+        demo_id=None,
+        episode_id="episode_0",
+        split="train",
+        start_frame=0,
+        end_frame=4,
+        duration_steps=4,
+        control_timestep=0.05,
+        hand=None,
+        start_joint_state=None,
+        start_joint_velocity=None,
+        start_fingertip_state=None,
+        start_piano_state=None,
+        intended_keys=(),
+        realized_keys_gt=(),
+        onset_frames_gt=(),
+        release_frames_gt=(),
+        conditioning_features=None,
+        chunk_path="",
+        chunk_index=0,
+        raw_chunk_path=None,
+        raw_chunk_index=None,
+        gmr_target_name="actions",
+        primitive_prior_path=None,
+    )
+
+    source = resolve_instance_rollout_source(
+        instance=instance,
+        rollout_config={
+            "source_mode": "example_midi_pool",
+            "example_midi_globs": ["music/data/maestro/**/*.midi", "music/data/maestro/**/*.mid"],
+        },
+        robopianist_root=package_root,
+    )
+
+    assert source["source_mode"] == "example_midi_pool"
+    assert Path(source["midi_file"]).exists()
+    assert source["source_label"] in {"piece_a", "piece_b"}
+
+
+def test_select_primitive_prior_mean_uses_nearest_prototype() -> None:
+    instance = PrimitiveInstance(
+        segment_id="segment_0",
+        primitive_id="primitive_001",
+        song_id="song_a",
+        demo_id=None,
+        episode_id="episode_0",
+        split="train",
+        start_frame=0,
+        end_frame=4,
+        duration_steps=4,
+        control_timestep=0.05,
+        hand=None,
+        start_joint_state=None,
+        start_joint_velocity=None,
+        start_fingertip_state=None,
+        start_piano_state=None,
+        intended_keys=(),
+        realized_keys_gt=(),
+        onset_frames_gt=(),
+        release_frames_gt=(),
+        conditioning_features=np.asarray([0.1, 0.2], dtype=np.float32),
+        chunk_path="",
+        chunk_index=0,
+        raw_chunk_path=None,
+        raw_chunk_index=None,
+        gmr_target_name="actions",
+        primitive_prior_path=None,
+    )
+    library_entry = PrimitiveLibraryEntry(
+        primitive_id="primitive_001",
+        prior_path=None,
+        prior_mean=np.asarray([[0.0, 0.0]], dtype=np.float32),
+        prototype_means=np.asarray([[[0.0, 0.0]], [[1.0, 1.0]]], dtype=np.float32),
+        prototype_latent_centroids=np.asarray([[0.0, 0.0], [2.0, 2.0]], dtype=np.float32),
+        prototype_weights=np.asarray([0.5, 0.5], dtype=np.float32),
+        default_prototype_index=1,
+        metadata={},
+    )
+
+    selected = select_primitive_prior_mean(instance=instance, library_entry=library_entry)
+
+    np.testing.assert_allclose(selected, np.asarray([[0.0, 0.0]], dtype=np.float32))

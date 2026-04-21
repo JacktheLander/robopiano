@@ -37,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--rollout-device", default=None)
+    parser.add_argument("--rollout-source-mode", default=None)
+    parser.add_argument("--example-midi-paths", nargs="*", default=None)
     parser.add_argument("--robopianist-root", default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--log-level", default="INFO")
@@ -77,6 +79,7 @@ def main() -> None:
 
     sampling = dict(config.get("sampling", {}))
     events = dict(config.get("events", {}))
+    rollout = dict(config.get("rollout", {}))
     if args.max_instances is not None:
         sampling["max_instances"] = int(args.max_instances)
     if args.instances_per_primitive is not None:
@@ -97,8 +100,13 @@ def main() -> None:
         events["use_goals"] = bool(args.use_goals)
     if args.use_piano_states is not None:
         events["use_piano_states"] = bool(args.use_piano_states)
+    if args.rollout_source_mode is not None:
+        rollout["source_mode"] = str(args.rollout_source_mode)
+    if args.example_midi_paths is not None:
+        rollout["example_midi_paths"] = [str(_resolve_user_path(path)) for path in args.example_midi_paths]
     config["sampling"] = sampling
     config["events"] = events
+    config["rollout"] = rollout
 
     payload = evaluate_primitives_online(config=config, logger=logger)
     if payload.get("status") == "backend_unavailable":
