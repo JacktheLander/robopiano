@@ -68,6 +68,22 @@ class MaestroEvalConfig:
     clip: bool = True
     action_reward_observation: bool = False
     device: str = "auto"
+    agent_backend: str = "auto"
+    utd_ratio: int = 20
+    n_step_return: int = 3
+    droq_hidden_dim: int = 256
+    droq_dropout: float = 0.01
+    droq_tau: float = 0.005
+    droq_lr: float = 3e-4
+    droq_min_alpha: float = 0.05
+    droq_grad_clip: float = 1.0
+    normalize_observations: bool = True
+    normalize_rewards: bool = True
+    normalizer_warmup_steps: int = 50
+    observation_normalizer_clip: float = 5.0
+    reward_normalizer_clip: float = 10.0
+    compile_models: bool = True
+    run_intermediate_evals: bool = False
 
 
 def discover_midi_files(dataset_root: Path) -> list[Path]:
@@ -272,7 +288,7 @@ def _run_piece_online(*, piece_path: Path, config: MaestroEvalConfig) -> dict[st
         max_steps=config.max_steps_per_song,
         warmstart_steps=config.warmstart_steps,
         log_interval=config.log_interval,
-        eval_interval=config.eval_interval,
+        eval_interval=config.eval_interval if config.run_intermediate_evals else 0,
         eval_episodes=config.final_eval_episodes,
         batch_size=config.batch_size,
         discount=config.discount,
@@ -299,12 +315,28 @@ def _run_piece_online(*, piece_path: Path, config: MaestroEvalConfig) -> dict[st
         clip=config.clip,
         action_reward_observation=config.action_reward_observation,
         device=config.device,
+        agent_backend=config.agent_backend,
+        utd_ratio=config.utd_ratio,
+        n_step_return=config.n_step_return,
+        droq_hidden_dim=config.droq_hidden_dim,
+        droq_dropout=config.droq_dropout,
+        droq_tau=config.droq_tau,
+        droq_lr=config.droq_lr,
+        droq_min_alpha=config.droq_min_alpha,
+        droq_grad_clip=config.droq_grad_clip,
+        normalize_observations=config.normalize_observations,
+        normalize_rewards=config.normalize_rewards,
+        normalizer_warmup_steps=config.normalizer_warmup_steps,
+        observation_normalizer_clip=config.observation_normalizer_clip,
+        reward_normalizer_clip=config.reward_normalizer_clip,
+        compile_models=config.compile_models,
     )
     env = None
     eval_env = None
     try:
         env = get_env(train_args, midi_file=piece_path)
-        eval_env = get_env(train_args, midi_file=piece_path, enable_midi_metrics=True)
+        if config.run_intermediate_evals:
+            eval_env = get_env(train_args, midi_file=piece_path, enable_midi_metrics=True)
         spec, agent, replay_buffer, device_info = initialize_agent_and_replay(train_args, env)
         agent, train_summary = train_online(
             args=train_args,
@@ -314,6 +346,8 @@ def _run_piece_online(*, piece_path: Path, config: MaestroEvalConfig) -> dict[st
             replay_buffer=replay_buffer,
             eval_env=eval_env,
         )
+        if eval_env is None:
+            eval_env = get_env(train_args, midi_file=piece_path, enable_midi_metrics=True)
         eval_payload = run_eval_episodes(agent, eval_env, max(config.final_eval_episodes, 1))
         music = dict(eval_payload.get("music", {}))
         statistics = dict(eval_payload.get("statistics", {}))

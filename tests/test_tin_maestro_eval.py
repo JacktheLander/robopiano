@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tin.maestro_eval import (
+    MaestroEvalConfig,
     append_jsonl_row,
     build_summary,
     discover_midi_files,
@@ -14,6 +15,7 @@ from tin.maestro_eval import (
     load_jsonl_rows,
     piece_id_from_path,
 )
+from tin.evaluate_maestro import build_parser
 
 
 def test_discover_midi_files_and_piece_ids(tmp_path: Path) -> None:
@@ -103,3 +105,29 @@ def test_build_summary_uses_completed_rows_only() -> None:
     assert summary["failed_rows"] == 1
     assert summary["f1_count"] == 2
     assert summary["f1_mean"] == 0.4
+
+
+def test_evaluate_maestro_parser_accepts_droq_backend_flags() -> None:
+    args = build_parser().parse_args(
+        [
+            "--max-steps-per-song",
+            "1000",
+            "--agent-backend",
+            "droq",
+            "--utd-ratio",
+            "12",
+            "--compile-models",
+            "--normalize-observations",
+        ]
+    )
+
+    assert args.agent_backend == "droq"
+    assert args.utd_ratio == 12
+    assert args.compile_models is True
+    assert args.normalize_observations is True
+
+
+def test_maestro_eval_config_disables_intermediate_evals_by_default() -> None:
+    config = MaestroEvalConfig(max_steps_per_song=1000)
+
+    assert config.run_intermediate_evals is False

@@ -17,9 +17,13 @@ python tin/evaluate_maestro.py \
   --dataset-root /WAVE/datasets/ccoelho_lab-jlanders/MAESTRO \
   --output-root /WAVE/datasets/ccoelho_lab-jlanders/tin_eval \
   --max-steps-per-song 100000 \
+  --agent-backend auto \
   --device auto \
   --resume
 ```
+
+`--agent-backend auto` now picks the DroQ-style GPU backend on CUDA machines and falls back to the legacy SAC path on CPU-only nodes.
+`--run-intermediate-evals` is off by default so MAESTRO corpus runs only do the final scored rollout for each song.
 
 Useful `tmux` commands:
 
