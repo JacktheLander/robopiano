@@ -1,19 +1,49 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
 import time
 
-import dm_env_wrappers as wrappers
 import numpy as np
-import replay
-import robopianist.wrappers as robopianist_wrappers
-import sac
-import specs
-from robopianist import suite
+
+try:
+    import dm_env_wrappers as wrappers
+except ImportError:  # pragma: no cover
+    wrappers = None
+
+try:
+    import replay
+except ImportError:  # pragma: no cover
+    replay = None
+
+try:
+    import robopianist.wrappers as robopianist_wrappers
+except ImportError:  # pragma: no cover
+    robopianist_wrappers = None
+
+try:
+    import sac
+except ImportError:  # pragma: no cover
+    sac = None
+
+try:
+    import specs
+except ImportError:  # pragma: no cover
+    specs = None
+
+try:
+    from robopianist import suite
+except ImportError:  # pragma: no cover
+    suite = None
+
+from tin.droq_backend import DroQAgent, DroQConfig, NStepReplayBuffer
 from tqdm import tqdm
+
+
+def _default_sac_config() -> Any:
+    return sac.SACConfig() if sac is not None else None
 
 
 @dataclass(frozen=True)
@@ -60,7 +90,22 @@ class TrainArgs:
     camera_id: Optional[str | int] = "piano/back"
     action_reward_observation: bool = False
     device: str = "auto"
-    agent_config: sac.SACConfig = sac.SACConfig()
+    agent_backend: str = "auto"
+    utd_ratio: int = 20
+    n_step_return: int = 3
+    droq_hidden_dim: int = 256
+    droq_dropout: float = 0.01
+    droq_tau: float = 0.005
+    droq_lr: float = 3e-4
+    droq_min_alpha: float = 0.05
+    droq_grad_clip: float = 1.0
+    normalize_observations: bool = True
+    normalize_rewards: bool = True
+    normalizer_warmup_steps: int = 50
+    observation_normalizer_clip: float = 5.0
+    reward_normalizer_clip: float = 10.0
+    compile_models: bool = True
+    agent_config: Any = field(default_factory=_default_sac_config)
 
 
 def prefix_dict(prefix: str, values: dict[str, Any]) -> dict[str, Any]:
@@ -77,6 +122,12 @@ def resolve_device(requested: str) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def resolve_backend(requested: str, device: str) -> str:
+    if requested and requested != "auto":
+        return requested
+    return "droq" if device.startswith("cuda") else "sac"
+
+
 def get_env(
     args: TrainArgs,
     *,
@@ -84,6 +135,7 @@ def get_env(
     midi_file: Optional[Path] = None,
     enable_midi_metrics: bool = False,
 ):
+    _require_env_runtime()
     env = suite.load(
         environment_name=args.environment_name,
         midi_file=midi_file,
@@ -133,9 +185,63 @@ def get_env(
 
 
 def initialize_agent_and_replay(args: TrainArgs, env: Any) -> tuple[Any, Any, Any, dict[str, Any]]:
-    spec = specs.EnvironmentSpec.make(env)
     requested_device = args.device or "auto"
     resolved_device = resolve_device(requested_device)
+    requested_backend = args.agent_backend or "auto"
+    resolved_backend = resolve_backend(requested_backend, resolved_device)
+    device_info = {
+        "requested_device": requested_device,
+        "resolved_device": resolved_device,
+        "requested_backend": requested_backend,
+        "resolved_backend": resolved_backend,
+    }
+
+    if resolved_backend == "droq":
+        initial_timestep = env.reset()
+        observation_dim, action_dim = _infer_env_dims(env, initial_timestep)
+        agent = DroQAgent(
+            DroQConfig(
+                obs_dim=observation_dim,
+                act_dim=action_dim,
+                device=resolved_device,
+                gamma=args.discount,
+                tau=args.droq_tau,
+                lr=args.droq_lr,
+                batch_size=args.batch_size,
+                hidden=args.droq_hidden_dim,
+                dropout=args.droq_dropout,
+                min_alpha=args.droq_min_alpha,
+                grad_clip=args.droq_grad_clip,
+                normalize_observations=args.normalize_observations,
+                normalize_rewards=args.normalize_rewards,
+                observation_clip=args.observation_normalizer_clip,
+                reward_clip=args.reward_normalizer_clip,
+                normalizer_warmup_steps=args.normalizer_warmup_steps,
+            )
+        )
+        compiled = bool(args.compile_models and agent.compile_models())
+        replay_buffer = NStepReplayBuffer(
+            capacity=args.replay_capacity,
+            obs_dim=observation_dim,
+            act_dim=action_dim,
+            batch_size=args.batch_size,
+            n_steps=args.n_step_return,
+            gamma=args.discount,
+            device=resolved_device,
+        )
+        device_info.update(
+            {
+                "agent_device_applied": True,
+                "agent_device_fields": "device",
+                "droq_compiled": compiled,
+                "observation_dim": observation_dim,
+                "action_dim": action_dim,
+            }
+        )
+        return None, agent, replay_buffer, device_info
+
+    _require_sac_runtime()
+    spec = specs.EnvironmentSpec.make(env)
     agent_config = deepcopy(args.agent_config)
     agent_config, applied_fields = _apply_agent_device(agent_config, resolved_device)
     agent = sac.SAC.initialize(
@@ -150,12 +256,16 @@ def initialize_agent_and_replay(args: TrainArgs, env: Any) -> tuple[Any, Any, An
         max_size=args.replay_capacity,
         batch_size=args.batch_size,
     )
-    return spec, agent, replay_buffer, {
-        "requested_device": requested_device,
-        "resolved_device": resolved_device,
-        "agent_device_applied": bool(applied_fields),
-        "agent_device_fields": ",".join(applied_fields),
-    }
+    device_info.update(
+        {
+            "agent_device_applied": bool(applied_fields),
+            "agent_device_fields": ",".join(applied_fields),
+            "droq_compiled": False,
+            "observation_dim": spec.observation_dim,
+            "action_dim": spec.action_dim,
+        }
+    )
+    return spec, agent, replay_buffer, device_info
 
 
 def run_eval_episodes(agent: Any, env: Any, num_episodes: int) -> dict[str, Any]:
@@ -175,6 +285,53 @@ def run_eval_episodes(agent: Any, env: Any, num_episodes: int) -> dict[str, Any]
 
 
 def train_online(
+    *,
+    args: TrainArgs,
+    env: Any,
+    spec: Any,
+    agent: Any,
+    replay_buffer: Any,
+    eval_env: Any | None = None,
+    on_episode_end: Callable[[int, dict[str, float]], None] | None = None,
+    on_train_metrics: Callable[[int, dict[str, float]], None] | None = None,
+    on_eval: Callable[[int, dict[str, Any]], None] | None = None,
+    on_fps: Callable[[int, int], None] | None = None,
+) -> tuple[Any, dict[str, float]]:
+    if getattr(agent, "backend", "") == "droq":
+        return _train_online_droq(
+            args=args,
+            env=env,
+            agent=agent,
+            replay_buffer=replay_buffer,
+            eval_env=eval_env,
+            on_episode_end=on_episode_end,
+            on_train_metrics=on_train_metrics,
+            on_eval=on_eval,
+            on_fps=on_fps,
+        )
+    return _train_online_sac(
+        args=args,
+        env=env,
+        spec=spec,
+        agent=agent,
+        replay_buffer=replay_buffer,
+        eval_env=eval_env,
+        on_episode_end=on_episode_end,
+        on_train_metrics=on_train_metrics,
+        on_eval=on_eval,
+        on_fps=on_fps,
+    )
+
+
+def safe_close(env: Any) -> None:
+    if env is None:
+        return
+    close = getattr(env, "close", None)
+    if callable(close):
+        close()
+
+
+def _train_online_sac(
     *,
     args: TrainArgs,
     env: Any,
@@ -229,15 +386,111 @@ def train_online(
     }
 
 
-def safe_close(env: Any) -> None:
-    if env is None:
-        return
-    close = getattr(env, "close", None)
-    if callable(close):
-        close()
+def _train_online_droq(
+    *,
+    args: TrainArgs,
+    env: Any,
+    agent: DroQAgent,
+    replay_buffer: NStepReplayBuffer,
+    eval_env: Any | None = None,
+    on_episode_end: Callable[[int, dict[str, float]], None] | None = None,
+    on_train_metrics: Callable[[int, dict[str, float]], None] | None = None,
+    on_eval: Callable[[int, dict[str, Any]], None] | None = None,
+    on_fps: Callable[[int, int], None] | None = None,
+) -> tuple[DroQAgent, dict[str, float]]:
+    timestep = env.reset()
+    raw_observation = _to_numpy_observation(timestep.observation)
+    start_time = time.time()
+
+    for step in tqdm(range(1, args.max_steps + 1), disable=not args.tqdm_bar):
+        normalized_observation = agent.prepare_observation(raw_observation)
+        if step < args.warmstart_steps:
+            action = _sample_random_action(env)
+        else:
+            _, action = agent.sample_actions(raw_observation)
+
+        timestep = env.step(action)
+        next_raw_observation = _to_numpy_observation(timestep.observation)
+        reward = float(timestep.reward or 0.0)
+        done = float(timestep.last())
+        agent.update_normalizers(raw_observation, reward)
+        next_observation = agent.prepare_observation(next_raw_observation)
+        replay_buffer.add(
+            normalized_observation,
+            np.asarray(action, dtype=np.float32),
+            agent.normalize_reward(reward),
+            next_observation,
+            done,
+        )
+        raw_observation = next_raw_observation
+
+        if timestep.last():
+            if on_episode_end is not None:
+                on_episode_end(step, dict(env.get_statistics()))
+            timestep = env.reset()
+            raw_observation = _to_numpy_observation(timestep.observation)
+
+        if step >= args.warmstart_steps and replay_buffer.is_ready():
+            for _ in range(max(args.utd_ratio, 1)):
+                transitions = replay_buffer.sample()
+                agent, metrics = agent.update(transitions)
+            if step % args.log_interval == 0 and on_train_metrics is not None:
+                on_train_metrics(step, dict(metrics))
+
+        if eval_env is not None and args.eval_interval > 0 and step % args.eval_interval == 0:
+            eval_payload = run_eval_episodes(agent, eval_env, max(args.eval_episodes, 1))
+            if on_eval is not None:
+                on_eval(step, eval_payload)
+
+        if step % args.log_interval == 0 and on_fps is not None:
+            elapsed = max(time.time() - start_time, 1e-6)
+            on_fps(step, int(step / elapsed))
+
+    elapsed_s = time.time() - start_time
+    return agent, {
+        "steps": float(args.max_steps),
+        "elapsed_s": float(elapsed_s),
+        "fps": float(args.max_steps / max(elapsed_s, 1e-6)),
+    }
+
+
+def _infer_env_dims(env: Any, timestep: Any) -> tuple[int, int]:
+    observation_dim = int(_to_numpy_observation(timestep.observation).size)
+    action_spec = env.action_spec()
+    action_dim = int(np.prod(action_spec.shape))
+    return observation_dim, action_dim
+
+
+def _sample_random_action(env: Any) -> np.ndarray:
+    action_spec = env.action_spec()
+    return np.random.uniform(action_spec.minimum, action_spec.maximum, action_spec.shape).astype(np.float32)
+
+
+def _to_numpy_observation(observation: Any) -> np.ndarray:
+    return np.asarray(observation, dtype=np.float32).reshape(-1)
+
+
+def _require_env_runtime() -> None:
+    missing = []
+    if suite is None:
+        missing.append("robopianist")
+    if wrappers is None:
+        missing.append("dm_env_wrappers")
+    if robopianist_wrappers is None:
+        missing.append("robopianist.wrappers")
+    if missing:
+        raise ImportError(f"Missing environment runtime dependencies: {', '.join(missing)}")
+
+
+def _require_sac_runtime() -> None:
+    missing = [name for name, module in (("sac", sac), ("replay", replay), ("specs", specs)) if module is None]
+    if missing:
+        raise ImportError(f"Missing SAC backend dependencies: {', '.join(missing)}")
 
 
 def _apply_agent_device(agent_config: Any, device: str) -> tuple[Any, list[str]]:
+    if agent_config is None:
+        return None, []
     candidate_fields = [name for name in ("device", "torch_device") if _has_field(agent_config, name)]
     if not candidate_fields:
         return agent_config, []

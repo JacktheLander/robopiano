@@ -49,6 +49,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clip", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--action-reward-observation", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--agent-backend", choices=("auto", "sac", "droq"), default="auto")
+    parser.add_argument("--utd-ratio", type=int, default=20)
+    parser.add_argument("--n-step-return", type=int, default=3)
+    parser.add_argument("--droq-hidden-dim", type=int, default=256)
+    parser.add_argument("--droq-dropout", type=float, default=0.01)
+    parser.add_argument("--droq-tau", type=float, default=0.005)
+    parser.add_argument("--droq-lr", type=float, default=3e-4)
+    parser.add_argument("--droq-min-alpha", type=float, default=0.05)
+    parser.add_argument("--droq-grad-clip", type=float, default=1.0)
+    parser.add_argument("--normalize-observations", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--normalize-rewards", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--normalizer-warmup-steps", type=int, default=50)
+    parser.add_argument("--observation-normalizer-clip", type=float, default=5.0)
+    parser.add_argument("--reward-normalizer-clip", type=float, default=10.0)
+    parser.add_argument("--compile-models", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run-intermediate-evals", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -96,6 +112,22 @@ def main() -> None:
         clip=args.clip,
         action_reward_observation=args.action_reward_observation,
         device=args.device,
+        agent_backend=args.agent_backend,
+        utd_ratio=args.utd_ratio,
+        n_step_return=args.n_step_return,
+        droq_hidden_dim=args.droq_hidden_dim,
+        droq_dropout=args.droq_dropout,
+        droq_tau=args.droq_tau,
+        droq_lr=args.droq_lr,
+        droq_min_alpha=args.droq_min_alpha,
+        droq_grad_clip=args.droq_grad_clip,
+        normalize_observations=args.normalize_observations,
+        normalize_rewards=args.normalize_rewards,
+        normalizer_warmup_steps=args.normalizer_warmup_steps,
+        observation_normalizer_clip=args.observation_normalizer_clip,
+        reward_normalizer_clip=args.reward_normalizer_clip,
+        compile_models=args.compile_models,
+        run_intermediate_evals=args.run_intermediate_evals,
     )
     payload = evaluate_maestro_corpus(config)
     logging.getLogger(__name__).info("MAESTRO evaluation complete: %s", payload)
