@@ -11,10 +11,10 @@ import wandb
 
 try:
     from tin.online_rl import TrainArgs as Args
-    from tin.online_rl import get_env, initialize_agent_and_replay, prefix_dict, train_online
+    from tin.online_rl import get_env, get_train_env, initialize_agent_and_replay, prefix_dict, train_online
 except ImportError:  # pragma: no cover
     from online_rl import TrainArgs as Args
-    from online_rl import get_env, initialize_agent_and_replay, prefix_dict, train_online
+    from online_rl import get_env, get_train_env, initialize_agent_and_replay, prefix_dict, train_online
 
 
 def main(args: Args) -> None:
@@ -39,7 +39,7 @@ def main(args: Args) -> None:
         name=run_name,
     )
 
-    env = get_env(args)
+    env = get_train_env(args)
     eval_env = get_env(args, record_dir=experiment_dir / "eval", enable_midi_metrics=True)
     spec, agent, replay_buffer, device_info = initialize_agent_and_replay(args, env)
     wandb.log(prefix_dict("runtime", device_info), step=0)

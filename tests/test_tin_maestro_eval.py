@@ -118,6 +118,11 @@ def test_evaluate_maestro_parser_accepts_droq_backend_flags() -> None:
             "12",
             "--compile-models",
             "--normalize-observations",
+            "--bc-checkpoint",
+            "/tmp/bc.pt",
+            "--use-mjx",
+            "--n-mjx-envs",
+            "4",
         ]
     )
 
@@ -125,6 +130,9 @@ def test_evaluate_maestro_parser_accepts_droq_backend_flags() -> None:
     assert args.utd_ratio == 12
     assert args.compile_models is True
     assert args.normalize_observations is True
+    assert args.bc_checkpoint == "/tmp/bc.pt"
+    assert args.use_mjx is True
+    assert args.n_mjx_envs == 4
 
 
 def test_maestro_eval_config_disables_intermediate_evals_by_default() -> None:

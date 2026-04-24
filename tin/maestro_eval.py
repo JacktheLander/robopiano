@@ -83,6 +83,10 @@ class MaestroEvalConfig:
     observation_normalizer_clip: float = 5.0
     reward_normalizer_clip: float = 10.0
     compile_models: bool = True
+    bc_checkpoint: Path | None = None
+    use_mjx: bool = False
+    n_mjx_envs: int = 4
+    mjx_prefer_warp: bool = False
     run_intermediate_evals: bool = False
 
 
@@ -279,9 +283,25 @@ def evaluate_maestro_corpus(config: MaestroEvalConfig, logger: logging.Logger | 
 
 def _run_piece_online(*, piece_path: Path, config: MaestroEvalConfig) -> dict[str, Any]:
     try:
-        from tin.online_rl import TrainArgs, get_env, initialize_agent_and_replay, run_eval_episodes, safe_close, train_online
+        from tin.online_rl import (
+            TrainArgs,
+            get_env,
+            get_train_env,
+            initialize_agent_and_replay,
+            run_eval_episodes,
+            safe_close,
+            train_online,
+        )
     except ImportError:  # pragma: no cover
-        from online_rl import TrainArgs, get_env, initialize_agent_and_replay, run_eval_episodes, safe_close, train_online
+        from online_rl import (
+            TrainArgs,
+            get_env,
+            get_train_env,
+            initialize_agent_and_replay,
+            run_eval_episodes,
+            safe_close,
+            train_online,
+        )
 
     train_args = TrainArgs(
         seed=config.seed,
@@ -330,11 +350,15 @@ def _run_piece_online(*, piece_path: Path, config: MaestroEvalConfig) -> dict[st
         observation_normalizer_clip=config.observation_normalizer_clip,
         reward_normalizer_clip=config.reward_normalizer_clip,
         compile_models=config.compile_models,
+        bc_checkpoint=config.bc_checkpoint,
+        use_mjx=config.use_mjx,
+        n_mjx_envs=config.n_mjx_envs,
+        mjx_prefer_warp=config.mjx_prefer_warp,
     )
     env = None
     eval_env = None
     try:
-        env = get_env(train_args, midi_file=piece_path)
+        env = get_train_env(train_args, midi_file=piece_path)
         if config.run_intermediate_evals:
             eval_env = get_env(train_args, midi_file=piece_path, enable_midi_metrics=True)
         spec, agent, replay_buffer, device_info = initialize_agent_and_replay(train_args, env)
