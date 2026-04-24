@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional, Tuple
 import time
 
 import numpy as np
+import tree
 
 try:
     import dm_env_wrappers as wrappers
@@ -136,6 +137,32 @@ def resolve_backend(requested: str, device: str) -> str:
     return "droq" if device.startswith("cuda") else "sac"
 
 
+def _single_precision_convert_value(nested_value: Any) -> Any:
+    """Like dm_env_wrappers SinglePrecision but uses ``asarray`` (NumPy 2-safe)."""
+
+    def _convert_single_value(value: Any) -> Any:
+        if value is not None:
+            value = np.asarray(value)
+            if np.issubdtype(value.dtype, np.float64):
+                value = np.asarray(value, dtype=np.float32)
+            elif np.issubdtype(value.dtype, np.int64):
+                value = np.asarray(value, dtype=np.int32)
+        return value
+
+    return tree.map_structure(_convert_single_value, nested_value)
+
+
+if wrappers is not None:
+
+    class _SinglePrecisionAsarrayWrapper(wrappers.SinglePrecisionWrapper):
+        def _convert_timestep(self, timestep: Any) -> Any:
+            return timestep._replace(
+                reward=_single_precision_convert_value(timestep.reward),
+                discount=_single_precision_convert_value(timestep.discount),
+                observation=_single_precision_convert_value(timestep.observation),
+            )
+
+
 def get_env(
     args: TrainArgs,
     *,
@@ -161,9 +188,6 @@ def get_env(
             disable_forearm_reward=args.disable_forearm_reward,
             disable_colorization=args.disable_colorization,
             disable_hand_collisions=args.disable_hand_collisions,
-            disable_key_proximity_reward=args.disable_key_proximity_reward,
-            disable_smooth_motion_reward=args.disable_smooth_motion_reward,
-            disable_anticipation_reward=args.disable_anticipation_reward,
             primitive_fingertip_collisions=args.primitive_fingertip_collisions,
             change_color_on_activation=True,
         ),
@@ -187,7 +211,7 @@ def get_env(
     if args.frame_stack > 1:
         env = wrappers.FrameStackingWrapper(env, num_frames=args.frame_stack, flatten=True)
     env = wrappers.CanonicalSpecWrapper(env, clip=args.clip)
-    env = wrappers.SinglePrecisionWrapper(env)
+    env = _SinglePrecisionAsarrayWrapper(env)  # type: ignore[misc]
     env = wrappers.DmControlWrapper(env)
     return env
 

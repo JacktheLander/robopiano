@@ -182,12 +182,13 @@ def evaluate_piece_batch(
     logger = logger or LOGGER
     output_root.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_root / _JSONL_NAME
-    rows = load_jsonl_rows(jsonl_path, logger=logger)
-    completed_piece_ids = {
-        str(row["piece_id"])
-        for row in rows
-        if isinstance(row, dict) and row.get("piece_id")
-    }
+    by_piece: dict[str, dict[str, Any]] = {}
+    for row in load_jsonl_rows(jsonl_path, logger=logger):
+        pid = row.get("piece_id")
+        if isinstance(pid, str):
+            by_piece[pid] = row
+    rows = [by_piece[key] for key in sorted(by_piece.keys())]
+    completed_piece_ids = {pid for pid, row in by_piece.items() if row.get("status") == "completed"}
     skipped = 0
     processed = 0
 
@@ -218,8 +219,10 @@ def evaluate_piece_batch(
             **payload,
         }
         append_jsonl_row(jsonl_path, row)
-        rows.append(row)
-        completed_piece_ids.add(piece_id)
+        by_piece[piece_id] = row
+        rows = [by_piece[key] for key in sorted(by_piece.keys())]
+        if status == "completed":
+            completed_piece_ids.add(piece_id)
         processed += 1
         materialize_outputs(rows, output_root)
 
