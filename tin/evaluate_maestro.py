@@ -64,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--observation-normalizer-clip", type=float, default=5.0)
     parser.add_argument("--reward-normalizer-clip", type=float, default=10.0)
     parser.add_argument("--compile-models", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--bc-checkpoint", default=None)
+    parser.add_argument("--use-mjx", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--n-mjx-envs", type=int, default=4)
+    parser.add_argument("--mjx-prefer-warp", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--run-intermediate-evals", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--log-level", default="INFO")
     return parser
@@ -127,6 +131,10 @@ def main() -> None:
         observation_normalizer_clip=args.observation_normalizer_clip,
         reward_normalizer_clip=args.reward_normalizer_clip,
         compile_models=args.compile_models,
+        bc_checkpoint=Path(args.bc_checkpoint).expanduser() if args.bc_checkpoint else None,
+        use_mjx=args.use_mjx,
+        n_mjx_envs=args.n_mjx_envs,
+        mjx_prefer_warp=args.mjx_prefer_warp,
         run_intermediate_evals=args.run_intermediate_evals,
     )
     payload = evaluate_maestro_corpus(config)

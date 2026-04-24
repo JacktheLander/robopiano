@@ -38,6 +38,10 @@ try:
 except ImportError:  # pragma: no cover
     suite = None
 
+try:
+    from tin.bc import load_bc_actor_weights
+except ImportError:  # pragma: no cover
+    from bc import load_bc_actor_weights
 from tin.droq_backend import DroQAgent, DroQConfig, NStepReplayBuffer
 from tqdm import tqdm
 
@@ -105,6 +109,10 @@ class TrainArgs:
     observation_normalizer_clip: float = 5.0
     reward_normalizer_clip: float = 10.0
     compile_models: bool = True
+    bc_checkpoint: Optional[Path] = None
+    use_mjx: bool = False
+    n_mjx_envs: int = 4
+    mjx_prefer_warp: bool = False
     agent_config: Any = field(default_factory=_default_sac_config)
 
 
@@ -184,6 +192,25 @@ def get_env(
     return env
 
 
+def get_train_env(
+    args: TrainArgs,
+    *,
+    midi_file: Optional[Path] = None,
+):
+    if args.use_mjx:
+        try:
+            from tin.mjx_env import MJXBatchedEnv
+        except ImportError:  # pragma: no cover
+            from mjx_env import MJXBatchedEnv
+        return MJXBatchedEnv(
+            args,
+            midi_file=midi_file,
+            n_envs=max(int(args.n_mjx_envs), 1),
+            prefer_warp=bool(args.mjx_prefer_warp),
+        )
+    return get_env(args, midi_file=midi_file)
+
+
 def initialize_agent_and_replay(args: TrainArgs, env: Any) -> tuple[Any, Any, Any, dict[str, Any]]:
     requested_device = args.device or "auto"
     resolved_device = resolve_device(requested_device)
@@ -219,6 +246,9 @@ def initialize_agent_and_replay(args: TrainArgs, env: Any) -> tuple[Any, Any, An
                 normalizer_warmup_steps=args.normalizer_warmup_steps,
             )
         )
+        bc_metadata = {}
+        if args.bc_checkpoint:
+            bc_metadata = load_bc_actor_weights(agent, args.bc_checkpoint)
         compiled = bool(args.compile_models and agent.compile_models())
         replay_buffer = NStepReplayBuffer(
             capacity=args.replay_capacity,
@@ -236,6 +266,8 @@ def initialize_agent_and_replay(args: TrainArgs, env: Any) -> tuple[Any, Any, An
                 "droq_compiled": compiled,
                 "observation_dim": observation_dim,
                 "action_dim": action_dim,
+                "bc_checkpoint": str(args.bc_checkpoint) if args.bc_checkpoint else None,
+                "bc_metadata": bc_metadata,
             }
         )
         return None, agent, replay_buffer, device_info
@@ -298,6 +330,18 @@ def train_online(
     on_fps: Callable[[int, int], None] | None = None,
 ) -> tuple[Any, dict[str, float]]:
     if getattr(agent, "backend", "") == "droq":
+        if getattr(env, "batched", False):
+            return _train_online_droq_batched(
+                args=args,
+                env=env,
+                agent=agent,
+                replay_buffer=replay_buffer,
+                eval_env=eval_env,
+                on_episode_end=on_episode_end,
+                on_train_metrics=on_train_metrics,
+                on_eval=on_eval,
+                on_fps=on_fps,
+            )
         return _train_online_droq(
             args=args,
             env=env,
@@ -454,8 +498,94 @@ def _train_online_droq(
     }
 
 
+def _train_online_droq_batched(
+    *,
+    args: TrainArgs,
+    env: Any,
+    agent: DroQAgent,
+    replay_buffer: NStepReplayBuffer,
+    eval_env: Any | None = None,
+    on_episode_end: Callable[[int, dict[str, float]], None] | None = None,
+    on_train_metrics: Callable[[int, dict[str, float]], None] | None = None,
+    on_eval: Callable[[int, dict[str, Any]], None] | None = None,
+    on_fps: Callable[[int, int], None] | None = None,
+) -> tuple[DroQAgent, dict[str, float]]:
+    observation_batch = np.asarray(env.reset(), dtype=np.float32)
+    start_time = time.time()
+    total_steps = 0
+    metrics: dict[str, float] = {}
+    batch_size = int(observation_batch.shape[0])
+
+    while total_steps < args.max_steps:
+        normalized_batch = agent.prepare_observation_batch(observation_batch)
+        if total_steps < args.warmstart_steps:
+            action_batch = _sample_random_actions_batch(env, batch_size)
+        else:
+            _, action_batch = agent.sample_actions_batch(observation_batch)
+
+        next_observation_batch, reward_batch, done_batch = env.step(action_batch)
+        next_observation_batch = np.asarray(next_observation_batch, dtype=np.float32)
+        reward_batch = np.asarray(reward_batch, dtype=np.float32).reshape(-1)
+        done_batch = np.asarray(done_batch, dtype=np.float32).reshape(-1)
+
+        remaining_steps = max(args.max_steps - total_steps, 0)
+        processed_steps = min(batch_size, remaining_steps)
+        for index in range(processed_steps):
+            reward = float(reward_batch[index])
+            agent.update_normalizers(observation_batch[index], reward)
+            replay_buffer.add(
+                normalized_batch[index],
+                np.asarray(action_batch[index], dtype=np.float32),
+                agent.normalize_reward(reward),
+                agent.prepare_observation(next_observation_batch[index]),
+                float(done_batch[index]),
+            )
+        total_steps += processed_steps
+        observation_batch = next_observation_batch
+
+        if total_steps >= args.warmstart_steps and replay_buffer.is_ready():
+            update_count = processed_steps * max(args.utd_ratio, 1)
+            for _ in range(update_count):
+                transitions = replay_buffer.sample()
+                agent, metrics = agent.update(transitions)
+            if total_steps % args.log_interval == 0 and on_train_metrics is not None:
+                on_train_metrics(total_steps, dict(metrics))
+
+        if bool(done_batch[:processed_steps].all()):
+            if on_episode_end is not None:
+                on_episode_end(
+                    total_steps,
+                    {
+                        "episode_return": float(np.mean(reward_batch[:processed_steps])),
+                        "episode_length": float(getattr(env, "_episode_horizon", processed_steps)),
+                    },
+                )
+            observation_batch = np.asarray(env.reset(), dtype=np.float32)
+
+        if eval_env is not None and args.eval_interval > 0 and total_steps % args.eval_interval < processed_steps:
+            eval_payload = run_eval_episodes(agent, eval_env, max(args.eval_episodes, 1))
+            if on_eval is not None:
+                on_eval(total_steps, eval_payload)
+
+        if total_steps % args.log_interval < processed_steps and on_fps is not None:
+            elapsed = max(time.time() - start_time, 1e-6)
+            on_fps(total_steps, int(total_steps / elapsed))
+
+    elapsed_s = time.time() - start_time
+    return agent, {
+        "steps": float(total_steps),
+        "elapsed_s": float(elapsed_s),
+        "fps": float(total_steps / max(elapsed_s, 1e-6)),
+    }
+
+
 def _infer_env_dims(env: Any, timestep: Any) -> tuple[int, int]:
-    observation_dim = int(_to_numpy_observation(timestep.observation).size)
+    observation = timestep.observation if hasattr(timestep, "observation") else timestep
+    observation_array = np.asarray(observation, dtype=np.float32)
+    if getattr(env, "batched", False) and observation_array.ndim > 1:
+        observation_dim = int(observation_array.shape[-1])
+    else:
+        observation_dim = int(_to_numpy_observation(observation).size)
     action_spec = env.action_spec()
     action_dim = int(np.prod(action_spec.shape))
     return observation_dim, action_dim
@@ -464,6 +594,13 @@ def _infer_env_dims(env: Any, timestep: Any) -> tuple[int, int]:
 def _sample_random_action(env: Any) -> np.ndarray:
     action_spec = env.action_spec()
     return np.random.uniform(action_spec.minimum, action_spec.maximum, action_spec.shape).astype(np.float32)
+
+
+def _sample_random_actions_batch(env: Any, batch_size: int) -> np.ndarray:
+    action_spec = env.action_spec()
+    return np.random.uniform(action_spec.minimum, action_spec.maximum, size=(batch_size, *action_spec.shape)).astype(
+        np.float32
+    )
 
 
 def _to_numpy_observation(observation: Any) -> np.ndarray:

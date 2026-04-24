@@ -297,8 +297,14 @@ class DroQAgent:
         action = self._act(self.prepare_observation(observation), deterministic=False)
         return self, action
 
+    def sample_actions_batch(self, observations: np.ndarray) -> tuple[DroQAgent, np.ndarray]:
+        return self, self._act_batch(self.prepare_observation_batch(observations), deterministic=False)
+
     def eval_actions(self, observation: np.ndarray) -> np.ndarray:
         return self._act(self.prepare_observation(observation), deterministic=True)
+
+    def eval_actions_batch(self, observations: np.ndarray) -> np.ndarray:
+        return self._act_batch(self.prepare_observation_batch(observations), deterministic=True)
 
     def update(self, transitions: tuple[torch.Tensor, ...]) -> tuple[DroQAgent, dict[str, float]]:
         observations, actions, rewards, next_observations, dones, effective_gammas = transitions
@@ -360,5 +366,23 @@ class DroQAgent:
                 action, _ = self.actor.sample(observation_tensor)
         return action.squeeze(0).cpu().numpy().astype(np.float32)
 
+    def _act_batch(self, observations: np.ndarray, *, deterministic: bool) -> np.ndarray:
+        with torch.no_grad():
+            observation_tensor = torch.as_tensor(observations, dtype=torch.float32, device=self.device)
+            if deterministic:
+                mean, _ = self.actor(observation_tensor)
+                action = torch.tanh(mean)
+            else:
+                action, _ = self.actor.sample(observation_tensor)
+        return action.cpu().numpy().astype(np.float32)
+
     def _alpha_tensor(self) -> torch.Tensor:
         return self.log_alpha.exp().clamp(min=self.min_alpha)
+
+    def prepare_observation_batch(self, observations: np.ndarray) -> np.ndarray:
+        array = np.asarray(observations, dtype=np.float32)
+        if array.ndim == 1:
+            return self.prepare_observation(array)
+        if self.observation_normalizer is None or self.observation_normalizer.count <= self.normalizer_warmup_steps:
+            return array
+        return np.stack([self.observation_normalizer.normalize(observation) for observation in array], axis=0)
