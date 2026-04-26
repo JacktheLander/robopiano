@@ -95,12 +95,25 @@ class SegmentRecord:
     chunk_path: str
     chunk_index: int
     heuristic_family: str
+    coarse_family: str
     motion_energy: float
     chord_size: int
     key_center: float
     start_state_norm: float
     end_state_norm: float
     score_context_json: str
+    proposal_size: int = 1
+    proposal_span_steps: int = 0
+    boundary_energy: float = 0.0
+    boundary_alignment_score: float = 0.0
+    duplicate_iou: float = 0.0
+    merge_count: int = 0
+    split_count: int = 0
+    target_key_count: int = 0
+    target_key_signature: str = ""
+    target_onset_step: int = -1
+    next_onset_gap_steps: int = -1
+    truncated_by_next_onset: bool = False
     raw_chunk_path: str = ""
     raw_chunk_index: int = -1
     gmr_target_name: str = ""

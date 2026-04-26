@@ -2,25 +2,47 @@ output_root: ../../outputs/primitives/full
 data_output_root: ../../outputs/data/full
 data_manifest_name: dataset_manifest
 experiment_name: Sonata-3-full-primitives
+
 wandb:
   enabled: true
   project: robopianist
   entity: tnguyen31-santa-clara-university
   mode: online
   tags: ["sonata", "primitives", "full"]
+
 seed: 7
+gmm_seed: 7
 force: false
-segmentation_strategy: dtw_assisted
+
+# Segmentation
+segmenter_name: keyset_onset
+segmentation_strategy: keyset_onset
 window_steps: 24
 stride_steps: 12
-pre_steps: 6
-post_steps: 12
+pre_steps: 2
+post_steps: 6
+segment_press_pre_steps: 2
+segment_press_post_steps: 6
+segment_truncate_at_next_onset: true
 min_gap_steps: 8
 velocity_quantile: 0.85
 acceleration_quantile: 0.85
 alignment_radius: 6
 dtw_template_window: 24
 chord_tolerance_steps: 1
+segment_grouping_window: 4
+segment_group_max_events: 8
+segment_group_max_span_steps: 40
+segment_group_key_center_tolerance: 0.12
+segment_repeat_window_steps: 12
+segment_boundary_refine_radius: 6
+segment_merge_enabled: true
+segment_split_enabled: true
+segment_duplicate_iou_threshold: 0.88
+segment_min_len: 4
+segment_max_len: 12
+segment_log_interval_episodes: 32
+
 segment_chunk_size: 1024
 online_segment_processing: true
 save_raw_segment_chunks: false
@@ -33,22 +55,78 @@ slim_cache_dir: slim
 slim_feature_dir: features
 slim_gmr_target_dir: gmr_targets
 slim_index_dir: index
+
+# Features / targets
 trajectory_resample_steps: 24
 include_action_trajectory: true
 fallback_action_dim: 39
+relative_wrist_frame: true
+relative_key_center_frame: true
+hand_specific_normalization: true
+
+# Clustering
 pca_components: 160
-gmm_k_candidates: [24, 32, 48, 64]
+family_aware_clustering: true
+gmm_k_candidates: [20, 28, 36, 48, 64]
+gmm_k_candidates_by_family:
+  single_press: [12, 16, 20]
+  dyad_press: [8, 12]
+  triad_press: [6, 8]
+  chord_press: [4, 6]
+  default: [8, 12]
+gmm_use_staged_k_search: true
+gmm_k_screen_subset_size: 8192
+gmm_top_k_full_fits: 3
 model_selection_metric: bic
 gmm_covariance_type: full
+gmm_candidate_covariance_types: [full, tied, diag]
 gmm_reg_covar: 0.0001
+gmm_n_init: 6
+gmm_screen_max_iter: 32
 silhouette_max_examples: 4096
+
+# GMR
 gmr_resample_steps: 32
 gmr_horizon: 32
 gmr_components: 8
+adaptive_gmr_components: true
+gmr_component_candidates: [3, 5, 8]
+gmr_min_samples_per_component: 4
 gmr_reg_covar: 0.0001
 gmr_target_actions: true
+gmr_strike_weight: 2.5
+primitive_split_merge_refinement: true
+primitive_split_error_improvement: 0.90
+primitive_merge_distance_threshold: 0.02
+
 num_duration_buckets: 8
 num_dynamics_buckets: 8
 min_segments_per_primitive: 12
-segment_num_workers: 0
-feature_num_workers: 0
+
+# Parallel / GPU
+use_process_pool: true
+process_start_method: spawn
+segment_num_workers: 16
+feature_num_workers: 8
+gpu_acceleration: true
+gpu_backend_preference: [rapids, cupy, torch]
+gpu_subsample_limit: 32768
+
+# Online evaluation / early stop
+enable_stage1_online_eval: true
+stage1_eval_interval_segments: 4096
+stage1_eval_interval_primitives: 8
+stage1_eval_subsample_size: 2048
+stage1_warn_only: true
+stage1_early_stop_enabled: false
+stage1_min_segments_before_stop_check: 2048
+stage1_max_short_segment_frac: 0.35
+stage1_max_low_confidence_frac: 0.45
+stage1_max_low_quality_primitive_frac: 0.40
+stage1_min_family_entropy: 0.80
+stage1_max_segments_per_score_onset: 1.5
+stage1_max_p95_segment_duration_steps: 12
+stage1_max_weighted_recon_error: 5.0
+stage1_assignment_confidence_threshold: 0.55
+stage1_duplicate_primitive_distance: 0.02
+stage1_patience_windows: 3

@@ -23,6 +23,7 @@ from sonata.transformer.dataset import (
     load_transformer_inputs,
     planner_collate_fn,
 )
+from sonata.transformer.decode import decode_factored_outputs, mask_logits_to_family, scale_logits
 from sonata.transformer.model import (
     FACTORED_PLANNER_ARCHITECTURE,
     PrimitivePlannerTransformer,
@@ -589,18 +590,17 @@ def evaluate(
         if model_type == "direct_transformer_action":
             continue
 
-        scaled_family_logits = scale_logits(torch.nan_to_num(outputs["family_logits"]), eval_temperature)
-        predicted_family = scaled_family_logits.argmax(dim=-1)
-        masked_primitive_logits = mask_logits_to_family(
-            scale_logits(torch.nan_to_num(outputs["primitive_logits"]), eval_temperature),
-            predicted_family,
-            loss_config["family_primitive_mask"],
+        decoded = decode_factored_outputs(
+            outputs,
+            family_mask=loss_config["family_primitive_mask"],
+            temperature=eval_temperature,
         )
-        predicted_primitive = masked_primitive_logits.argmax(dim=-1)
-        scaled_duration_logits = scale_logits(torch.nan_to_num(outputs["duration_logits"]), eval_temperature)
-        scaled_dynamics_logits = scale_logits(torch.nan_to_num(outputs["dynamics_logits"]), eval_temperature)
-        predicted_duration = scaled_duration_logits.argmax(dim=-1)
-        predicted_dynamics = scaled_dynamics_logits.argmax(dim=-1)
+        scaled_family_logits = decoded["scaled_family_logits"]
+        masked_primitive_logits = decoded["masked_primitive_logits"]
+        predicted_family = decoded["predicted_family"]
+        predicted_primitive = decoded["predicted_primitive"]
+        predicted_duration = decoded["predicted_duration"]
+        predicted_dynamics = decoded["predicted_dynamics"]
 
         family_truth.extend(batch["target_family"].tolist())
         family_pred.extend(predicted_family.tolist())
@@ -800,18 +800,6 @@ def classification_loss(
     if class_weights is not None:
         sample_loss = sample_loss * class_weights[targets]
     return sample_loss.mean()
-
-
-def mask_logits_to_family(logits: torch.Tensor, family_index: torch.Tensor, family_mask: torch.Tensor) -> torch.Tensor:
-    mask = family_mask[family_index]
-    fill_value = -1.0e4
-    return logits.masked_fill(~mask, fill_value)
-
-
-def scale_logits(logits: torch.Tensor, temperature: float) -> torch.Tensor:
-    if temperature == 1.0:
-        return logits
-    return logits / max(float(temperature), 1e-6)
 
 
 def topk_accuracy(logits: torch.Tensor, target: torch.Tensor, topk: int) -> float:

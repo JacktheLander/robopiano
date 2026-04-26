@@ -131,7 +131,7 @@ class PrimitivePlannerTransformer(nn.Module):
         )
         self.register_buffer("family_primitive_mask", family_mask_tensor(mask_metadata), persistent=False)
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def _encode_history(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         primitive = batch["primitive_history"]
         family = batch["family_history"]
         duration = batch["duration_history"]
@@ -165,6 +165,76 @@ class PrimitivePlannerTransformer(nn.Module):
         pooled_hidden = masked_mean(encoded, attention_mask)
         goal_hidden = self.goal_context_proj(goal_context)
         planner_state = self.summary_fusion(torch.cat([final_hidden, pooled_hidden, goal_hidden], dim=-1))
+        return planner_state, goal_hidden, attention_mask
+
+    def build_plan_embedding(
+        self,
+        *,
+        planner_state: torch.Tensor,
+        goal_hidden: torch.Tensor,
+        family_index: torch.Tensor | None = None,
+        primitive_index: torch.Tensor | None = None,
+        duration_bucket: torch.Tensor | None = None,
+        dynamics_bucket: torch.Tensor | None = None,
+        family_logits: torch.Tensor | None = None,
+        primitive_logits: torch.Tensor | None = None,
+        duration_logits: torch.Tensor | None = None,
+        dynamics_logits: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if family_index is None:
+            if family_logits is None:
+                raise ValueError("family_index or family_logits is required to build the plan embedding.")
+            family_probs = torch.softmax(family_logits, dim=-1)
+            family_intent = family_probs @ self.family_intent_embed.weight
+        else:
+            family_intent = self.family_intent_embed(family_index)
+
+        if primitive_index is None:
+            if primitive_logits is None:
+                raise ValueError("primitive_index or primitive_logits is required to build the plan embedding.")
+            primitive_probs = torch.softmax(primitive_logits, dim=-1)
+            primitive_intent = primitive_probs @ self.primitive_intent_embed.weight
+        else:
+            primitive_intent = self.primitive_intent_embed(primitive_index)
+
+        if duration_bucket is None:
+            if duration_logits is None:
+                raise ValueError("duration_bucket or duration_logits is required to build the plan embedding.")
+            duration_intent = torch.softmax(duration_logits, dim=-1) @ self.duration_intent_embed.weight
+        else:
+            duration_intent = self.duration_intent_embed(duration_bucket)
+
+        if dynamics_bucket is None:
+            if dynamics_logits is None:
+                raise ValueError("dynamics_bucket or dynamics_logits is required to build the plan embedding.")
+            dynamics_intent = torch.softmax(dynamics_logits, dim=-1) @ self.dynamics_intent_embed.weight
+        else:
+            dynamics_intent = self.dynamics_intent_embed(dynamics_bucket)
+
+        plan_embedding = self.plan_projection(
+            torch.cat(
+                [
+                    planner_state,
+                    goal_hidden,
+                    family_intent,
+                    primitive_intent,
+                    duration_intent,
+                    dynamics_intent,
+                ],
+                dim=-1,
+            )
+        )
+        return plan_embedding, {
+            "family_intent": family_intent,
+            "primitive_intent": primitive_intent,
+            "duration_intent": duration_intent,
+            "dynamics_intent": dynamics_intent,
+        }
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        planner_state, goal_hidden, _ = self._encode_history(batch)
+        batch_size = planner_state.shape[0]
+        device = planner_state.device
 
         family_logits = self.family_head(planner_state)
         family_probs = torch.softmax(family_logits, dim=-1)
@@ -180,25 +250,16 @@ class PrimitivePlannerTransformer(nn.Module):
         continuous_params = (
             self.continuous_param_head(planner_state)
             if self.continuous_param_head is not None
-            else torch.zeros((batch_size, 0), device=primitive.device, dtype=planner_state.dtype)
+            else torch.zeros((batch_size, 0), device=device, dtype=planner_state.dtype)
         )
 
-        primitive_probs = torch.softmax(primitive_logits, dim=-1)
-        primitive_intent = primitive_probs @ self.primitive_intent_embed.weight
-        duration_intent = torch.softmax(duration_logits, dim=-1) @ self.duration_intent_embed.weight
-        dynamics_intent = torch.softmax(dynamics_logits, dim=-1) @ self.dynamics_intent_embed.weight
-        plan_embedding = self.plan_projection(
-            torch.cat(
-                [
-                    planner_state,
-                    goal_hidden,
-                    family_intent,
-                    primitive_intent,
-                    duration_intent,
-                    dynamics_intent,
-                ],
-                dim=-1,
-            )
+        plan_embedding, intents = self.build_plan_embedding(
+            planner_state=planner_state,
+            goal_hidden=goal_hidden,
+            family_logits=family_logits,
+            primitive_logits=primitive_logits,
+            duration_logits=duration_logits,
+            dynamics_logits=dynamics_logits,
         )
 
         return {
@@ -210,6 +271,49 @@ class PrimitivePlannerTransformer(nn.Module):
             "planner_state": planner_state,
             "goal_context_hidden": goal_hidden,
             "plan_embedding": plan_embedding,
+            **intents,
+        }
+
+    def oracle_plan_embedding(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        family_index: torch.Tensor,
+        primitive_index: torch.Tensor,
+        duration_bucket: torch.Tensor,
+        dynamics_bucket: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        planner_state, goal_hidden, _ = self._encode_history(batch)
+        family_logits = self.family_head(planner_state)
+        primitive_state = self.primitive_fusion(torch.cat([planner_state, self.family_intent_embed(family_index)], dim=-1))
+        primitive_logits = self.primitive_head(primitive_state)
+        family_mask = self.family_primitive_mask[family_index]
+        primitive_logits = primitive_logits.masked_fill(~family_mask, -1.0e4)
+        duration_logits = self.duration_head(planner_state)
+        dynamics_logits = self.dynamics_head(planner_state)
+        continuous_params = (
+            self.continuous_param_head(planner_state)
+            if self.continuous_param_head is not None
+            else torch.zeros((planner_state.shape[0], 0), device=planner_state.device, dtype=planner_state.dtype)
+        )
+        plan_embedding, intents = self.build_plan_embedding(
+            planner_state=planner_state,
+            goal_hidden=goal_hidden,
+            family_index=family_index,
+            primitive_index=primitive_index,
+            duration_bucket=duration_bucket,
+            dynamics_bucket=dynamics_bucket,
+        )
+        return {
+            "family_logits": family_logits,
+            "primitive_logits": primitive_logits,
+            "duration_logits": duration_logits,
+            "dynamics_logits": dynamics_logits,
+            "continuous_param_pred": continuous_params,
+            "planner_state": planner_state,
+            "goal_context_hidden": goal_hidden,
+            "plan_embedding": plan_embedding,
+            **intents,
         }
 
 

@@ -17,6 +17,7 @@ from sonata.evaluation.offline import resample_prediction
 from sonata.evaluation.rollout import (
     _build_video_caption,
     _collect_musical_metrics,
+    _find_piano_midi_events,
     _relative_output_path,
     _render_frame,
     _safe_close,
@@ -24,7 +25,9 @@ from sonata.evaluation.rollout import (
     _summarize_rollout_results,
     _write_rollout_video,
 )
+from sonata.evaluation.task_config import build_rollout_task_kwargs, validate_rollout_action_dim
 from sonata.models.pipeline import Sonata3Pipeline
+from sonata.transformer.decode import decode_factored_outputs
 from sonata.transformer.dataset import build_goal_context, build_history_context, planner_collate_fn
 from sonata.utils.io import write_json, write_table
 from sonata.utils.robopianist import ensure_local_robopianist_on_path, format_robopianist_import_error
@@ -107,6 +110,15 @@ def evaluate_external_midi_benchmark(
         continuous_param_names=pipeline.config.get("continuous_param_names"),
     )
     reference = compute_external_reference_stats(token_df)
+    expected_hand_joint_dim = (
+        int(metadata.state_dim // state_context_steps)
+        if int(state_context_steps) > 0 and int(metadata.state_dim) % int(state_context_steps) == 0
+        else None
+    )
+    rollout_task_kwargs = build_rollout_task_kwargs(
+        control_timestep=float(manifest_df.iloc[0].control_timestep),
+        expected_action_dim=int(metadata.action_dim),
+    )
 
     videos_root = output_root / "videos"
     frames_tmp_root = output_root / "frames_tmp"
@@ -167,12 +179,17 @@ def evaluate_external_midi_benchmark(
                     environment_name=environment_name,
                     midi_file=note_path,
                     seed=0,
-                    task_kwargs={"control_timestep": float(row.control_timestep), "n_steps_lookahead": 1},
+                    task_kwargs=rollout_task_kwargs | {"control_timestep": float(row.control_timestep)},
                 ),
                 deque_size=1,
             )
             timestep = env.reset()
             action_dim = int(env.action_spec().shape[0])
+            validate_rollout_action_dim(
+                actual_action_dim=action_dim,
+                expected_action_dim=int(metadata.action_dim),
+                environment_name=environment_name,
+            )
             base_rows = build_external_segment_rows(
                 events=events,
                 song_id=str(row.song_id),
@@ -192,7 +209,7 @@ def evaluate_external_midi_benchmark(
                 except Exception as exc:
                     render_error = str(exc)
                     logger.warning("Initial render failed for external MIDI episode `%s`: %s", row.episode_id, exc)
-            hand_history = [extract_hand_joints(timestep.observation)]
+            hand_history = [extract_hand_joints(timestep.observation, expected_dim=expected_hand_joint_dim)]
             predicted_history: list[dict[str, Any]] = []
             segments_executed = 0
             for segment_index, template_row in enumerate(base_rows):
@@ -260,7 +277,7 @@ def evaluate_external_midi_benchmark(
                     timestep = env.step(control)
                     total_reward += float(timestep.reward or 0.0)
                     actions_executed += 1
-                    latest_joint = extract_hand_joints(timestep.observation)
+                    latest_joint = extract_hand_joints(timestep.observation, expected_dim=expected_hand_joint_dim)
                     hand_history.append(latest_joint)
                     segment_joint_trace.append(latest_joint)
                     if should_render and render_error is None:
@@ -277,6 +294,15 @@ def evaluate_external_midi_benchmark(
                 current_row["primitive_family"] = metadata.primitive_family_names[int(predicted_tokens["family_index"])]
                 current_row["duration_bucket"] = int(predicted_tokens["duration_bucket"])
                 current_row["dynamics_bucket"] = int(predicted_tokens["dynamics_bucket"])
+                current_row["predicted_family_index"] = int(predicted_tokens["family_index"])
+                current_row["predicted_family"] = metadata.primitive_family_names[int(predicted_tokens["family_index"])]
+                current_row["predicted_primitive_index"] = int(predicted_tokens["primitive_index"])
+                current_row["predicted_primitive_id"] = primitive_id
+                current_row["predicted_duration_bucket"] = int(predicted_tokens["duration_bucket"])
+                current_row["predicted_dynamics_bucket"] = int(predicted_tokens["dynamics_bucket"])
+                current_row["raw_predicted_primitive_index"] = int(predicted_tokens["raw_primitive_index"])
+                current_row["raw_predicted_primitive_id"] = str(metadata.primitive_ids[int(predicted_tokens["raw_primitive_index"])])
+                current_row["decode_valid_under_family_mask"] = bool(predicted_tokens["decode_valid_under_family_mask"])
                 current_row["end_state_norm"] = float(np.linalg.norm(hand_history[-1]))
                 current_row["motion_energy"] = compute_motion_energy(
                     np.stack(segment_joint_trace, axis=0),
@@ -300,11 +326,13 @@ def evaluate_external_midi_benchmark(
                 rendered_episodes += 1
                 if render_error is None:
                     try:
+                        audio_events = _find_piano_midi_events(env)
                         video_path, video_format, video_warning = _write_rollout_video(
                             frames=frames,
                             output_path=videos_root / f"{_safe_filename(str(row.song_id))}_{_safe_filename(str(row.episode_id))}.mp4",
                             fps=video_fps,
                             temp_root=frames_tmp_root,
+                            audio_events=audio_events,
                         )
                     except Exception as exc:
                         render_error = str(exc)
@@ -563,26 +591,38 @@ def predict_external_tokens(
             "primitive_index": int(reference.seed_primitive_index),
             "duration_bucket": int(reference.seed_duration_bucket),
             "dynamics_bucket": int(reference.seed_dynamics_bucket),
+            "raw_primitive_index": int(reference.seed_primitive_index),
+            "decode_valid_under_family_mask": True,
         }
     with torch.no_grad():
         outputs = pipeline.planner(planner_batch)
-    family_index = int(torch.argmax(outputs["family_logits"], dim=-1).item())
-    primitive_index = int(torch.argmax(outputs["primitive_logits"], dim=-1).item())
-    duration_bucket = int(torch.argmax(outputs["duration_logits"], dim=-1).item())
-    dynamics_bucket = int(torch.argmax(outputs["dynamics_logits"], dim=-1).item())
+    decoded = decode_factored_outputs(
+        outputs,
+        family_mask=pipeline.planner.family_primitive_mask,
+        temperature=1.0,
+    )
+    family_index = int(decoded["predicted_family"].item())
+    primitive_index = int(decoded["predicted_primitive"].item())
+    duration_bucket = int(decoded["predicted_duration"].item())
+    dynamics_bucket = int(decoded["predicted_dynamics"].item())
+    raw_primitive_index = int(decoded["raw_predicted_primitive"].item())
+    decode_valid_under_family_mask = bool(decoded["raw_decode_valid_under_family_mask"].item())
     family_index = int(np.clip(family_index, 0, metadata.num_families - 1))
     primitive_index = int(np.clip(primitive_index, 0, metadata.num_primitives - 1))
     duration_bucket = int(np.clip(duration_bucket, 0, metadata.num_duration_buckets - 1))
     dynamics_bucket = int(np.clip(dynamics_bucket, 0, metadata.num_dynamics_buckets - 1))
+    raw_primitive_index = int(np.clip(raw_primitive_index, 0, metadata.num_primitives - 1))
     return {
         "family_index": family_index,
         "primitive_index": primitive_index,
         "duration_bucket": duration_bucket,
         "dynamics_bucket": dynamics_bucket,
+        "raw_primitive_index": raw_primitive_index,
+        "decode_valid_under_family_mask": decode_valid_under_family_mask,
     }
 
 
-def extract_hand_joints(observation: dict[str, Any]) -> np.ndarray:
+def extract_hand_joints(observation: dict[str, Any], expected_dim: int | None = None) -> np.ndarray:
     if not isinstance(observation, dict):
         raise TypeError("RoboPianist observation must be a mapping to extract hand joints.")
     keys = [
@@ -594,10 +634,27 @@ def extract_hand_joints(observation: dict[str, Any]) -> np.ndarray:
         raise KeyError("No `*/joints_pos` observations were available to build state context.")
     preferred_order = ["rh_shadow_hand/joints_pos", "lh_shadow_hand/joints_pos"]
     ordered = [key for key in preferred_order if key in keys] + sorted(key for key in keys if key not in preferred_order)
-    return np.concatenate(
-        [np.asarray(observation[key], dtype=np.float32).reshape(-1) for key in ordered],
+    joint_vectors = [np.asarray(observation[key], dtype=np.float32).reshape(-1) for key in ordered]
+    concatenated = np.concatenate(
+        joint_vectors,
         axis=0,
     ).astype(np.float32)
+    if expected_dim is None or concatenated.shape[0] == int(expected_dim):
+        return concatenated
+    if int(expected_dim) <= 0:
+        raise ValueError(f"expected_dim must be positive when provided, got {expected_dim}.")
+    # Some RoboPianist forks expose extra hand qpos entries. Trim symmetrically per hand when possible.
+    if len(joint_vectors) == 2 and int(expected_dim) % 2 == 0:
+        per_hand = int(expected_dim) // 2
+        if all(vector.shape[0] >= per_hand for vector in joint_vectors):
+            return np.concatenate([vector[:per_hand] for vector in joint_vectors], axis=0).astype(np.float32)
+    if concatenated.shape[0] < int(expected_dim):
+        raise ValueError(
+            f"Observed hand joint vector has dim {concatenated.shape[0]}, smaller than expected {expected_dim}."
+        )
+    return concatenated[: int(expected_dim)].astype(np.float32)
+
+
 
 
 def build_state_context(*, hand_history: list[np.ndarray], state_context_steps: int) -> np.ndarray:

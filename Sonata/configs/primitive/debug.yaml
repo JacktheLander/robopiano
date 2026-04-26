@@ -10,11 +10,17 @@ wandb:
   tags: ["sonata", "primitives", "debug"]
 seed: 7
 force: false
-segmentation_strategy: note_aligned
+segmenter_name: keyset_onset
+segmentation_strategy: keyset_onset
 window_steps: 24
 stride_steps: 12
-pre_steps: 6
-post_steps: 10
+pre_steps: 2
+post_steps: 6
+segment_press_pre_steps: 2
+segment_press_post_steps: 6
+segment_truncate_at_next_onset: true
+segment_min_len: 4
+segment_max_len: 12
 min_gap_steps: 8
 velocity_quantile: 0.85
 acceleration_quantile: 0.85
@@ -38,6 +44,12 @@ include_action_trajectory: true
 fallback_action_dim: 39
 pca_components: 64
 gmm_k_candidates: [8, 12, 16]
+gmm_k_candidates_by_family:
+  single_press: [6, 8]
+  dyad_press: [4, 6]
+  triad_press: [3, 4]
+  chord_press: [2, 3]
+  default: [4, 6]
 model_selection_metric: bic
 gmm_covariance_type: full
 gmm_reg_covar: 0.0001
@@ -52,3 +64,5 @@ num_dynamics_buckets: 5
 min_segments_per_primitive: 4
 segment_num_workers: 0
 feature_num_workers: 0
+stage1_max_segments_per_score_onset: 1.5
+stage1_max_p95_segment_duration_steps: 12
