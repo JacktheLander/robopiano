@@ -27,6 +27,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from sonata.evaluation.offline import evaluate_offline_pipeline
+from sonata.evaluation.attribution import evaluate_failure_attribution
 from sonata.evaluation.rollout import evaluate_dm_control_rollout, evaluate_mjx_physics
 from sonata.utils.logging import configure_logging
 from sonata.utils.wandb import add_wandb_arguments, apply_wandb_cli_overrides
@@ -42,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--diffusion-checkpoint", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--variant", default=None)
+    parser.add_argument("--diagnostic", choices=["standard", "attribution"], default="standard")
     parser.add_argument("--backend", choices=["offline", "dm_control", "mjx_physics"], default="offline")
     parser.add_argument("--xml-path", default=None)
     parser.add_argument("--device", default="cpu")
@@ -50,6 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-height", type=int, default=480)
     parser.add_argument("--video-width", type=int, default=640)
     parser.add_argument("--max-render-episodes", type=int, default=None)
+    parser.add_argument("--rollout-sample-size", type=int, default=32)
+    parser.add_argument("--bootstrap-samples", type=int, default=1000)
+    parser.add_argument("--sample-seed", type=int, default=7)
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--log-level", default="INFO")
     add_wandb_arguments(parser)
@@ -73,27 +78,49 @@ def main() -> None:
             "output_root": str(output_root),
             "backend": args.backend,
             "variant": args.variant,
+            "diagnostic": args.diagnostic,
             "device": args.device,
             "render_video": bool(args.render_video),
             "video_fps": int(args.video_fps),
             "video_height": int(args.video_height),
             "video_width": int(args.video_width),
             "max_render_episodes": args.max_render_episodes,
+            "rollout_sample_size": int(args.rollout_sample_size),
+            "bootstrap_samples": int(args.bootstrap_samples),
+            "sample_seed": int(args.sample_seed),
         },
         logger=logger,
         group=args.wandb_group,
         tags=["evaluation", args.backend],
     )
-    offline = evaluate_offline_pipeline(
-        primitive_root=primitive_root,
-        diffusion_checkpoint=diffusion_checkpoint,
-        output_root=output_root / "offline",
-        variant=args.variant,
-        device=args.device,
-    )
-    logger.info("Offline metrics: %s", offline["metrics"])
-    log_prefixed_metrics(wandb_run, offline["metrics"], prefix="offline", summary=True)
     try:
+        if args.diagnostic == "attribution":
+            payload = evaluate_failure_attribution(
+                primitive_root=primitive_root,
+                diffusion_checkpoint=diffusion_checkpoint,
+                output_root=output_root / "attribution",
+                variant=args.variant,
+                device=args.device,
+                rollout_sample_size=args.rollout_sample_size,
+                bootstrap_samples=args.bootstrap_samples,
+                sample_seed=args.sample_seed,
+                wandb_run=wandb_run,
+                logger=logger,
+            )
+            logger.info("Attribution summary: %s", payload["summary"])
+            log_prefixed_metrics(wandb_run, payload["summary"], prefix="attribution", summary=True)
+            log_prefixed_metrics(wandb_run, {"backend": args.backend, "status": "completed"}, prefix="evaluation", summary=True)
+            return
+
+        offline = evaluate_offline_pipeline(
+            primitive_root=primitive_root,
+            diffusion_checkpoint=diffusion_checkpoint,
+            output_root=output_root / "offline",
+            variant=args.variant,
+            device=args.device,
+        )
+        logger.info("Offline metrics: %s", offline["metrics"])
+        log_prefixed_metrics(wandb_run, offline["metrics"], prefix="offline", summary=True)
         if args.backend == "dm_control":
             rollout = evaluate_dm_control_rollout(
                 primitive_root=primitive_root,

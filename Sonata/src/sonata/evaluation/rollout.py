@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +14,10 @@ import pandas as pd
 
 from sonata.data.loading import build_manifest_lookup, load_stage1_source_manifest
 from sonata.evaluation.offline import stitch_segment_predictions
+from sonata.evaluation.task_config import build_rollout_task_kwargs, validate_rollout_action_dim
 from sonata.training.mjx_rollout import MJXRolloutBackend, mjx_availability
 from sonata.utils.io import write_json, write_table
+from sonata.utils.robopianist import ensure_local_robopianist_on_path, format_robopianist_import_error
 from sonata.utils.wandb_eval import log_prefixed_metrics, log_rollout_table, log_rollout_video
 
 LOGGER = logging.getLogger(__name__)
@@ -38,11 +41,12 @@ def evaluate_dm_control_rollout(
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
     logger = logger or LOGGER
+    ensure_local_robopianist_on_path()
     try:
         from robopianist import suite
         from robopianist.wrappers.evaluation import MidiEvaluationWrapper
     except Exception as exc:  # pragma: no cover
-        result = {"available": False, "error": str(exc)}
+        result = {"available": False, "error": format_robopianist_import_error(exc)}
         write_json(result, output_root / "dm_control_rollout.json")
         log_prefixed_metrics(wandb_run, result, prefix="rollout/dm_control", summary=True)
         return result
@@ -52,6 +56,10 @@ def evaluate_dm_control_rollout(
         if (primitive_root / "tokens" / "primitive_tokens.parquet").exists()
         else pd.read_csv(primitive_root / "tokens" / "primitive_tokens.csv")
     )
+    source_manifest = load_stage1_source_manifest(primitive_root)
+    action_series = pd.to_numeric(source_manifest.get("action_dim"), errors="coerce") if "action_dim" in source_manifest.columns else pd.Series(dtype=float)
+    expected_action_dim = int(action_series.dropna().iloc[0]) if not action_series.dropna().empty else int(stitch_segment_predictions(token_df, next(iter(predictions_by_episode.values()), []), 1).shape[-1])
+    rollout_task_kwargs = build_rollout_task_kwargs(control_timestep=0.05, expected_action_dim=expected_action_dim)
     manifest_lookup = _load_rollout_manifest_lookup(primitive_root=primitive_root, logger=logger)
     output_root.mkdir(parents=True, exist_ok=True)
     videos_root = output_root / "videos"
@@ -93,13 +101,18 @@ def evaluate_dm_control_rollout(
                     environment_name=source["environment_name"],
                     midi_file=source["midi_file"],
                     seed=0,
-                    task_kwargs={"control_timestep": 0.05, "n_steps_lookahead": 1},
+                    task_kwargs=rollout_task_kwargs,
                 ),
                 deque_size=1,
             )
             timestep = env.reset()
             total_reward = 0.0
             action_dim = int(env.action_spec().shape[0])
+            validate_rollout_action_dim(
+                actual_action_dim=action_dim,
+                expected_action_dim=expected_action_dim,
+                environment_name=source["environment_name"],
+            )
             frames: list[np.ndarray] = []
             render_error: str | None = None
             if should_render:
@@ -131,12 +144,14 @@ def evaluate_dm_control_rollout(
                 rendered_episodes += 1
                 if render_error is None:
                     try:
+                        audio_events = _find_piano_midi_events(env)
                         video_path, video_format, video_warning = _write_rollout_video(
                             frames=frames,
                             output_path=videos_root
                             / f"{_safe_filename(source['environment_name'])}_{_safe_filename(str(episode_id))}.mp4",
                             fps=video_fps,
                             temp_root=frames_tmp_root,
+                            audio_events=audio_events,
                         )
                     except Exception as exc:
                         render_error = str(exc)
@@ -351,11 +366,13 @@ def _write_rollout_video(
     output_path: Path,
     fps: int,
     temp_root: Path,
+    audio_events: list[Any] | None = None,
 ) -> tuple[Path, str, str | None]:
     if not frames:
         raise ValueError("No frames were captured for this rollout.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer_errors: list[str] = []
+    warning_parts: list[str] = []
     try:
         import imageio.v2 as imageio
 
@@ -367,13 +384,37 @@ def _write_rollout_video(
             quality=7,
             macro_block_size=None,
         )
-        return output_path, "mp4", None
+        if audio_events:
+            warning = _maybe_attach_rollout_audio(
+                video_path=output_path,
+                audio_events=audio_events,
+                temp_root=temp_root,
+            )
+            if warning:
+                warning_parts.append(warning)
+        return output_path, "mp4", " ".join(warning_parts) if warning_parts else None
     except Exception as exc:
         if output_path.exists():
             output_path.unlink(missing_ok=True)
         writer_errors.append(f"imageio MP4 export failed: {exc}")
     try:
-        return _write_video_with_ffmpeg(frames=frames, output_path=output_path, fps=fps, temp_root=temp_root)
+        video_path, video_format, warning = _write_video_with_ffmpeg(
+            frames=frames,
+            output_path=output_path,
+            fps=fps,
+            temp_root=temp_root,
+        )
+        if warning:
+            warning_parts.append(warning)
+        if audio_events:
+            warning = _maybe_attach_rollout_audio(
+                video_path=video_path,
+                audio_events=audio_events,
+                temp_root=temp_root,
+            )
+            if warning:
+                warning_parts.append(warning)
+        return video_path, video_format, " ".join(warning_parts) if warning_parts else None
     except Exception as exc:
         writer_errors.append(f"ffmpeg MP4 export failed: {exc}")
     try:
@@ -435,6 +476,135 @@ def _write_video_with_ffmpeg(
         if output_path.exists():
             output_path.unlink(missing_ok=True)
         raise
+
+
+def _find_piano_midi_events(env: Any) -> list[Any]:
+    for current in _iter_wrapped_envs(env):
+        task = getattr(current, "task", None)
+        piano = getattr(task, "piano", None)
+        midi_module = getattr(piano, "midi_module", None)
+        get_all = getattr(midi_module, "get_all_midi_messages", None)
+        if callable(get_all):
+            events = list(get_all())
+            if events:
+                return events
+    return []
+
+
+def _maybe_attach_rollout_audio(
+    *,
+    video_path: Path,
+    audio_events: list[Any],
+    temp_root: Path,
+) -> str | None:
+    if not audio_events:
+        return None
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        return "Audio mux skipped because `ffmpeg` was not found on PATH."
+    try:
+        from robopianist.music import synthesizer
+    except Exception as exc:
+        return f"Audio mux skipped because RoboPianist synthesizer import failed: {exc}"
+
+    soundfont_path = _default_soundfont_path()
+    if soundfont_path is None:
+        return "Audio mux skipped because no soundfont file was available."
+
+    temp_root.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"{video_path.stem}_audio_", dir=str(temp_root)))
+    wav_path = temp_dir / f"{video_path.stem}.wav"
+    temp_video_path = temp_dir / video_path.name
+    try:
+        synth = synthesizer.Synthesizer(soundfont_path=soundfont_path)
+        try:
+            waveform = synth.get_samples(_clone_midi_events(audio_events))
+        finally:
+            synth.stop()
+        _write_waveform(wav_path=wav_path, waveform=waveform)
+        shutil.copyfile(video_path, temp_video_path)
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(temp_video_path),
+            "-i",
+            str(wav_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(video_path),
+        ]
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        if completed.stderr:
+            LOGGER.debug("ffmpeg wrote rollout audio with stderr output: %s", completed.stderr.strip())
+        return None
+    except Exception as exc:
+        return f"Audio mux failed: {exc}"
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _default_soundfont_path() -> Path | None:
+    repo_root = Path(__file__).resolve().parents[4]
+    candidates = [
+        repo_root / "robopianist" / "soundfonts" / "SalamanderGrandPiano.sf2",
+        repo_root / "third_party" / "soundfonts" / "TimGM6mb.sf2",
+    ]
+    for candidate in candidates:
+        if _is_valid_soundfont(candidate):
+            return candidate
+    return None
+
+
+def _is_valid_soundfont(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        with path.open("rb") as handle:
+            return handle.read(4) == b"RIFF"
+    except OSError:
+        return False
+
+
+def _clone_midi_events(events: list[Any]) -> list[Any]:
+    cloned: list[Any] = []
+    for event in events:
+        note = getattr(event, "note", None)
+        velocity = getattr(event, "velocity", None)
+        value = getattr(event, "value", None)
+        control = getattr(event, "control", None)
+        time_value = float(getattr(event, "time"))
+        event_type = type(event).__name__
+        if note is not None and velocity is not None:
+            cloned.append(type(event)(note=int(note), velocity=int(velocity), time=time_value))
+        elif note is not None:
+            cloned.append(type(event)(note=int(note), time=time_value))
+        elif control is not None and value is not None:
+            try:
+                cloned.append(type(event)(time=time_value))
+            except TypeError:
+                cloned.append(type(event)(control=int(control), value=int(value), time=time_value))
+        else:
+            raise ValueError(f"Unsupported MIDI event type for audio synthesis: {event_type}")
+    return cloned
+
+
+def _write_waveform(*, wav_path: Path, waveform: np.ndarray, sample_rate: int = 44100) -> None:
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(wav_path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(np.asarray(waveform, dtype=np.int16).tobytes())
 
 
 def _write_gif_fallback(*, frames: list[np.ndarray], output_path: Path, fps: int) -> Path:

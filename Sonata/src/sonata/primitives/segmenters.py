@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +18,7 @@ from tqdm import tqdm
 from sonata.data.loading import load_episode_record
 from sonata.data.score import dumps_score_context, infer_events_from_goal_roll, load_note_events, score_context_from_roll
 from sonata.data.schema import ScoreEvent, SegmentRecord
+from sonata.primitives.parallel import iter_parallel_map, resolve_worker_count
 from sonata.primitives.slim_cache import (
     append_episode_progress,
     build_gmr_target,
@@ -56,6 +56,19 @@ class CandidateSegment:
     heuristic_family: str
     chord_size: int
     key_center: float
+    coarse_family: str = ""
+    proposal_size: int = 1
+    proposal_span_steps: int = 0
+    boundary_energy: float = 0.0
+    boundary_alignment_score: float = 0.0
+    duplicate_iou: float = 0.0
+    merge_count: int = 0
+    split_count: int = 0
+    target_key_count: int = 0
+    target_key_signature: str = ""
+    target_onset_step: int = -1
+    next_onset_gap_steps: int = -1
+    truncated_by_next_onset: bool = False
 
 
 @dataclass
@@ -65,7 +78,7 @@ class PreparedSegment:
     feature_names: list[str]
     gmr_target: np.ndarray
     gmr_target_name: str
-    arrays: dict[str, np.ndarray | None]
+    arrays: dict[str, np.ndarray | None] | None
     raw_bytes_estimate: int
 
 
@@ -75,10 +88,12 @@ class PreparedEpisodeBatch:
     episode_id: str
     score_rows: list[dict[str, Any]]
     prepared_segments: list[PreparedSegment]
+    stats: dict[str, Any]
 
 
 class BaseSegmenter:
     name = "base"
+    last_stats: dict[str, Any]
 
     def segment(self, episode, score_events: list[ScoreEvent]) -> list[CandidateSegment]:
         raise NotImplementedError
@@ -94,6 +109,7 @@ class FixedWindowSegmenter(BaseSegmenter):
     def segment(self, episode, score_events: list[ScoreEvent]) -> list[CandidateSegment]:
         del score_events
         if episode.hand_joints is None:
+            self.last_stats = {"proposed_segments": 0, "accepted_segments": 0}
             return []
         segments = []
         for start in range(0, max(episode.hand_joints.shape[0] - self.window_steps + 1, 1), self.stride_steps):
@@ -110,6 +126,7 @@ class FixedWindowSegmenter(BaseSegmenter):
                     key_center=0.0,
                 )
             )
+        self.last_stats = {"proposed_segments": len(segments), "accepted_segments": len(segments)}
         return segments
 
 
@@ -125,6 +142,7 @@ class ChangePointSegmenter(BaseSegmenter):
     def segment(self, episode, score_events: list[ScoreEvent]) -> list[CandidateSegment]:
         del score_events
         if episode.hand_joints is None:
+            self.last_stats = {"proposed_segments": 0, "accepted_segments": 0}
             return []
         velocity = np.gradient(np.asarray(episode.hand_joints, dtype=np.float32), axis=0)
         acceleration = np.gradient(velocity, axis=0)
@@ -156,6 +174,7 @@ class ChangePointSegmenter(BaseSegmenter):
                     key_center=0.0,
                 )
             )
+        self.last_stats = {"proposed_segments": len(segments), "accepted_segments": len(segments)}
         return segments
 
 
@@ -182,8 +201,12 @@ class NoteAlignedSegmenter(BaseSegmenter):
                     heuristic_family=family,
                     chord_size=event.chord_size,
                     key_center=event.key_center,
+                    coarse_family=_heuristic_to_coarse_family(family=family, chord_size=event.chord_size),
+                    proposal_size=1,
+                    proposal_span_steps=max(int(event.end_step) - int(event.onset_step), 1),
                 )
             )
+        self.last_stats = {"proposed_segments": len(segments), "accepted_segments": len(segments)}
         return segments
 
 
@@ -198,6 +221,7 @@ class DTWAssistedSegmenter(NoteAlignedSegmenter):
     def segment(self, episode, score_events: list[ScoreEvent]) -> list[CandidateSegment]:
         base_segments = super().segment(episode, score_events)
         if episode.hand_joints is None or not base_segments:
+            self.last_stats = {"proposed_segments": len(base_segments), "accepted_segments": len(base_segments)}
             return base_segments
         velocity = np.gradient(np.asarray(episode.hand_joints, dtype=np.float32), axis=0)
         magnitude = np.linalg.norm(velocity, axis=1)
@@ -237,8 +261,17 @@ class DTWAssistedSegmenter(NoteAlignedSegmenter):
                     heuristic_family=segment.heuristic_family,
                     chord_size=segment.chord_size,
                     key_center=segment.key_center,
+                    coarse_family=segment.coarse_family,
+                    proposal_size=segment.proposal_size,
+                    proposal_span_steps=segment.proposal_span_steps,
+                    boundary_energy=segment.boundary_energy,
+                    boundary_alignment_score=segment.boundary_alignment_score,
+                    duplicate_iou=segment.duplicate_iou,
+                    merge_count=segment.merge_count,
+                    split_count=segment.split_count,
                 )
             )
+        self.last_stats = {"proposed_segments": len(base_segments), "accepted_segments": len(aligned)}
         return aligned
 
 
@@ -262,8 +295,632 @@ def classify_interval_family(event: ScoreEvent) -> str:
     return "single"
 
 
+def _heuristic_to_coarse_family(*, family: str, chord_size: int) -> str:
+    if family == "chord":
+        return "chord_press"
+    if family == "stacked":
+        return "chord_press" if int(chord_size) > 1 else "repeat_press"
+    if family in {"changepoint", "window"}:
+        return "reposition"
+    return "single_press"
+
+
+def _coarse_to_heuristic_family(*, coarse_family: str, chord_size: int) -> str:
+    if coarse_family in {"dyad_press", "triad_press", "chord_press"}:
+        return "chord" if int(chord_size) >= 3 else "stacked"
+    if coarse_family in {"single_press", "repeat_press"}:
+        return "single"
+    if coarse_family == "reposition":
+        return "changepoint"
+    return "window"
+
+
+def _keyset_coarse_family(chord_size: int) -> str:
+    if int(chord_size) <= 1:
+        return "single_press"
+    if int(chord_size) == 2:
+        return "dyad_press"
+    if int(chord_size) == 3:
+        return "triad_press"
+    return "chord_press"
+
+
+class KeysetOnsetSegmenter(BaseSegmenter):
+    name = "keyset_onset"
+
+    def __init__(
+        self,
+        *,
+        pre_steps: int,
+        post_steps: int,
+        min_len: int,
+        max_len: int,
+        chord_tolerance_steps: int,
+        truncate_at_next_onset: bool,
+    ):
+        self.pre_steps = max(int(pre_steps), 0)
+        self.post_steps = max(int(post_steps), 1)
+        self.min_len = max(int(min_len), 1)
+        self.max_len = max(int(max_len), self.min_len)
+        self.chord_tolerance_steps = max(int(chord_tolerance_steps), 0)
+        self.truncate_at_next_onset = bool(truncate_at_next_onset)
+        self.last_stats = {"proposed_segments": 0, "accepted_segments": 0}
+
+    def segment(self, episode, score_events: list[ScoreEvent]) -> list[CandidateSegment]:
+        if episode.hand_joints is None or not score_events:
+            self.last_stats = {"proposed_segments": 0, "accepted_segments": 0}
+            return []
+        boundary_signal, _, _ = _build_boundary_signal(episode)
+        groups = self._build_onset_groups(score_events)
+        segments = [
+            self._candidate_from_group(
+                episode=episode,
+                group=group,
+                next_group=groups[index + 1] if index + 1 < len(groups) else None,
+                boundary_signal=boundary_signal,
+            )
+            for index, group in enumerate(groups)
+        ]
+        self.last_stats = {
+            "proposed_segments": int(len(groups)),
+            "accepted_segments": int(len(segments)),
+            "segments_per_score_onset": 1.0 if groups else 0.0,
+        }
+        return segments
+
+    def _build_onset_groups(self, score_events: list[ScoreEvent]) -> list[list[ScoreEvent]]:
+        groups: list[list[ScoreEvent]] = []
+        current: list[ScoreEvent] = []
+        current_onset = 0
+        for event in sorted(score_events, key=lambda item: (item.onset_step, item.end_step, item.event_id)):
+            if not current:
+                current = [event]
+                current_onset = int(event.onset_step)
+                continue
+            if abs(int(event.onset_step) - current_onset) <= self.chord_tolerance_steps:
+                current.append(event)
+            else:
+                groups.append(current)
+                current = [event]
+                current_onset = int(event.onset_step)
+        if current:
+            groups.append(current)
+        return groups
+
+    def _candidate_from_group(
+        self,
+        *,
+        episode,
+        group: list[ScoreEvent],
+        next_group: list[ScoreEvent] | None,
+        boundary_signal: np.ndarray,
+    ) -> CandidateSegment:
+        onset_step = int(min(event.onset_step for event in group))
+        next_onset = int(min(event.onset_step for event in next_group)) if next_group else None
+        start = max(onset_step - self.pre_steps, 0)
+        end_cap = min(onset_step + self.post_steps, episode.hand_joints.shape[0])
+        if self.truncate_at_next_onset and next_onset is not None:
+            end_cap = min(end_cap, max(next_onset, onset_step + 1))
+        end = min(max(start + self.min_len, end_cap), start + self.max_len, episode.hand_joints.shape[0])
+        if self.truncate_at_next_onset and next_onset is not None and end > next_onset:
+            end = max(min(next_onset, episode.hand_joints.shape[0]), onset_step + 1)
+            start = max(min(start, end - self.min_len), 0)
+        if end <= start:
+            end = min(start + 1, episode.hand_joints.shape[0])
+
+        unique_keys = sorted({int(key) for event in group for key in event.key_numbers})
+        key_signature = "-".join(str(key) for key in unique_keys) if unique_keys else "none"
+        chord_size = len(unique_keys)
+        boundary_index = int(np.clip(onset_step, 0, max(boundary_signal.shape[0] - 1, 0))) if boundary_signal.size else 0
+        boundary_energy = float(boundary_signal[boundary_index]) if boundary_signal.size else 0.0
+        next_gap = int(next_onset - onset_step) if next_onset is not None else -1
+        score_event_id = "|".join(str(event.event_id) for event in group)
+        coarse_family = _keyset_coarse_family(chord_size)
+        return CandidateSegment(
+            onset_step=int(start),
+            end_step=int(end),
+            segment_source=self.name,
+            score_event_id=score_event_id,
+            key_signature=key_signature,
+            heuristic_family=_coarse_to_heuristic_family(coarse_family=coarse_family, chord_size=chord_size),
+            chord_size=int(chord_size),
+            key_center=float(np.mean(unique_keys) / 87.0) if unique_keys else 0.0,
+            coarse_family=coarse_family,
+            proposal_size=len(group),
+            proposal_span_steps=max(int(max(event.end_step for event in group)) - onset_step, 1),
+            boundary_energy=boundary_energy,
+            boundary_alignment_score=boundary_energy,
+            target_key_count=int(chord_size),
+            target_key_signature=key_signature,
+            target_onset_step=int(onset_step),
+            next_onset_gap_steps=next_gap,
+            truncated_by_next_onset=bool(next_onset is not None and end_cap >= next_onset),
+        )
+
+
+class NoteGroupRefinedSegmenter(BaseSegmenter):
+    name = "note_group_refined"
+
+    def __init__(
+        self,
+        *,
+        pre_steps: int,
+        post_steps: int,
+        grouping_window: int,
+        boundary_refine_radius: int,
+        min_len: int,
+        max_len: int,
+        duplicate_iou_threshold: float,
+        merge_enabled: bool,
+        split_enabled: bool,
+        chord_tolerance_steps: int,
+        group_max_events: int,
+        group_max_span_steps: int,
+        key_center_tolerance: float,
+        repeat_window_steps: int,
+    ):
+        self.pre_steps = int(pre_steps)
+        self.post_steps = int(post_steps)
+        self.grouping_window = int(grouping_window)
+        self.boundary_refine_radius = int(boundary_refine_radius)
+        self.min_len = max(int(min_len), 2)
+        self.max_len = max(int(max_len), self.min_len + 1)
+        self.duplicate_iou_threshold = float(duplicate_iou_threshold)
+        self.merge_enabled = bool(merge_enabled)
+        self.split_enabled = bool(split_enabled)
+        self.chord_tolerance_steps = int(chord_tolerance_steps)
+        self.group_max_events = max(int(group_max_events), 1)
+        self.group_max_span_steps = max(int(group_max_span_steps), self.max_len)
+        self.key_center_tolerance = float(key_center_tolerance)
+        self.repeat_window_steps = max(int(repeat_window_steps), 1)
+        self.last_stats = {"proposed_segments": 0, "accepted_segments": 0}
+
+    def segment(self, episode, score_events: list[ScoreEvent]) -> list[CandidateSegment]:
+        if episode.hand_joints is None or not score_events:
+            self.last_stats = {"proposed_segments": 0, "accepted_segments": 0}
+            return []
+
+        boundary_signal, contact_roll, pedal_trace = _build_boundary_signal(episode)
+        groups = self._build_groups(score_events)
+        initial = [
+            self._candidate_from_group(
+                episode=episode,
+                group=group,
+                boundary_signal=boundary_signal,
+                contact_roll=contact_roll,
+                pedal_trace=pedal_trace,
+            )
+            for group in groups
+        ]
+        cleaned, cleanup_stats = self._cleanup_candidates(initial=initial, boundary_signal=boundary_signal)
+        self.last_stats = {
+            "proposed_segments": int(len(initial)),
+            "accepted_segments": int(len(cleaned)),
+            **cleanup_stats,
+        }
+        return cleaned
+
+    def _build_groups(self, score_events: list[ScoreEvent]) -> list[list[ScoreEvent]]:
+        groups: list[list[ScoreEvent]] = []
+        current: list[ScoreEvent] = []
+        current_keys: set[int] = set()
+        current_start = 0
+        current_end = 0
+        for event in sorted(score_events, key=lambda item: (item.onset_step, item.end_step, item.event_id)):
+            if not current:
+                current = [event]
+                current_keys = set(int(key) for key in event.key_numbers)
+                current_start = int(event.onset_step)
+                current_end = int(event.end_step)
+                continue
+            onset_gap = int(event.onset_step) - int(current[-1].onset_step)
+            span = int(event.end_step) - current_start
+            repeated_key = bool(current_keys.intersection(int(key) for key in event.key_numbers))
+            nearby_key = abs(float(event.key_center) - float(np.mean([item.key_center for item in current]))) <= self.key_center_tolerance
+            should_group = (
+                onset_gap <= self.grouping_window
+                and span <= self.group_max_span_steps
+                and len(current) < self.group_max_events
+                and (
+                    onset_gap <= self.chord_tolerance_steps
+                    or repeated_key
+                    or nearby_key
+                    or int(event.chord_size) > 1
+                    or any(int(item.chord_size) > 1 for item in current)
+                )
+            )
+            if should_group:
+                current.append(event)
+                current_keys.update(int(key) for key in event.key_numbers)
+                current_end = max(current_end, int(event.end_step))
+            else:
+                groups.append(current)
+                current = [event]
+                current_keys = set(int(key) for key in event.key_numbers)
+                current_start = int(event.onset_step)
+                current_end = int(event.end_step)
+        if current:
+            groups.append(current)
+        return groups
+
+    def _candidate_from_group(
+        self,
+        *,
+        episode,
+        group: list[ScoreEvent],
+        boundary_signal: np.ndarray,
+        contact_roll: np.ndarray,
+        pedal_trace: np.ndarray,
+    ) -> CandidateSegment:
+        first = group[0]
+        last = group[-1]
+        start = max(int(first.onset_step) - self.pre_steps, 0)
+        end = min(int(last.end_step) + self.post_steps, episode.hand_joints.shape[0])
+        start, end, boundary_energy, alignment_score = _refine_boundaries(
+            boundary_signal=boundary_signal,
+            start=start,
+            end=end,
+            radius=self.boundary_refine_radius,
+            min_len=self.min_len,
+        )
+        unique_keys = sorted({int(key) for event in group for key in event.key_numbers})
+        chord_size = len(unique_keys)
+        coarse_family = _infer_group_family(
+            group=group,
+            start=start,
+            end=end,
+            contact_roll=contact_roll,
+            pedal_trace=pedal_trace,
+            repeat_window_steps=self.repeat_window_steps,
+        )
+        score_event_id = first.event_id if len(group) == 1 else f"{first.event_id}|{last.event_id}"
+        key_signature = "-".join(str(key) for key in unique_keys) if unique_keys else "none"
+        return CandidateSegment(
+            onset_step=int(start),
+            end_step=int(end),
+            segment_source=self.name,
+            score_event_id=score_event_id,
+            key_signature=key_signature,
+            heuristic_family=_coarse_to_heuristic_family(coarse_family=coarse_family, chord_size=chord_size),
+            coarse_family=coarse_family,
+            chord_size=int(chord_size),
+            key_center=float(np.mean(unique_keys) / 87.0) if unique_keys else float(np.mean([event.key_center for event in group])),
+            proposal_size=len(group),
+            proposal_span_steps=max(int(last.end_step) - int(first.onset_step), 1),
+            boundary_energy=float(boundary_energy),
+            boundary_alignment_score=float(alignment_score),
+        )
+
+    def _cleanup_candidates(
+        self,
+        *,
+        initial: list[CandidateSegment],
+        boundary_signal: np.ndarray,
+    ) -> tuple[list[CandidateSegment], dict[str, Any]]:
+        ordered = sorted(initial, key=lambda item: (item.onset_step, item.end_step, item.score_event_id))
+        merged_segments = 0
+        split_segments = 0
+        duplicate_segments_dropped = 0
+        if self.merge_enabled:
+            merged: list[CandidateSegment] = []
+            for candidate in ordered:
+                if not merged:
+                    merged.append(candidate)
+                    continue
+                previous = merged[-1]
+                if _should_merge_candidates(previous=previous, current=candidate, boundary_signal=boundary_signal, max_len=self.max_len):
+                    merged[-1] = _merge_candidates(previous=previous, current=candidate)
+                    merged_segments += 1
+                else:
+                    merged.append(candidate)
+            ordered = merged
+        if self.split_enabled:
+            split_output: list[CandidateSegment] = []
+            for candidate in ordered:
+                parts = _split_candidate(candidate=candidate, boundary_signal=boundary_signal, min_len=self.min_len, max_len=self.max_len)
+                split_segments += max(len(parts) - 1, 0)
+                split_output.extend(parts)
+            ordered = split_output
+        deduped: list[CandidateSegment] = []
+        for candidate in sorted(ordered, key=lambda item: (item.onset_step, item.end_step, item.score_event_id)):
+            if not deduped:
+                deduped.append(candidate)
+                continue
+            previous = deduped[-1]
+            iou = _segment_iou(previous, candidate)
+            same_context = previous.coarse_family == candidate.coarse_family or previous.key_signature == candidate.key_signature
+            if same_context and iou >= self.duplicate_iou_threshold:
+                keep_current = float(candidate.boundary_alignment_score) >= float(previous.boundary_alignment_score)
+                survivor = candidate if keep_current else previous
+                survivor = CandidateSegment(
+                    onset_step=survivor.onset_step,
+                    end_step=survivor.end_step,
+                    segment_source=survivor.segment_source,
+                    score_event_id=survivor.score_event_id,
+                    key_signature=survivor.key_signature,
+                    heuristic_family=survivor.heuristic_family,
+                    chord_size=survivor.chord_size,
+                    key_center=survivor.key_center,
+                    coarse_family=survivor.coarse_family,
+                    proposal_size=survivor.proposal_size,
+                    proposal_span_steps=survivor.proposal_span_steps,
+                    boundary_energy=survivor.boundary_energy,
+                    boundary_alignment_score=survivor.boundary_alignment_score,
+                    duplicate_iou=max(float(previous.duplicate_iou), float(candidate.duplicate_iou), float(iou)),
+                    merge_count=survivor.merge_count,
+                    split_count=survivor.split_count,
+                    target_key_count=survivor.target_key_count,
+                    target_key_signature=survivor.target_key_signature,
+                    target_onset_step=survivor.target_onset_step,
+                    next_onset_gap_steps=survivor.next_onset_gap_steps,
+                    truncated_by_next_onset=survivor.truncated_by_next_onset,
+                )
+                deduped[-1] = survivor
+                duplicate_segments_dropped += 1
+            else:
+                deduped.append(candidate)
+        return deduped, {
+            "merged_segments": int(merged_segments),
+            "split_segments": int(split_segments),
+            "duplicate_segments_dropped": int(duplicate_segments_dropped),
+        }
+
+
+def _build_boundary_signal(episode) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    hand_joints = np.asarray(episode.hand_joints, dtype=np.float32)
+    contact_roll_source = episode.goals if episode.goals is not None else episode.piano_states
+    contact_roll = np.asarray(contact_roll_source[:, :88], dtype=np.float32) if contact_roll_source is not None else np.zeros((hand_joints.shape[0], 88), dtype=np.float32)
+    pedal_trace = np.asarray(contact_roll_source[:, 88:], dtype=np.float32) if contact_roll_source is not None and contact_roll_source.shape[1] > 88 else np.zeros((hand_joints.shape[0], 1), dtype=np.float32)
+
+    signal = _normalized_trace(np.linalg.norm(np.gradient(hand_joints, axis=0), axis=1))
+    signal += 0.35 * _normalized_trace(np.linalg.norm(np.gradient(np.gradient(hand_joints, axis=0), axis=0), axis=1))
+    if episode.actions is not None:
+        signal += 0.30 * _normalized_trace(_frame_delta_norm(np.asarray(episode.actions, dtype=np.float32)))
+    if episode.hand_fingertips is not None:
+        signal += 0.25 * _normalized_trace(np.linalg.norm(np.gradient(np.asarray(episode.hand_fingertips, dtype=np.float32), axis=0), axis=1))
+    if episode.wrist_pose is not None:
+        signal += 0.20 * _normalized_trace(_frame_delta_norm(np.asarray(episode.wrist_pose, dtype=np.float32)))
+    signal += 0.20 * _normalized_trace(_contact_transition_trace(contact_roll))
+    signal += 0.15 * _normalized_trace(_contact_transition_trace(pedal_trace))
+    return signal.astype(np.float32), contact_roll, pedal_trace
+
+
+def _frame_delta_norm(array: np.ndarray) -> np.ndarray:
+    if array.shape[0] <= 1:
+        return np.zeros((array.shape[0],), dtype=np.float32)
+    delta = np.diff(array, axis=0, prepend=array[:1])
+    return np.linalg.norm(delta, axis=1).astype(np.float32)
+
+
+def _normalized_trace(trace: np.ndarray) -> np.ndarray:
+    values = np.asarray(trace, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        return values
+    median = float(np.median(values))
+    scale = float(np.quantile(np.abs(values - median), 0.75)) + 1e-6
+    normalized = (values - median) / scale
+    normalized = np.clip(normalized, -4.0, 8.0)
+    normalized -= float(normalized.min())
+    maximum = float(normalized.max())
+    return normalized / maximum if maximum > 0 else np.zeros_like(normalized)
+
+
+def _contact_transition_trace(roll: np.ndarray) -> np.ndarray:
+    if roll.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    binary = np.asarray(roll > 0.5, dtype=np.float32)
+    delta = np.abs(np.diff(binary, axis=0, prepend=binary[:1]))
+    return delta.sum(axis=1).astype(np.float32) / max(binary.shape[1], 1)
+
+
+def _refine_boundaries(
+    *,
+    boundary_signal: np.ndarray,
+    start: int,
+    end: int,
+    radius: int,
+    min_len: int,
+) -> tuple[int, int, float, float]:
+    if boundary_signal.size == 0:
+        return int(start), int(end), 0.0, 0.0
+    best_start, start_score = _search_boundary(boundary_signal=boundary_signal, anchor=start, radius=radius, direction="start")
+    best_end, end_score = _search_boundary(boundary_signal=boundary_signal, anchor=end, radius=radius, direction="end")
+    if best_end - best_start < int(min_len):
+        best_end = min(max(best_start + int(min_len), end), boundary_signal.shape[0])
+    boundary_energy = float(np.mean(boundary_signal[[min(best_start, boundary_signal.shape[0] - 1), min(max(best_end - 1, 0), boundary_signal.shape[0] - 1)]]))
+    return int(best_start), int(best_end), boundary_energy, float((start_score + end_score) * 0.5)
+
+
+def _search_boundary(*, boundary_signal: np.ndarray, anchor: int, radius: int, direction: str) -> tuple[int, float]:
+    left = max(int(anchor) - int(radius), 0)
+    right = min(int(anchor) + int(radius), boundary_signal.shape[0] - 1)
+    best_index = int(np.clip(anchor, left, right))
+    best_score = float("-inf")
+    look = max(int(radius // 2), 1)
+    for candidate in range(left, right + 1):
+        current = float(boundary_signal[candidate])
+        if direction == "start":
+            future = boundary_signal[candidate : min(candidate + look + 1, boundary_signal.shape[0])]
+            past = boundary_signal[max(candidate - look, 0) : candidate + 1]
+        else:
+            future = boundary_signal[max(candidate - look, 0) : candidate + 1]
+            past = boundary_signal[candidate : min(candidate + look + 1, boundary_signal.shape[0])]
+        future_peak = float(np.max(future)) if future.size else current
+        past_mean = float(np.mean(past)) if past.size else current
+        score = future_peak - current - 0.25 * past_mean
+        if score > best_score:
+            best_score = score
+            best_index = candidate
+    return int(best_index), float(best_score if np.isfinite(best_score) else 0.0)
+
+
+def _infer_group_family(
+    *,
+    group: list[ScoreEvent],
+    start: int,
+    end: int,
+    contact_roll: np.ndarray,
+    pedal_trace: np.ndarray,
+    repeat_window_steps: int,
+) -> str:
+    unique_keys = sorted({int(key) for event in group for key in event.key_numbers})
+    chord_size = len(unique_keys)
+    onset_step = int(group[0].onset_step)
+    repeated_notes = len(unique_keys) < len(group)
+    pedal_delta = 0.0
+    if pedal_trace.size:
+        left = max(start - 1, 0)
+        right = min(max(end - 1, 0), pedal_trace.shape[0] - 1)
+        pedal_delta = float(np.abs(pedal_trace[right] - pedal_trace[left]).sum())
+    if pedal_delta > 0.2:
+        return "pedal_transition"
+    if chord_size >= 2:
+        return "chord_press"
+    if repeated_notes and (int(group[-1].onset_step) - onset_step) <= int(repeat_window_steps):
+        return "repeat_press"
+    if contact_roll.size:
+        before = contact_roll[max(onset_step - 1, 0)]
+        after = contact_roll[min(onset_step, contact_roll.shape[0] - 1)]
+        active_delta = float((after > 0.5).sum() - (before > 0.5).sum())
+        if active_delta < 0:
+            return "release"
+        if abs(active_delta) <= 0.0 and chord_size == 0:
+            return "reposition"
+    return "single_press" if chord_size <= 1 else "mixed_unknown"
+
+
+def _should_merge_candidates(
+    *,
+    previous: CandidateSegment,
+    current: CandidateSegment,
+    boundary_signal: np.ndarray,
+    max_len: int,
+) -> bool:
+    gap = int(current.onset_step) - int(previous.end_step)
+    merged_len = int(current.end_step) - int(previous.onset_step)
+    if merged_len > int(max_len):
+        return False
+    if gap > max(int(0.2 * max_len), 2):
+        return False
+    family_compatible = previous.coarse_family == current.coarse_family or previous.heuristic_family == current.heuristic_family
+    key_compatible = abs(float(previous.key_center) - float(current.key_center)) <= 0.08
+    if not (family_compatible and key_compatible):
+        return False
+    if boundary_signal.size == 0:
+        return True
+    boundary_index = min(max(previous.end_step, 0), boundary_signal.shape[0] - 1)
+    return float(boundary_signal[boundary_index]) <= float(np.quantile(boundary_signal, 0.55))
+
+
+def _merge_candidates(*, previous: CandidateSegment, current: CandidateSegment) -> CandidateSegment:
+    chord_size = max(int(previous.chord_size), int(current.chord_size))
+    key_signature = previous.key_signature if previous.key_signature == current.key_signature else f"{previous.key_signature}|{current.key_signature}"
+    score_event_id = previous.score_event_id if previous.score_event_id == current.score_event_id else f"{previous.score_event_id}|{current.score_event_id}"
+    return CandidateSegment(
+        onset_step=min(int(previous.onset_step), int(current.onset_step)),
+        end_step=max(int(previous.end_step), int(current.end_step)),
+        segment_source=previous.segment_source,
+        score_event_id=score_event_id,
+        key_signature=key_signature,
+        heuristic_family=previous.heuristic_family if previous.heuristic_family == current.heuristic_family else "window",
+        chord_size=chord_size,
+        key_center=float((float(previous.key_center) + float(current.key_center)) * 0.5),
+        coarse_family=previous.coarse_family if previous.coarse_family == current.coarse_family else "mixed_unknown",
+        proposal_size=int(previous.proposal_size) + int(current.proposal_size),
+        proposal_span_steps=max(int(current.end_step) - int(previous.onset_step), 1),
+        boundary_energy=float((float(previous.boundary_energy) + float(current.boundary_energy)) * 0.5),
+        boundary_alignment_score=float(max(float(previous.boundary_alignment_score), float(current.boundary_alignment_score))),
+        duplicate_iou=max(float(previous.duplicate_iou), float(current.duplicate_iou)),
+        merge_count=int(previous.merge_count) + int(current.merge_count) + 1,
+        split_count=int(previous.split_count) + int(current.split_count),
+        target_key_count=max(int(previous.target_key_count), int(current.target_key_count)),
+        target_key_signature=key_signature,
+        target_onset_step=min(int(previous.target_onset_step), int(current.target_onset_step)),
+        next_onset_gap_steps=int(current.next_onset_gap_steps),
+        truncated_by_next_onset=bool(previous.truncated_by_next_onset or current.truncated_by_next_onset),
+    )
+
+
+def _split_candidate(
+    *,
+    candidate: CandidateSegment,
+    boundary_signal: np.ndarray,
+    min_len: int,
+    max_len: int,
+) -> list[CandidateSegment]:
+    duration = int(candidate.end_step) - int(candidate.onset_step)
+    if duration <= max_len or duration < max(int(min_len) * 2, 4):
+        return [candidate]
+    left = int(candidate.onset_step) + int(min_len)
+    right = int(candidate.end_step) - int(min_len)
+    if right <= left:
+        return [candidate]
+    midpoint = (left + right) // 2
+    search_left = max(midpoint - int(min_len), left)
+    search_right = min(midpoint + int(min_len), right)
+    if boundary_signal.size:
+        valley = int(search_left + np.argmin(boundary_signal[search_left:search_right])) if search_right > search_left else midpoint
+    else:
+        valley = midpoint
+    if valley <= left or valley >= right:
+        return [candidate]
+    first = CandidateSegment(
+        onset_step=int(candidate.onset_step),
+        end_step=int(valley),
+        segment_source=candidate.segment_source,
+        score_event_id=candidate.score_event_id,
+        key_signature=candidate.key_signature,
+        heuristic_family=candidate.heuristic_family,
+        chord_size=candidate.chord_size,
+        key_center=candidate.key_center,
+        coarse_family=candidate.coarse_family,
+        proposal_size=max(int(candidate.proposal_size // 2), 1),
+        proposal_span_steps=max(int(valley) - int(candidate.onset_step), 1),
+        boundary_energy=candidate.boundary_energy,
+        boundary_alignment_score=candidate.boundary_alignment_score,
+        duplicate_iou=candidate.duplicate_iou,
+        merge_count=candidate.merge_count,
+        split_count=candidate.split_count + 1,
+        target_key_count=candidate.target_key_count,
+        target_key_signature=candidate.target_key_signature,
+        target_onset_step=candidate.target_onset_step,
+        next_onset_gap_steps=candidate.next_onset_gap_steps,
+        truncated_by_next_onset=candidate.truncated_by_next_onset,
+    )
+    second = CandidateSegment(
+        onset_step=int(valley),
+        end_step=int(candidate.end_step),
+        segment_source=candidate.segment_source,
+        score_event_id=candidate.score_event_id,
+        key_signature=candidate.key_signature,
+        heuristic_family=candidate.heuristic_family,
+        chord_size=candidate.chord_size,
+        key_center=candidate.key_center,
+        coarse_family=candidate.coarse_family,
+        proposal_size=max(int(candidate.proposal_size - first.proposal_size), 1),
+        proposal_span_steps=max(int(candidate.end_step) - int(valley), 1),
+        boundary_energy=candidate.boundary_energy,
+        boundary_alignment_score=candidate.boundary_alignment_score,
+        duplicate_iou=candidate.duplicate_iou,
+        merge_count=candidate.merge_count,
+        split_count=candidate.split_count + 1,
+        target_key_count=candidate.target_key_count,
+        target_key_signature=candidate.target_key_signature,
+        target_onset_step=candidate.target_onset_step,
+        next_onset_gap_steps=candidate.next_onset_gap_steps,
+        truncated_by_next_onset=candidate.truncated_by_next_onset,
+    )
+    return [first, second]
+
+
+def _segment_iou(left: CandidateSegment, right: CandidateSegment) -> float:
+    intersection = max(0, min(int(left.end_step), int(right.end_step)) - max(int(left.onset_step), int(right.onset_step)))
+    union = max(int(left.end_step), int(right.end_step)) - min(int(left.onset_step), int(right.onset_step))
+    return float(intersection / max(union, 1))
+
+
 def build_segmenter(config: dict[str, Any]) -> BaseSegmenter:
-    strategy = str(config["segmentation_strategy"])
+    strategy = str(config.get("segmenter_name", config.get("segmentation_strategy", "note_aligned")))
     if strategy == "fixed_window":
         return FixedWindowSegmenter(window_steps=config["window_steps"], stride_steps=config["stride_steps"])
     if strategy == "changepoint":
@@ -281,6 +938,32 @@ def build_segmenter(config: dict[str, Any]) -> BaseSegmenter:
             post_steps=config["post_steps"],
             alignment_radius=config["alignment_radius"],
             template_window=config["dtw_template_window"],
+        )
+    if strategy == "keyset_onset":
+        return KeysetOnsetSegmenter(
+            pre_steps=int(config.get("segment_press_pre_steps", config.get("pre_steps", 2))),
+            post_steps=int(config.get("segment_press_post_steps", config.get("post_steps", 6))),
+            min_len=int(config.get("segment_min_len", 4)),
+            max_len=int(config.get("segment_max_len", 12)),
+            chord_tolerance_steps=int(config.get("chord_tolerance_steps", 1)),
+            truncate_at_next_onset=bool(config.get("segment_truncate_at_next_onset", True)),
+        )
+    if strategy == "note_group_refined":
+        return NoteGroupRefinedSegmenter(
+            pre_steps=int(config.get("pre_steps", 6)),
+            post_steps=int(config.get("post_steps", 12)),
+            grouping_window=int(config.get("segment_grouping_window", config.get("chord_tolerance_steps", 2))),
+            boundary_refine_radius=int(config.get("segment_boundary_refine_radius", 6)),
+            min_len=int(config.get("segment_min_len", 4)),
+            max_len=int(config.get("segment_max_len", 48)),
+            duplicate_iou_threshold=float(config.get("segment_duplicate_iou_threshold", 0.85)),
+            merge_enabled=bool(config.get("segment_merge_enabled", True)),
+            split_enabled=bool(config.get("segment_split_enabled", True)),
+            chord_tolerance_steps=int(config.get("chord_tolerance_steps", 1)),
+            group_max_events=int(config.get("segment_group_max_events", 8)),
+            group_max_span_steps=int(config.get("segment_group_max_span_steps", config.get("segment_max_len", 48))),
+            key_center_tolerance=float(config.get("segment_group_key_center_tolerance", 0.12)),
+            repeat_window_steps=int(config.get("segment_repeat_window_steps", 12)),
         )
     raise ValueError(f"Unknown segmentation strategy: {strategy}")
 
@@ -354,7 +1037,8 @@ def _write_resume_manifest(
             "chunk_files": [str(item) for item in chunk_files],
             "num_segments_written": int(num_segments_written),
             "num_score_events_written": int(num_score_events_written),
-            "segment_strategy": str(config["segmentation_strategy"]),
+            "segment_strategy": str(config.get("segmenter_name", config.get("segmentation_strategy", ""))),
+            "segment_config_signature": _segment_config_signature(config),
             "segment_chunk_size": int(config["segment_chunk_size"]),
         },
     )
@@ -383,10 +1067,84 @@ def _validate_existing_chunks(segments_dir: Path, chunk_files: list[str]) -> lis
         valid.append(chunk_name)
     return valid
 
-def run_segmentation(manifest_df: pd.DataFrame, output_dir: Path, config: dict[str, Any], logger: logging.Logger | None = None) -> dict[str, Path]:
+
+_SEGMENT_CONFIG_SIGNATURE_KEYS = (
+    "segmenter_name",
+    "segmentation_strategy",
+    "pre_steps",
+    "post_steps",
+    "segment_press_pre_steps",
+    "segment_press_post_steps",
+    "segment_truncate_at_next_onset",
+    "segment_min_len",
+    "segment_max_len",
+    "chord_tolerance_steps",
+    "window_steps",
+    "stride_steps",
+    "min_gap_steps",
+    "velocity_quantile",
+    "acceleration_quantile",
+    "alignment_radius",
+    "dtw_template_window",
+    "segment_grouping_window",
+    "segment_boundary_refine_radius",
+    "segment_duplicate_iou_threshold",
+    "segment_merge_enabled",
+    "segment_split_enabled",
+    "segment_group_max_events",
+    "segment_group_max_span_steps",
+    "segment_group_key_center_tolerance",
+    "segment_repeat_window_steps",
+)
+
+
+def _segment_config_payload(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: config.get(key)
+        for key in _SEGMENT_CONFIG_SIGNATURE_KEYS
+        if key in config
+    }
+
+
+def _segment_config_signature(config: dict[str, Any]) -> str:
+    return json.dumps(_segment_config_payload(config), sort_keys=True, separators=(",", ":"))
+
+
+def _load_segment_manifest(manifest_path: Path) -> dict[str, Any]:
+    if not manifest_path.exists():
+        return {}
+    try:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _segment_cache_matches_config(manifest_path: Path, config: dict[str, Any]) -> bool:
+    payload = _load_segment_manifest(manifest_path)
+    if not payload:
+        return True
+    expected_strategy = str(config.get("segmenter_name", config.get("segmentation_strategy", "")))
+    cached_strategy = str(payload.get("segment_strategy", ""))
+    if cached_strategy and cached_strategy != expected_strategy:
+        return False
+    cached_signature = str(payload.get("segment_config_signature", ""))
+    if cached_signature and cached_signature != _segment_config_signature(config):
+        return False
+    return True
+
+
+def run_segmentation(
+    manifest_df: pd.DataFrame,
+    output_dir: Path,
+    config: dict[str, Any],
+    logger: logging.Logger | None = None,
+    evaluator=None,
+) -> dict[str, Path]:
     if not online_segment_processing_enabled(config):
         return run_segmentation_legacy(manifest_df=manifest_df, output_dir=output_dir, config=config)
-    return run_segmentation_slim(manifest_df=manifest_df, output_dir=output_dir, config=config, logger=logger)
+    return run_segmentation_slim(manifest_df=manifest_df, output_dir=output_dir, config=config, logger=logger, evaluator=evaluator)
 
 
 def run_segmentation_legacy(manifest_df: pd.DataFrame, output_dir: Path, config: dict[str, Any]) -> dict[str, Path]:
@@ -403,13 +1161,16 @@ def run_segmentation_legacy(manifest_df: pd.DataFrame, output_dir: Path, config:
     final_segment_csv = table_base.with_suffix(".csv")
     final_score_csv = score_base.with_suffix(".csv")
     force = bool(config.get("force", False))
+    reset_cache = force or not _segment_cache_matches_config(manifest_path, config)
 
-    if force:
+    if reset_cache:
         for path in [segment_partial_csv, score_partial_csv, final_segment_csv, final_score_csv, manifest_path]:
             if path.exists():
                 path.unlink()
+        for path in segments_dir.glob("segment_chunk_*.npz"):
+            path.unlink()
 
-    if final_segment_csv.exists() and final_score_csv.exists() and not force:
+    if final_segment_csv.exists() and final_score_csv.exists() and not reset_cache:
         return {"segment_table_base": table_base, "score_table_base": score_base, "manifest_path": manifest_path}
 
     resume_state = _load_resume_manifest(manifest_path)
@@ -532,12 +1293,25 @@ def run_segmentation_legacy(manifest_df: pd.DataFrame, output_dir: Path, config:
                 chunk_path="",
                 chunk_index=-1,
                 heuristic_family=candidate.heuristic_family,
+                coarse_family=candidate.coarse_family or _heuristic_to_coarse_family(family=candidate.heuristic_family, chord_size=candidate.chord_size),
                 motion_energy=float(np.linalg.norm(velocity, axis=1).mean()),
                 chord_size=int(candidate.chord_size),
                 key_center=float(candidate.key_center),
                 start_state_norm=float(np.linalg.norm(hand_joints[0])),
                 end_state_norm=float(np.linalg.norm(hand_joints[-1])),
                 score_context_json=dumps_score_context(context),
+                proposal_size=int(candidate.proposal_size),
+                proposal_span_steps=int(candidate.proposal_span_steps),
+                boundary_energy=float(candidate.boundary_energy),
+                boundary_alignment_score=float(candidate.boundary_alignment_score),
+                duplicate_iou=float(candidate.duplicate_iou),
+                merge_count=int(candidate.merge_count),
+                split_count=int(candidate.split_count),
+                target_key_count=int(candidate.target_key_count or candidate.chord_size),
+                target_key_signature=str(candidate.target_key_signature or candidate.key_signature),
+                target_onset_step=int(candidate.target_onset_step if candidate.target_onset_step >= 0 else candidate.onset_step),
+                next_onset_gap_steps=int(candidate.next_onset_gap_steps),
+                truncated_by_next_onset=bool(candidate.truncated_by_next_onset),
             )
             writer.add(record.as_row() | {"split": row.split}, arrays)
 
@@ -594,6 +1368,7 @@ def run_segmentation_slim(
     output_dir: Path,
     config: dict[str, Any],
     logger: logging.Logger | None = None,
+    evaluator=None,
 ) -> dict[str, Path]:
     segments_dir = output_dir / "segments"
     segments_dir.mkdir(parents=True, exist_ok=True)
@@ -603,7 +1378,13 @@ def run_segmentation_slim(
     slim_paths = resolve_slim_cache_paths(output_dir, config)
     compact_manifest_path = compact_store_manifest_path(slim_paths)
 
-    if bool(config.get("force", False)):
+    reset_cache = bool(config.get("force", False)) or not _segment_cache_matches_config(manifest_path, config)
+    if reset_cache:
+        if logger is not None and not bool(config.get("force", False)):
+            logger.warning(
+                "Existing Stage 1 segmentation cache does not match the current segmenter config; rebuilding %s.",
+                output_dir,
+            )
         _reset_segmentation_outputs(segments_dir=segments_dir, slim_root=slim_paths.root)
 
     existing_segment_df = _read_optional_table(table_base)
@@ -654,8 +1435,13 @@ def run_segmentation_slim(
         )
 
     new_score_rows: list[dict[str, Any]] = []
+    early_stop_decision = None
+    loop_start_time = time.monotonic()
+    log_interval = max(int(config.get("segment_log_interval_episodes", 32)), 1)
+    processed_this_loop = 0
+    segments_this_loop = 0
     if raw_writer is None:
-        segment_num_workers = _positive_int(config.get("segment_num_workers")) or 0
+        segment_num_workers = resolve_worker_count(config.get("segment_num_workers"), default=0)
         prepared_batches = _iter_prepared_episode_batches(
             manifest_df=remaining_df,
             config=config,
@@ -685,6 +1471,25 @@ def run_segmentation_slim(
                     ),
                 )
             processed_episode_ids.add(batch.episode_id)
+            processed_this_loop += 1
+            segments_this_loop += len(batch.prepared_segments)
+            if evaluator is not None:
+                early_stop_decision = evaluator.observe_segmentation(
+                    [segment.row for segment in batch.prepared_segments],
+                    batch.stats,
+                )
+                if early_stop_decision is not None and early_stop_decision.stop:
+                    break
+            if logger is not None and processed_this_loop % log_interval == 0:
+                elapsed = max(time.monotonic() - loop_start_time, 1e-6)
+                logger.info(
+                    "Stage 1 segmentation progress: %d/%d episodes, %d segments, %.2f episodes/s, %.2f segments/s.",
+                    processed_this_loop,
+                    len(remaining_df),
+                    segments_this_loop,
+                    processed_this_loop / elapsed,
+                    segments_this_loop / elapsed,
+                )
     else:
         for row in tqdm(remaining_df.itertuples(index=False), total=len(remaining_df), desc="Segment episodes"):
             episode_id = str(row.episode_id)
@@ -698,6 +1503,7 @@ def run_segmentation_slim(
                     score_events=score_events,
                     segmenter=segmenter,
                     config=config,
+                    include_arrays=True,
                 )
             )
             if not prepared_segments:
@@ -726,6 +1532,25 @@ def run_segmentation_slim(
                 )
             _record_episode_progress(slim_paths, slim_writer.end_episode())
             processed_episode_ids.add(episode_id)
+            processed_this_loop += 1
+            segments_this_loop += len(prepared_segments)
+            if evaluator is not None:
+                early_stop_decision = evaluator.observe_segmentation(
+                    [segment.row for segment in prepared_segments],
+                    dict(getattr(segmenter, "last_stats", {})) | {"accepted_segments": len(prepared_segments)},
+                )
+                if early_stop_decision is not None and early_stop_decision.stop:
+                    break
+            if logger is not None and processed_this_loop % log_interval == 0:
+                elapsed = max(time.monotonic() - loop_start_time, 1e-6)
+                logger.info(
+                    "Stage 1 segmentation progress: %d/%d episodes, %d segments, %.2f episodes/s, %.2f segments/s.",
+                    processed_this_loop,
+                    len(remaining_df),
+                    segments_this_loop,
+                    processed_this_loop / elapsed,
+                    segments_this_loop / elapsed,
+                )
 
     _record_episode_progress(slim_paths, slim_writer.flush())
     slim_segment_df = load_slim_index_table(slim_paths)
@@ -741,11 +1566,14 @@ def run_segmentation_slim(
         if total_raw_estimate > 0 and store_summary["total_bytes_on_disk"] > 0
         else None
     )
+    final_status = "early_stopped" if early_stop_decision is not None and early_stop_decision.stop else "completed"
     compact_manifest = {
-        "status": "completed",
+        "status": final_status,
         "online_segment_processing": True,
         "save_raw_segment_chunks": save_raw_segment_chunks_enabled(config),
         "online_storage_format": resolve_online_storage_format(config),
+        "segment_strategy": config.get("segmenter_name", config.get("segmentation_strategy", "note_aligned")),
+        "segment_config_signature": _segment_config_signature(config),
         "num_segments": int(store_summary["num_segments"]),
         "num_chunks": int(store_summary["num_chunks"]),
         "feature_dim": int(store_summary["feature_dim"]),
@@ -771,12 +1599,13 @@ def run_segmentation_slim(
     write_table(score_df, score_base)
     write_json(
         {
-            "status": "completed",
+            "status": final_status,
             "num_segments": int(len(segment_df)),
             "num_score_events": int(len(score_df)),
             "chunk_files": sorted(path.name for path in segments_dir.glob("segment_chunk_*.npz")),
             "slim_chunk_files": collect_slim_chunk_names(slim_paths, completed_only=True),
-            "segment_strategy": config["segmentation_strategy"],
+            "segment_strategy": config.get("segmenter_name", config.get("segmentation_strategy", "note_aligned")),
+            "segment_config_signature": _segment_config_signature(config),
             "online_segment_processing": True,
             "save_raw_segment_chunks": save_raw_segment_chunks_enabled(config),
             "online_storage_format": resolve_online_storage_format(config),
@@ -890,44 +1719,65 @@ def _iter_prepared_episode_batches(
     payloads = [row._asdict() for row in manifest_df.itertuples(index=False)]
     if max_workers <= 1 or len(payloads) <= 1:
         for payload in payloads:
-            yield _prepare_episode_batch(payload, config)
+            yield _prepare_episode_batch(payload, config, include_arrays=False)
         return
 
-    in_flight_limit = max(max_workers * 2, 1)
-    iterator = iter(payloads)
-    futures: deque = deque()
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for _ in range(min(in_flight_limit, len(payloads))):
-            payload = next(iterator, None)
-            if payload is None:
-                break
-            futures.append(executor.submit(_prepare_episode_batch, payload, config))
-        while futures:
-            future = futures.popleft()
-            yield future.result()
-            payload = next(iterator, None)
-            if payload is not None:
-                futures.append(executor.submit(_prepare_episode_batch, payload, config))
+    jobs = [
+        {
+            "manifest_row_payload": payload,
+            "config": config,
+            "include_arrays": False,
+        }
+        for payload in payloads
+    ]
+    use_process_pool = bool(config.get("use_process_pool", True))
+    start_method = str(config.get("process_start_method", "spawn"))
+    yield from iter_parallel_map(
+        _prepare_episode_batch_job,
+        jobs,
+        max_workers=max_workers,
+        use_process_pool=use_process_pool,
+        in_flight_multiplier=2,
+        start_method=start_method,
+    )
 
 
-def _prepare_episode_batch(manifest_row_payload: dict[str, Any], config: dict[str, Any]) -> PreparedEpisodeBatch:
+def _prepare_episode_batch_job(job_payload: dict[str, Any]) -> PreparedEpisodeBatch:
+    return _prepare_episode_batch(
+        job_payload["manifest_row_payload"],
+        job_payload["config"],
+        include_arrays=bool(job_payload.get("include_arrays", False)),
+    )
+
+
+def _prepare_episode_batch(
+    manifest_row_payload: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    include_arrays: bool,
+) -> PreparedEpisodeBatch:
     manifest_row = SimpleNamespace(**manifest_row_payload)
     episode = load_episode_record(manifest_row_payload)
     score_events = _load_or_infer_score_events(episode=episode, config=config)
+    segmenter = build_segmenter(config)
     prepared_segments = list(
         iter_prepared_segments(
             manifest_row=manifest_row,
             episode=episode,
             score_events=score_events,
-            segmenter=build_segmenter(config),
+            segmenter=segmenter,
             config=config,
+            include_arrays=include_arrays,
         )
     )
+    stats = dict(getattr(segmenter, "last_stats", {}))
+    stats["accepted_segments"] = int(len(prepared_segments))
     return PreparedEpisodeBatch(
         song_id=str(manifest_row.song_id),
         episode_id=str(manifest_row.episode_id),
         score_rows=[event.as_row() for event in score_events],
         prepared_segments=prepared_segments,
+        stats=stats,
     )
 
 
@@ -937,6 +1787,8 @@ def iter_prepared_segments(
     score_events: list[ScoreEvent],
     segmenter: BaseSegmenter,
     config: dict[str, Any],
+    *,
+    include_arrays: bool,
 ) -> Iterator[PreparedSegment]:
     from sonata.primitives.features import build_feature_vector_from_arrays, build_gmr_target_from_arrays
 
@@ -967,17 +1819,31 @@ def iter_prepared_segments(
             chunk_path="",
             chunk_index=-1,
             heuristic_family=candidate.heuristic_family,
+            coarse_family=candidate.coarse_family or _heuristic_to_coarse_family(family=candidate.heuristic_family, chord_size=candidate.chord_size),
             motion_energy=float(np.linalg.norm(velocity, axis=1).mean()),
             chord_size=int(candidate.chord_size),
             key_center=float(candidate.key_center),
             start_state_norm=float(np.linalg.norm(hand_joints[0])),
             end_state_norm=float(np.linalg.norm(hand_joints[-1])),
             score_context_json=dumps_score_context(context),
+            proposal_size=int(candidate.proposal_size),
+            proposal_span_steps=int(candidate.proposal_span_steps),
+            boundary_energy=float(candidate.boundary_energy),
+            boundary_alignment_score=float(candidate.boundary_alignment_score),
+            duplicate_iou=float(candidate.duplicate_iou),
+            merge_count=int(candidate.merge_count),
+            split_count=int(candidate.split_count),
+            target_key_count=int(candidate.target_key_count or candidate.chord_size),
+            target_key_signature=str(candidate.target_key_signature or candidate.key_signature),
+            target_onset_step=int(candidate.target_onset_step if candidate.target_onset_step >= 0 else candidate.onset_step),
+            next_onset_gap_steps=int(candidate.next_onset_gap_steps),
+            truncated_by_next_onset=bool(candidate.truncated_by_next_onset),
         )
         row_payload = record.as_row() | {"split": manifest_row.split}
         feature_vector, names = build_feature_vector_from_arrays(row=row_payload, arrays=arrays, config=config)
         gmr_target, target_name = build_gmr_target_from_arrays(arrays=arrays, config=config)
         row_payload["gmr_target_name"] = target_name
+        raw_bytes_estimate = estimate_segment_storage_bytes(arrays)
         if not feature_names:
             feature_names = names
         elif feature_names != names:
@@ -988,8 +1854,8 @@ def iter_prepared_segments(
             feature_names=list(names),
             gmr_target=gmr_target.astype(np.float32),
             gmr_target_name=target_name,
-            arrays=arrays,
-            raw_bytes_estimate=estimate_segment_storage_bytes(arrays),
+            arrays=arrays if include_arrays else None,
+            raw_bytes_estimate=raw_bytes_estimate,
         )
 
 

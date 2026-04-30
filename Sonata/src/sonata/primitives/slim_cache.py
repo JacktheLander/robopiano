@@ -15,6 +15,14 @@ SEGMENT_INDEX_DEFAULTS: dict[str, Any] = {
     "raw_chunk_path": "",
     "raw_chunk_index": -1,
     "gmr_target_name": "",
+    "coarse_family": "",
+    "proposal_size": 1,
+    "proposal_span_steps": 0,
+    "boundary_energy": 0.0,
+    "boundary_alignment_score": 0.0,
+    "duplicate_iou": 0.0,
+    "merge_count": 0,
+    "split_count": 0,
 }
 ONLINE_STORAGE_FORMATS = {"npz", "npz_shards"}
 
@@ -114,6 +122,12 @@ def ensure_segment_index_columns(frame: pd.DataFrame) -> pd.DataFrame:
         output["chunk_index"] = output["chunk_index"].fillna(-1).astype(int)
     if "raw_chunk_index" in output.columns:
         output["raw_chunk_index"] = output["raw_chunk_index"].fillna(-1).astype(int)
+    for column in ("proposal_size", "proposal_span_steps", "merge_count", "split_count"):
+        if column in output.columns:
+            output[column] = output[column].fillna(0).astype(int)
+    for column in ("boundary_energy", "boundary_alignment_score", "duplicate_iou"):
+        if column in output.columns:
+            output[column] = output[column].fillna(0.0).astype(float)
     return output
 
 

@@ -94,7 +94,13 @@ class Sonata3Pipeline:
                 "Diffusion checkpoint planner metadata uses a different primitive-family mapping than the current primitive_root."
             )
 
-    def _condition_vector(self, batch: dict[str, torch.Tensor], variant: str) -> torch.Tensor:
+    def _condition_vector(
+        self,
+        batch: dict[str, torch.Tensor],
+        variant: str,
+        *,
+        oracle_tokens: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         score = batch["score_context"]
         state = batch["state_context"]
         scalar = torch.stack(
@@ -107,13 +113,28 @@ class Sonata3Pipeline:
         )
         if self.planner is not None and variant not in {"diffusion_only", "gmr_only"}:
             with torch.no_grad():
-                plan = self.planner(batch)["plan_embedding"]
+                if oracle_tokens is not None:
+                    plan = self.planner.oracle_plan_embedding(
+                        batch,
+                        family_index=oracle_tokens["family_index"],
+                        primitive_index=oracle_tokens["primitive_index"],
+                        duration_bucket=oracle_tokens["duration_bucket"],
+                        dynamics_bucket=oracle_tokens["dynamics_bucket"],
+                    )["plan_embedding"]
+                else:
+                    plan = self.planner(batch)["plan_embedding"]
             return torch.cat([score, state, scalar, plan], dim=-1)
         primitive = self.primitive_embed(batch["primitive_index"])
         return torch.cat([score, state, scalar, primitive], dim=-1)
 
     @torch.no_grad()
-    def predict_batch(self, batch: dict[str, torch.Tensor], variant: str | None = None) -> torch.Tensor:
+    def predict_batch(
+        self,
+        batch: dict[str, torch.Tensor],
+        variant: str | None = None,
+        *,
+        oracle_tokens: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         local_variant = variant or str(self.config["variant"])
         batch = {key: value.to(self.device) if hasattr(value, "to") else value for key, value in batch.items()}
         prior = batch["gmr_prior"]
@@ -121,10 +142,19 @@ class Sonata3Pipeline:
             return prior
         if local_variant in {"diffusion_only", "planner_no_prior"}:
             prior = torch.zeros_like(prior)
-        condition = self._condition_vector(batch, variant=local_variant)
-        return self.diffusion.sample(
+        local_oracle_tokens = None
+        if oracle_tokens is not None:
+            local_oracle_tokens = {
+                key: value.to(self.device) if hasattr(value, "to") else value
+                for key, value in oracle_tokens.items()
+            }
+        condition = self._condition_vector(batch, variant=local_variant, oracle_tokens=local_oracle_tokens)
+        sampled = self.diffusion.sample(
             self.model,
             shape=tuple(batch["action_target"].shape),
             prior=prior,
             condition=condition,
         )
+        if bool(self.config.get("predict_residual", False)):
+            return prior + sampled
+        return sampled

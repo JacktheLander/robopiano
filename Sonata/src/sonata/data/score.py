@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from sonata.data.schema import ScoreEvent
+from sonata.utils.robopianist import ensure_local_robopianist_on_path, format_robopianist_import_error
 
 _PIANO_LOWEST_MIDI = 21
 _NUM_PIANO_KEYS = 88
@@ -133,36 +134,21 @@ def dumps_score_context(payload: dict[str, Any]) -> str:
 
 
 def _load_proto_notes(path: Path) -> list[dict[str, float | int]]:
-    try:
-        from note_seq.protobuf import music_pb2
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(
-            "note-seq is required to parse Sonata .proto note files."
-        ) from exc
-
-    sequence = music_pb2.NoteSequence()
-    sequence.ParseFromString(path.read_bytes())
-    return [
-        {
-            "pitch": int(note.pitch),
-            "start_time": float(note.start_time),
-            "end_time": float(note.end_time),
-            "velocity": int(note.velocity),
-        }
-        for note in sequence.notes
-        if float(note.end_time) > float(note.start_time)
-    ]
+    return _load_notes_with_robopianist(path)
 
 
 def _load_midi_notes(path: Path) -> list[dict[str, float | int]]:
-    try:
-        import note_seq
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError(
-            "note-seq is required to parse Sonata MIDI note files."
-        ) from exc
+    return _load_notes_with_robopianist(path)
 
-    sequence = note_seq.midi_file_to_note_sequence(str(path))
+
+def _load_notes_with_robopianist(path: Path) -> list[dict[str, float | int]]:
+    ensure_local_robopianist_on_path()
+    try:
+        from robopianist import music
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(format_robopianist_import_error(exc)) from exc
+    midi = music.load(path)
+    sequence = midi.seq
     return [
         {
             "pitch": int(note.pitch),
