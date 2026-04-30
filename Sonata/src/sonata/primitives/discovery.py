@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -902,6 +903,11 @@ def _apply_stage1_defaults(config: dict[str, Any]) -> dict[str, Any]:
     output.setdefault("relative_wrist_frame", True)
     output.setdefault("relative_key_center_frame", True)
     output.setdefault("hand_specific_normalization", True)
+    override_workers = os.environ.get("SONATA_PRIMITIVE_NUM_WORKERS", "").strip()
+    if override_workers:
+        count = max(int(override_workers), 1)
+        output["segment_num_workers"] = count
+        output["feature_num_workers"] = count
     return output
 
 

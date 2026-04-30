@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -39,8 +40,12 @@ def main() -> None:
     data_config = load_stage_config("data", profile=args.profile)
     data_config_dir = resolve_path(data_config["config_path"]).parent
     data_config["dataset_root"] = str(resolve_path(data_config["dataset_root"], data_config_dir))
-    data_config["output_root"] = str(resolve_path(data_config["output_root"], data_config_dir))
+    # Use the same tree as primitive `data_output_root` so scan_dataset and Stage 1 agree.
+    data_config["output_root"] = str(config["data_output_root"])
     data_config["note_search_roots"] = [str(resolve_path(path, data_config_dir)) for path in data_config.get("note_search_roots", [])]
+    scan_override = os.environ.get("SONATA_DATA_SCAN_WORKERS", "").strip()
+    if scan_override:
+        data_config["scan_num_workers"] = max(int(scan_override), 1)
     config["data_config"] = deep_update(data_config, {"force": bool(args.force or config.get("force", False))})
     config["force"] = bool(args.force or config.get("force", False))
     logger = configure_logging(args.log_level)

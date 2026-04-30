@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from glob import glob
 import json
 import logging
 import math
+import os
 import re
 import shutil
 from pathlib import Path
@@ -23,6 +25,18 @@ from sonata.utils.robopianist import ensure_local_robopianist_on_path, format_ro
 LOGGER = logging.getLogger(__name__)
 _NUM_PIANO_KEYS = 88
 _ENV_SUFFIX_RE = re.compile(r"(-v\d+)_\d+$")
+_DEFAULT_EXAMPLE_MIDI_SOURCES = (
+    {
+        "label": "TwinkleTwinkleRousseau",
+        "environment_name": "RoboPianist-debug-TwinkleTwinkleRousseau-v0",
+        "relative_path": Path("music/data/rousseau/twinkle-twinkle-trimmed.mid"),
+    },
+    {
+        "label": "NocturneRousseau",
+        "environment_name": "RoboPianist-debug-NocturneRousseau-v0",
+        "relative_path": Path("music/data/rousseau/nocturne-trimmed.mid"),
+    },
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -79,6 +93,7 @@ class PrimitiveInstance:
     segment_source: str | None = None
     heuristic_family: str | None = None
     coarse_family: str | None = None
+    control_phase: str | None = None
     chord_size: int | None = None
     key_center: float | None = None
     intended_events: list[KeyEvent] = field(default_factory=list)
@@ -123,6 +138,10 @@ class PrimitiveOnlineRolloutResult:
     observed_hand_joints: np.ndarray | None
     raw_observed_hand_fingertips: np.ndarray | None
     observed_hand_fingertips: np.ndarray | None
+    rollout_source_mode: str
+    rollout_source_label: str | None
+    rollout_environment_name: str
+    rollout_midi_path: str | None
     observed_key_events: list[KeyEvent] = field(default_factory=list)
     observed_key_roll: np.ndarray | None = None
     notes: list[str] = field(default_factory=list)
@@ -133,6 +152,10 @@ class PrimitiveLibraryEntry:
     primitive_id: str
     prior_path: Path | None
     prior_mean: np.ndarray | None
+    prototype_means: np.ndarray | None
+    prototype_latent_centroids: np.ndarray | None
+    prototype_weights: np.ndarray | None
+    default_prototype_index: int
     metadata: dict[str, Any]
 
 
@@ -454,6 +477,8 @@ def sample_primitive_assignment_rows(
             sampled_groups.append(group.iloc[np.sort(indices[:take])])
         frame = pd.concat(sampled_groups, ignore_index=True) if sampled_groups else frame.iloc[0:0].copy()
     max_instances = sampling_config.get("max_instances")
+    if max_instances is None:
+        max_instances = sampling_config.get("max_instances_total")
     if max_instances is not None and len(frame) > int(max_instances):
         indices = np.arange(len(frame), dtype=np.int64)
         rng.shuffle(indices)
@@ -558,6 +583,7 @@ def build_primitive_instances(
                         segment_source=_optional_string(getattr(row, "segment_source", None)),
                         heuristic_family=_optional_string(getattr(row, "heuristic_family", None)),
                         coarse_family=_optional_string(getattr(row, "coarse_family", None)),
+                        control_phase=_optional_string(getattr(row, "control_phase", None)),
                         chord_size=_optional_int(getattr(row, "chord_size", None)),
                         key_center=float(getattr(row, "key_center", float("nan"))),
                         intended_events=list(merged["intended_events"]),
@@ -749,6 +775,11 @@ def rollout_primitive_instance(
     runtime: RoboPianistPrimitiveRuntime,
     rollout_config: dict[str, Any],
 ) -> PrimitiveOnlineRolloutResult:
+    source = resolve_instance_rollout_source(
+        instance=instance,
+        rollout_config=rollout_config,
+        robopianist_root=runtime.robopianist_root,
+    )
     if library_entry is None or library_entry.prior_mean is None:
         return PrimitiveOnlineRolloutResult(
             segment_id=instance.segment_id,
@@ -765,6 +796,10 @@ def rollout_primitive_instance(
             observed_hand_joints=None,
             raw_observed_hand_fingertips=None,
             observed_hand_fingertips=None,
+            rollout_source_mode=str(source["source_mode"]),
+            rollout_source_label=_optional_string(source.get("source_label")),
+            rollout_environment_name=str(source["environment_name"]),
+            rollout_midi_path=str(source["midi_file"]) if source.get("midi_file") is not None else None,
         )
     if str(instance.gmr_target_name) != "actions":
         return PrimitiveOnlineRolloutResult(
@@ -785,14 +820,18 @@ def rollout_primitive_instance(
             observed_hand_joints=None,
             raw_observed_hand_fingertips=None,
             observed_hand_fingertips=None,
+            rollout_source_mode=str(source["source_mode"]),
+            rollout_source_label=_optional_string(source.get("source_label")),
+            rollout_environment_name=str(source["environment_name"]),
+            rollout_midi_path=str(source["midi_file"]) if source.get("midi_file") is not None else None,
         )
 
-    expected_action_dim = int(library_entry.prior_mean.shape[-1])
+    selected_prior = select_primitive_prior_mean(instance=instance, library_entry=library_entry)
+    expected_action_dim = int(selected_prior.shape[-1])
     predicted_actions = resample_sequence(
-        np.asarray(library_entry.prior_mean, dtype=np.float32),
+        np.asarray(selected_prior, dtype=np.float32),
         max(int(instance.duration_steps), 1),
     )
-    source = resolve_instance_rollout_source(instance=instance)
     try:
         env = runtime.get_env(
             environment_name=source["environment_name"],
@@ -864,6 +903,10 @@ def rollout_primitive_instance(
             observed_hand_joints=observed_hand,
             raw_observed_hand_fingertips=raw_tip,
             observed_hand_fingertips=observed_tip,
+            rollout_source_mode=str(source["source_mode"]),
+            rollout_source_label=_optional_string(source.get("source_label")),
+            rollout_environment_name=str(source["environment_name"]),
+            rollout_midi_path=str(source["midi_file"]) if source.get("midi_file") is not None else None,
             observed_key_events=list(observed_bundle.events),
             observed_key_roll=observed_bundle.key_roll,
             notes=list(notes),
@@ -884,6 +927,10 @@ def rollout_primitive_instance(
             observed_hand_joints=None,
             raw_observed_hand_fingertips=None,
             observed_hand_fingertips=None,
+            rollout_source_mode=str(source["source_mode"]),
+            rollout_source_label=_optional_string(source.get("source_label")),
+            rollout_environment_name=str(source["environment_name"]),
+            rollout_midi_path=str(source["midi_file"]) if source.get("midi_file") is not None else None,
         )
 
 
@@ -982,6 +1029,7 @@ def build_instance_result_row(
                         "segment_source": instance.segment_source,
                         "heuristic_family": instance.heuristic_family,
                         "coarse_family": instance.coarse_family,
+                        "control_phase": instance.control_phase,
                         "chord_size": instance.chord_size,
                         "key_center": instance.key_center,
                         "chunk_path": instance.chunk_path,
@@ -1006,6 +1054,10 @@ def build_instance_result_row(
         "error": rollout.error,
         "restore_mode": rollout.restore_mode,
         "alignment_mode": rollout.alignment_mode,
+        "rollout_source_mode": rollout.rollout_source_mode,
+        "rollout_source_label": rollout.rollout_source_label,
+        "rollout_environment_name": rollout.rollout_environment_name,
+        "rollout_midi_path": rollout.rollout_midi_path,
         "onset_precision": float(realized_metrics["precision"]),
         "onset_recall": float(realized_metrics["recall"]),
         "onset_f1": float(realized_metrics["f1"]),
@@ -1133,19 +1185,83 @@ def load_primitive_library_lookup(
             if local_prior.exists() and (prior_path is None or not prior_path.exists()):
                 prior_path = local_prior.resolve()
         prior_mean = None
+        prototype_means = None
+        prototype_latent_centroids = None
+        prototype_weights = None
+        default_prototype_index = int(getattr(row, "default_prototype_index", 0) or 0)
         if prior_path is not None and prior_path.exists():
             payload = np.load(prior_path, allow_pickle=True)
             prior_mean = np.asarray(payload["prior_mean"], dtype=np.float32)
+            if "prototype_means" in payload:
+                prototype_means = np.asarray(payload["prototype_means"], dtype=np.float32)
+            if "prototype_latent_centroids" in payload:
+                prototype_latent_centroids = np.asarray(payload["prototype_latent_centroids"], dtype=np.float32)
+            if "prototype_weights" in payload:
+                prototype_weights = np.asarray(payload["prototype_weights"], dtype=np.float32)
         lookup[primitive_id] = PrimitiveLibraryEntry(
             primitive_id=primitive_id,
             prior_path=prior_path,
             prior_mean=prior_mean,
+            prototype_means=prototype_means,
+            prototype_latent_centroids=prototype_latent_centroids,
+            prototype_weights=prototype_weights,
+            default_prototype_index=default_prototype_index,
             metadata=row._asdict(),
         )
     return lookup
 
 
-def resolve_instance_rollout_source(instance: PrimitiveInstance) -> dict[str, Any]:
+def select_primitive_prior_mean(*, instance: PrimitiveInstance, library_entry: PrimitiveLibraryEntry) -> np.ndarray:
+    if library_entry.prototype_means is None or library_entry.prototype_means.size == 0:
+        if library_entry.prior_mean is None:
+            raise ValueError(f"Primitive `{library_entry.primitive_id}` is missing a prior mean.")
+        return np.asarray(library_entry.prior_mean, dtype=np.float32)
+    prototype_means = np.asarray(library_entry.prototype_means, dtype=np.float32)
+    if (
+        instance.conditioning_features is None
+        or library_entry.prototype_latent_centroids is None
+        or library_entry.prototype_latent_centroids.size == 0
+    ):
+        index = int(np.clip(library_entry.default_prototype_index, 0, prototype_means.shape[0] - 1))
+        return prototype_means[index]
+    centroids = np.asarray(library_entry.prototype_latent_centroids, dtype=np.float32)
+    feature_dim = min(int(instance.conditioning_features.shape[0]), int(centroids.shape[1]))
+    if feature_dim <= 0:
+        index = int(np.clip(library_entry.default_prototype_index, 0, prototype_means.shape[0] - 1))
+        return prototype_means[index]
+    feature_slice = np.asarray(instance.conditioning_features[:feature_dim], dtype=np.float32)
+    centroid_slice = centroids[:, :feature_dim]
+    distances = np.linalg.norm(centroid_slice - feature_slice[None, :], axis=1)
+    index = int(np.argmin(distances))
+    index = int(np.clip(index, 0, prototype_means.shape[0] - 1))
+    return prototype_means[index]
+
+
+def resolve_instance_rollout_source(
+    *,
+    instance: PrimitiveInstance,
+    rollout_config: dict[str, Any] | None = None,
+    robopianist_root: str | Path | None = None,
+) -> dict[str, Any]:
+    rollout_config = dict(rollout_config or {})
+    source_mode = str(rollout_config.get("source_mode", "dataset_song") or "dataset_song")
+    if source_mode == "example_midi_pool":
+        example_sources = _resolve_example_midi_sources(
+            rollout_config=rollout_config,
+            robopianist_root=robopianist_root,
+        )
+        if not example_sources:
+            raise FileNotFoundError(
+                "No example MIDI files were found for primitive online evaluation. "
+                "Provide rollout.example_midi_paths or install the Rousseau example MIDI files."
+            )
+        source = example_sources[_stable_index(instance.primitive_id, len(example_sources))]
+        return {
+            "environment_name": str(source["environment_name"]),
+            "midi_file": Path(source["midi_file"]).resolve(),
+            "source_mode": source_mode,
+            "source_label": str(source["label"]),
+        }
     midi_file = Path(instance.source_midi_path).resolve() if instance.source_midi_path else None
     if midi_file is not None and not midi_file.exists():
         midi_file = None
@@ -1153,7 +1269,105 @@ def resolve_instance_rollout_source(instance: PrimitiveInstance) -> dict[str, An
     return {
         "environment_name": environment_name,
         "midi_file": midi_file,
+        "source_mode": source_mode,
+        "source_label": None,
     }
+
+
+def _resolve_example_midi_sources(
+    *,
+    rollout_config: dict[str, Any],
+    robopianist_root: str | Path | None,
+) -> list[dict[str, Any]]:
+    package_root = _resolve_robopianist_package_root(robopianist_root)
+    configured_paths = [str(item).strip() for item in rollout_config.get("example_midi_paths", []) if str(item).strip()]
+    configured_env_names = [
+        str(item).strip() for item in rollout_config.get("example_environment_names", []) if str(item).strip()
+    ]
+    configured_labels = [str(item).strip() for item in rollout_config.get("example_midi_labels", []) if str(item).strip()]
+    configured_globs = [str(item).strip() for item in rollout_config.get("example_midi_globs", []) if str(item).strip()]
+    max_example_midis = int(rollout_config.get("max_example_midis", 0) or 0)
+    sources: list[dict[str, Any]] = []
+    if configured_paths:
+        for index, item in enumerate(configured_paths):
+            midi_path = Path(os.path.expandvars(str(item))).expanduser()
+            if not midi_path.is_absolute():
+                midi_path = (package_root / midi_path).resolve()
+            if not midi_path.exists():
+                continue
+            sources.append(
+                {
+                    "label": configured_labels[index] if index < len(configured_labels) else midi_path.stem,
+                    "environment_name": (
+                        configured_env_names[index]
+                        if index < len(configured_env_names)
+                        else f"RoboPianist-debug-{midi_path.stem}-v0"
+                    ),
+                    "midi_file": midi_path,
+                }
+            )
+        return sources
+    if configured_globs:
+        matched_paths: list[Path] = []
+        for pattern in configured_globs:
+            expanded = Path(os.path.expandvars(str(pattern))).expanduser()
+            if not expanded.is_absolute():
+                expanded = (package_root / expanded).resolve()
+            matched_paths.extend(Path(path).resolve() for path in sorted(glob(str(expanded), recursive=True)))
+        deduped_paths: list[Path] = []
+        seen: set[str] = set()
+        for midi_path in matched_paths:
+            if str(midi_path) in seen or not midi_path.exists():
+                continue
+            seen.add(str(midi_path))
+            deduped_paths.append(midi_path)
+        if max_example_midis > 0:
+            deduped_paths = deduped_paths[:max_example_midis]
+        for index, midi_path in enumerate(deduped_paths):
+            sources.append(
+                {
+                    "label": configured_labels[index] if index < len(configured_labels) else midi_path.stem,
+                    "environment_name": (
+                        configured_env_names[index]
+                        if index < len(configured_env_names)
+                        else f"RoboPianist-debug-{midi_path.stem}-v0"
+                    ),
+                    "midi_file": midi_path,
+                }
+            )
+        return sources
+    for item in _DEFAULT_EXAMPLE_MIDI_SOURCES:
+        midi_path = (package_root / item["relative_path"]).resolve()
+        if not midi_path.exists():
+            continue
+        sources.append(
+            {
+                "label": str(item["label"]),
+                "environment_name": str(item["environment_name"]),
+                "midi_file": midi_path,
+            }
+        )
+    return sources
+
+
+def _resolve_robopianist_package_root(robopianist_root: str | Path | None) -> Path:
+    candidates: list[Path] = []
+    if robopianist_root is not None:
+        candidates.append(Path(robopianist_root).expanduser().resolve())
+    candidates.append(Path(__file__).resolve().parents[4] / "robopianist")
+    for candidate in candidates:
+        if (candidate / "__init__.py").exists() and (candidate / "music").exists():
+            return candidate
+        package_root = candidate / "robopianist"
+        if (package_root / "__init__.py").exists() and (package_root / "music").exists():
+            return package_root
+    return candidates[0]
+
+
+def _stable_index(value: str, size: int) -> int:
+    if size <= 0:
+        return 0
+    return sum(ord(char) for char in str(value)) % size
 
 
 def save_rollout_debug_artifact(
@@ -1226,6 +1440,12 @@ def save_summary_plots(
         fig.tight_layout()
         fig.savefig(output_dir / "primitive_mean_onset_f1.png", dpi=200)
         plt.close(fig)
+        _plot_primitive_frequency_accuracy_bar_chart(
+            output_path=output_dir / "primitive_frequency_vs_accuracy.png",
+            summary_df=summary_df,
+            max_plot_primitives=max(int(max_plot_primitives), 1),
+            plt=plt,
+        )
 
 
 def save_representative_timing_plots(*, output_dir: Path, result_df: pd.DataFrame, top_k: int) -> None:
@@ -1456,6 +1676,10 @@ def _resolve_eval_config(config: dict[str, Any]) -> dict[str, Any]:
     events.setdefault("piano_sustain_threshold", 0.5)
     events.setdefault("onset_tolerance_frames", 1)
     rollout.setdefault("validate_action_dim", True)
+    rollout.setdefault("source_mode", "dataset_song")
+    rollout.setdefault("example_midi_paths", [])
+    rollout.setdefault("example_environment_names", [])
+    rollout.setdefault("example_midi_labels", [])
     rollout.setdefault("piano_state_threshold", events["piano_state_threshold"])
     rollout.setdefault("piano_sustain_threshold", events["piano_sustain_threshold"])
     aggregation.setdefault("top_k_examples", 3)
@@ -1787,6 +2011,49 @@ def _plot_histogram(
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Count")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def _plot_primitive_frequency_accuracy_bar_chart(
+    *,
+    output_path: Path,
+    summary_df: pd.DataFrame,
+    max_plot_primitives: int,
+    plt: Any,
+) -> None:
+    """Bar heights = evaluated instance counts; fill color maps mean onset F1 (accuracy)."""
+    if summary_df.empty:
+        return
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    frame = summary_df.sort_values("num_instances", ascending=False, kind="stable").head(max_plot_primitives)
+    labels = frame["primitive_id"].astype(str).tolist()
+    counts = pd.to_numeric(frame["num_instances"], errors="coerce").fillna(0).to_numpy(dtype=float)
+    accuracy = pd.to_numeric(frame["mean_onset_f1"], errors="coerce").to_numpy(dtype=float)
+
+    cmap = plt.cm.viridis
+    norm = Normalize(vmin=0.0, vmax=1.0, clip=True)
+    colors: list[Any] = []
+    no_accuracy_rgba = (0.78, 0.78, 0.78, 1.0)
+    for val in accuracy:
+        colors.append(no_accuracy_rgba if (val != val or math.isnan(float(val))) else cmap(norm(float(val))))
+
+    fig_w = max(10.0, 0.35 * len(labels) + 5.0)
+    fig, ax = plt.subplots(figsize=(fig_w, 5))
+    ax.bar(labels, counts, color=colors, edgecolor="black", linewidth=0.3)
+    ax.set_title("Primitive frequency in online evaluation (bar color = mean onset F1)")
+    ax.set_ylabel("Evaluated instances")
+    ax.set_xlabel("Primitive ID")
+    ax.tick_params(axis="x", rotation=90)
+
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
+    cbar.set_label("Mean onset F1")
+
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
