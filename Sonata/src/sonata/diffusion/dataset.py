@@ -23,8 +23,10 @@ from sonata.transformer.dataset import (
 
 @dataclass
 class DiffusionMetadata(PlannerMetadata):
-    action_dim: int
-    state_dim: int
+    # Defaults satisfy dataclass ordering (parent ends with defaulted primitive_remap_summary).
+    # Callers must set real action_dim / state_dim (load_diffusion_inputs always does).
+    action_dim: int = 0
+    state_dim: int = 0
 
 
 class DiffusionChunkDataset(Dataset):
@@ -185,6 +187,7 @@ def metadata_to_planner(metadata: DiffusionMetadata) -> PlannerMetadata:
         continuous_param_std=list(metadata.continuous_param_std),
         goal_context_features=list(metadata.goal_context_features),
         history_context_features=list(metadata.history_context_features),
+        primitive_remap_summary=metadata.primitive_remap_summary,
     )
 
 
@@ -225,6 +228,7 @@ def load_diffusion_inputs(
         continuous_param_std=list(planner_metadata.continuous_param_std),
         goal_context_features=list(planner_metadata.goal_context_features),
         history_context_features=list(planner_metadata.history_context_features),
+        primitive_remap_summary=planner_metadata.primitive_remap_summary,
         action_dim=action_dim,
         state_dim=state_dim,
     )

@@ -42,6 +42,9 @@ class PrimitivePlannerTransformer(nn.Module):
         primitive_selector_hidden_dim: int | None = None,
         primitive_selector_layers: int = 2,
         primitive_selector_dropout: float | None = None,
+        predict_dynamics: bool = True,
+        use_dynamics_intent_in_plan: bool = True,
+        use_dynamics_in_history: bool = True,
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
@@ -52,6 +55,9 @@ class PrimitivePlannerTransformer(nn.Module):
         self.num_dynamics_buckets = int(num_dynamics_buckets)
         self.continuous_param_dim = int(continuous_param_dim)
         self.plan_embedding_dim = int(plan_embedding_dim or d_model)
+        self.predict_dynamics = bool(predict_dynamics)
+        self.use_dynamics_intent_in_plan = bool(use_dynamics_intent_in_plan)
+        self.use_dynamics_in_history = bool(use_dynamics_in_history)
 
         self.primitive_embed = nn.Embedding(num_primitives + 1, d_model)
         self.family_embed = nn.Embedding(num_families + 1, d_model)
@@ -103,8 +109,10 @@ class PrimitivePlannerTransformer(nn.Module):
         self.primitive_intent_embed = nn.Embedding(num_primitives, d_model)
         self.duration_head = nn.Linear(d_model, num_duration_buckets)
         self.duration_intent_embed = nn.Embedding(num_duration_buckets, d_model)
-        self.dynamics_head = nn.Linear(d_model, num_dynamics_buckets)
-        self.dynamics_intent_embed = nn.Embedding(num_dynamics_buckets, d_model)
+        self.dynamics_head = nn.Linear(d_model, num_dynamics_buckets) if self.predict_dynamics else None
+        self.dynamics_intent_embed = (
+            nn.Embedding(num_dynamics_buckets, d_model) if self.use_dynamics_intent_in_plan else None
+        )
         self.continuous_param_head = (
             nn.Sequential(
                 nn.Linear(d_model, d_model),
@@ -162,11 +170,13 @@ class PrimitivePlannerTransformer(nn.Module):
                 f"Planner history length {sequence_length} exceeds configured max_length={self.max_length}."
             )
         positions = torch.arange(sequence_length, device=primitive.device).unsqueeze(0).expand(batch_size, sequence_length)
+        prim_enc = self.primitive_embed(primitive)
+        dyn_enc = self.dynamics_embed(dynamics) if self.use_dynamics_in_history else torch.zeros_like(prim_enc)
         hidden = (
-            self.primitive_embed(primitive)
+            prim_enc
             + self.family_embed(family)
             + self.duration_embed(duration)
-            + self.dynamics_embed(dynamics)
+            + dyn_enc
             + self.position_embed(positions)
             + self.history_context_proj(history_context)
         )
@@ -219,12 +229,20 @@ class PrimitivePlannerTransformer(nn.Module):
         else:
             duration_intent = self.duration_intent_embed(duration_bucket)
 
-        if dynamics_bucket is None:
+        if not self.use_dynamics_intent_in_plan:
+            dynamics_intent = torch.zeros_like(planner_state)
+        elif dynamics_bucket is None:
             if dynamics_logits is None:
                 raise ValueError("dynamics_bucket or dynamics_logits is required to build the plan embedding.")
-            dynamics_intent = torch.softmax(dynamics_logits, dim=-1) @ self.dynamics_intent_embed.weight
+            if self.dynamics_intent_embed is None:
+                dynamics_intent = torch.zeros_like(planner_state)
+            else:
+                dynamics_intent = torch.softmax(dynamics_logits, dim=-1) @ self.dynamics_intent_embed.weight
         else:
-            dynamics_intent = self.dynamics_intent_embed(dynamics_bucket)
+            if self.dynamics_intent_embed is None:
+                dynamics_intent = torch.zeros_like(planner_state)
+            else:
+                dynamics_intent = self.dynamics_intent_embed(dynamics_bucket)
 
         plan_embedding = self.plan_projection(
             torch.cat(
@@ -261,7 +279,14 @@ class PrimitivePlannerTransformer(nn.Module):
         primitive_logits = primitive_logits + soft_family_mask.clamp(min=1e-6).log()
 
         duration_logits = self.duration_head(planner_state)
-        dynamics_logits = self.dynamics_head(planner_state)
+        if self.dynamics_head is not None:
+            dynamics_logits = self.dynamics_head(planner_state)
+        else:
+            dynamics_logits = torch.zeros(
+                (batch_size, self.num_dynamics_buckets),
+                device=device,
+                dtype=planner_state.dtype,
+            )
         continuous_params = (
             self.continuous_param_head(planner_state)
             if self.continuous_param_head is not None
@@ -305,7 +330,13 @@ class PrimitivePlannerTransformer(nn.Module):
         family_mask = self.family_primitive_mask[family_index]
         primitive_logits = primitive_logits.masked_fill(~family_mask, -1.0e4)
         duration_logits = self.duration_head(planner_state)
-        dynamics_logits = self.dynamics_head(planner_state)
+        batch_sz = planner_state.shape[0]
+        dev = planner_state.device
+        dtype = planner_state.dtype
+        if self.dynamics_head is not None:
+            dynamics_logits = self.dynamics_head(planner_state)
+        else:
+            dynamics_logits = torch.zeros((batch_sz, self.num_dynamics_buckets), device=dev, dtype=dtype)
         continuous_params = (
             self.continuous_param_head(planner_state)
             if self.continuous_param_head is not None
@@ -383,6 +414,9 @@ def build_planner_from_config(metadata: PlannerMetadata, config: dict[str, Any])
         primitive_selector_dropout=float(config["primitive_selector_dropout"])
         if config.get("primitive_selector_dropout") is not None
         else None,
+        predict_dynamics=bool(config.get("predict_dynamics", True)),
+        use_dynamics_intent_in_plan=bool(config.get("use_dynamics_intent_in_plan", True)),
+        use_dynamics_in_history=bool(config.get("use_dynamics_in_history", True)),
     )
 
 

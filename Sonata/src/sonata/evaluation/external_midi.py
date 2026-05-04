@@ -332,7 +332,9 @@ def evaluate_external_midi_benchmark(
                             output_path=videos_root / f"{_safe_filename(str(row.song_id))}_{_safe_filename(str(row.episode_id))}.mp4",
                             fps=video_fps,
                             temp_root=frames_tmp_root,
-                            audio_events=audio_events,
+                            audio_source="robot_midi" if audio_events else "none",
+                            robot_midi_events=audio_events,
+                            logger=logger,
                         )
                     except Exception as exc:
                         render_error = str(exc)

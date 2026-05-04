@@ -11,7 +11,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from sonata.transformer.dataset import PlannerMetadata
-from sonata.transformer.model import PrimitiveSelectionMLP, build_planner_from_config
+from sonata.transformer.model import PrimitivePlannerTransformer, PrimitiveSelectionMLP, build_planner_from_config
 
 
 def _metadata() -> PlannerMetadata:
@@ -101,3 +101,47 @@ def test_build_planner_uses_mlp_primitive_selector() -> None:
 
     assert isinstance(model.primitive_head, PrimitiveSelectionMLP)
     assert outputs["primitive_logits"].shape == (2, 4)
+
+
+def test_build_planner_without_dynamics_prediction() -> None:
+    model = PrimitivePlannerTransformer(
+        num_primitives=4,
+        num_duration_buckets=3,
+        num_dynamics_buckets=2,
+        num_families=2,
+        primitive_to_family=[0, 0, 1, 1],
+        history_context_dim=20,
+        goal_context_dim=17,
+        continuous_param_dim=1,
+        d_model=16,
+        nhead=4,
+        num_layers=1,
+        dim_feedforward=32,
+        dropout=0.0,
+        max_length=4,
+        plan_embedding_dim=12,
+        primitive_selector_type="linear",
+        predict_dynamics=False,
+        use_dynamics_intent_in_plan=False,
+    )
+    assert model.dynamics_head is None
+    assert model.dynamics_intent_embed is None
+    batch = _batch()
+
+    outputs = model(batch)
+    assert outputs["dynamics_logits"].shape == (2, 2)
+    assert torch.allclose(outputs["dynamics_logits"], torch.zeros_like(outputs["dynamics_logits"]))
+    assert torch.allclose(outputs["dynamics_intent"], torch.zeros_like(outputs["dynamics_intent"]))
+    assert outputs["plan_embedding"].shape == (2, 12)
+
+    oracle = model.oracle_plan_embedding(
+        batch,
+        family_index=torch.tensor([0, 1], dtype=torch.long),
+        primitive_index=torch.tensor([1, 2], dtype=torch.long),
+        duration_bucket=torch.tensor([2, 0], dtype=torch.long),
+        dynamics_bucket=torch.tensor([1, 0], dtype=torch.long),
+    )
+    assert oracle["dynamics_logits"].shape == (2, 2)
+    assert torch.allclose(oracle["dynamics_logits"], torch.zeros_like(oracle["dynamics_logits"]))
+    assert torch.allclose(oracle["dynamics_intent"], torch.zeros_like(oracle["dynamics_intent"]))
+    assert oracle["plan_embedding"].shape == (2, 12)

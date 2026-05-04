@@ -116,6 +116,11 @@ def run_transformer_training(config: dict[str, Any], logger: logging.Logger) -> 
                 "planner/primitive_selector_type": str(config.get("primitive_selector_type", "linear")),
                 "planner/primitive_remap_enabled": bool(remap_summary.get("enabled", False)),
                 "planner/num_remapped_primitives": int(remap_summary.get("num_remapped_primitives", 0)),
+                "planner/predict_dynamics": bool(config.get("predict_dynamics", True)),
+                "planner/use_dynamics_loss": bool(config.get("use_dynamics_loss", True)),
+                "planner/use_dynamics_intent_in_plan": bool(config.get("use_dynamics_intent_in_plan", True)),
+                "planner/log_dynamics_metrics": bool(config.get("log_dynamics_metrics", True)),
+                "planner/use_dynamics_in_history": bool(config.get("use_dynamics_in_history", True)),
             }
         )
 
@@ -318,6 +323,16 @@ def run_transformer_training(config: dict[str, Any], logger: logging.Logger) -> 
 
 
 def normalize_transformer_config(config: dict[str, Any]) -> dict[str, Any]:
+    incoming = set(config.keys())
+    if "use_dynamics_in_plan_embedding" in incoming and "use_dynamics_intent_in_plan" in incoming:
+        if bool(config["use_dynamics_in_plan_embedding"]) != bool(config["use_dynamics_intent_in_plan"]):
+            raise ValueError(
+                "use_dynamics_in_plan_embedding and use_dynamics_intent_in_plan disagree; remove one or align values."
+            )
+    if "use_dynamics_target" in incoming and "predict_dynamics" in incoming:
+        if bool(config["use_dynamics_target"]) != bool(config["predict_dynamics"]):
+            raise ValueError("use_dynamics_target and predict_dynamics disagree; remove one or align values.")
+
     normalized = dict(config)
     raw_variant = str(normalized.get("model_variant", "factored_goal_conditioned"))
     normalized["model_variant"] = LEGACY_VARIANT_ALIASES.get(raw_variant, raw_variant)
@@ -347,6 +362,29 @@ def normalize_transformer_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("primitive_selector_layers", 2)
     normalized.setdefault("primitive_selector_dropout", normalized.get("dropout", 0.0))
     normalized.setdefault("primitive_remap", {"enabled": False})
+
+    if "use_dynamics_in_plan_embedding" in incoming and "use_dynamics_intent_in_plan" not in incoming:
+        normalized["use_dynamics_intent_in_plan"] = bool(config["use_dynamics_in_plan_embedding"])
+    if "use_dynamics_target" in incoming and "predict_dynamics" not in incoming:
+        normalized["predict_dynamics"] = bool(config["use_dynamics_target"])
+
+    predict_dynamics = bool(normalized.get("predict_dynamics", True))
+    normalized["predict_dynamics"] = predict_dynamics
+    if "use_dynamics_loss" not in incoming:
+        normalized["use_dynamics_loss"] = predict_dynamics
+    else:
+        normalized["use_dynamics_loss"] = bool(normalized["use_dynamics_loss"])
+    plan_explicit = "use_dynamics_intent_in_plan" in incoming or "use_dynamics_in_plan_embedding" in incoming
+    if not plan_explicit:
+        normalized["use_dynamics_intent_in_plan"] = predict_dynamics
+    else:
+        normalized["use_dynamics_intent_in_plan"] = bool(normalized.get("use_dynamics_intent_in_plan"))
+    if "log_dynamics_metrics" not in incoming:
+        normalized["log_dynamics_metrics"] = predict_dynamics
+    else:
+        normalized["log_dynamics_metrics"] = bool(normalized["log_dynamics_metrics"])
+    normalized.setdefault("use_dynamics_in_history", True)
+    normalized["use_dynamics_in_history"] = bool(normalized["use_dynamics_in_history"])
     return normalized
 
 
@@ -374,6 +412,18 @@ def validate_transformer_config(config: dict[str, Any]) -> None:
         raise ValueError("primitive_selector_layers must be >= 1.")
     if int(config.get("primitive_selector_hidden_dim", 1)) <= 0:
         raise ValueError("primitive_selector_hidden_dim must be positive.")
+    try:
+        predict_dynamics = bool(config["predict_dynamics"])
+        use_dynamics_loss = bool(config["use_dynamics_loss"])
+        use_dynamics_intent_in_plan = bool(config["use_dynamics_intent_in_plan"])
+        bool(config["log_dynamics_metrics"])
+        bool(config["use_dynamics_in_history"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Dynamics-related config flags must be bool-convertible.") from exc
+    if not predict_dynamics and use_dynamics_loss:
+        raise ValueError("predict_dynamics=False is incompatible with use_dynamics_loss=True.")
+    if not predict_dynamics and use_dynamics_intent_in_plan:
+        raise ValueError("predict_dynamics=False is incompatible with use_dynamics_intent_in_plan=True.")
 
 
 def build_dataloaders_and_model(token_df, metadata: PlannerMetadata, primitive_root: Path, config: dict[str, Any]):
@@ -516,11 +566,18 @@ def build_loss_config(
             metadata.primitive_ids,
             device=device,
         ),
+        "predict_dynamics": bool(config.get("predict_dynamics", True)),
+        "use_dynamics_loss": bool(config.get("use_dynamics_loss", True)),
+        "log_dynamics_metrics": bool(config.get("log_dynamics_metrics", True)),
         "loss_weights": {
             "family": float(config.get("family_loss_weight", 1.0)),
             "primitive": float(config.get("primitive_loss_weight", 1.0)),
             "duration": float(config.get("duration_loss_weight", 0.35)),
-            "dynamics": float(config.get("dynamics_loss_weight", 0.25)),
+            "dynamics": (
+                0.0
+                if not bool(config.get("use_dynamics_loss", True))
+                else float(config.get("dynamics_loss_weight", 0.25))
+            ),
             "params": float(config.get("param_loss_weight", 0.0)),
         },
         "normalize_loss_by_active_weights": bool(config.get("normalize_loss_by_active_weights", True)),
@@ -601,6 +658,9 @@ def evaluate(
     primitive_entropy: list[float] = []
     generated: list[dict[str, Any]] = []
 
+    predict_dynamics = bool(loss_config.get("predict_dynamics", True))
+    log_dynamics_metrics = bool(loss_config.get("log_dynamics_metrics", True))
+
     for batch in tqdm(loader, desc="Eval transformer", leave=False):
         batch = move_to_device(batch, str(device))
         outputs = model(batch)
@@ -633,8 +693,9 @@ def evaluate(
         primitive_pred.extend(predicted_primitive.tolist())
         duration_truth.extend(batch["target_duration"].tolist())
         duration_pred.extend(predicted_duration.tolist())
-        dynamics_truth.extend(batch["target_dynamics"].tolist())
-        dynamics_pred.extend(predicted_dynamics.tolist())
+        if log_dynamics_metrics:
+            dynamics_truth.extend(batch["target_dynamics"].tolist())
+            dynamics_pred.extend(predicted_dynamics.tolist())
 
         family_topk_hits.append(topk_accuracy(scaled_family_logits, batch["target_family"], topk=topk))
         primitive_topk_hits.append(topk_accuracy(masked_primitive_logits, batch["target_primitive"], topk=topk))
@@ -653,6 +714,7 @@ def evaluate(
             batch["target_dynamics"].tolist(),
             predicted_dynamics.tolist(),
         ):
+            pred_dyn_rec = None if not predict_dynamics else int(pred_dynamics)
             generated.append(
                 {
                     "target_family": int(truth_family),
@@ -666,7 +728,8 @@ def evaluate(
                     "target_duration": int(truth_duration),
                     "predicted_duration": int(pred_duration),
                     "target_dynamics": int(truth_dynamics),
-                    "predicted_dynamics": int(pred_dynamics),
+                    "predicted_dynamics": pred_dyn_rec,
+                    "dynamics_enabled": predict_dynamics,
                 }
             )
 
@@ -742,13 +805,18 @@ def compute_loss(
         label_smoothing=label_smoothing,
         focal_gamma=focal_gamma if "duration" in focal_heads else 0.0,
     )
-    dynamics_loss = classification_loss(
-        dynamics_logits,
-        batch["target_dynamics"],
-        class_weights=None,
-        label_smoothing=label_smoothing,
-        focal_gamma=focal_gamma if "dynamics" in focal_heads else 0.0,
-    )
+    use_dynamics_loss = bool(loss_config.get("use_dynamics_loss", True))
+    log_dynamics_metrics = bool(loss_config.get("log_dynamics_metrics", True))
+    if use_dynamics_loss:
+        dynamics_loss = classification_loss(
+            dynamics_logits,
+            batch["target_dynamics"],
+            class_weights=None,
+            label_smoothing=label_smoothing,
+            focal_gamma=focal_gamma if "dynamics" in focal_heads else 0.0,
+        )
+    else:
+        dynamics_loss = family_logits.sum() * 0.0
     if outputs.get("continuous_param_pred") is not None and batch["target_params"].numel() > 0:
         param_loss = F.smooth_l1_loss(outputs["continuous_param_pred"], batch["target_params"])
     else:
@@ -770,7 +838,6 @@ def compute_loss(
     predicted_family = family_logits.argmax(dim=-1)
     predicted_primitive = mask_logits_to_family(primitive_logits, predicted_family, family_mask).argmax(dim=-1)
     predicted_duration = duration_logits.argmax(dim=-1)
-    predicted_dynamics = dynamics_logits.argmax(dim=-1)
 
     metrics = {
         "family_loss": float(family_loss.item()),
@@ -781,8 +848,10 @@ def compute_loss(
         "family_accuracy": float((predicted_family == batch["target_family"]).float().mean().item()),
         "primitive_accuracy": float((predicted_primitive == batch["target_primitive"]).float().mean().item()),
         "duration_accuracy": float((predicted_duration == batch["target_duration"]).float().mean().item()),
-        "dynamics_accuracy": float((predicted_dynamics == batch["target_dynamics"]).float().mean().item()),
     }
+    if log_dynamics_metrics:
+        predicted_dynamics = dynamics_logits.argmax(dim=-1)
+        metrics["dynamics_accuracy"] = float((predicted_dynamics == batch["target_dynamics"]).float().mean().item())
     if outputs.get("continuous_param_pred") is not None and batch["target_params"].numel() > 0:
         metrics["param_mae"] = float(torch.mean(torch.abs(outputs["continuous_param_pred"] - batch["target_params"])).item())
     return total_loss, metrics
