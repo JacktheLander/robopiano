@@ -30,6 +30,7 @@ from sonata.transformer.model import (
     TransformerActionRegressor,
     build_planner_from_config,
 )
+from sonata.transformer.primitive_remap import build_remap_tensor
 from sonata.utils.checkpointing import find_latest_checkpoint, load_checkpoint, save_checkpoint
 from sonata.utils.experiment import make_run_paths
 from sonata.utils.io import write_json, write_table
@@ -52,11 +53,14 @@ def run_transformer_training(config: dict[str, Any], logger: logging.Logger) -> 
         primitive_root,
         family_mapping_mode=str(config.get("family_mapping_mode", "heuristic_stats")),
         continuous_param_names=config.get("continuous_param_names"),
+        primitive_remap_config=config.get("primitive_remap"),
     )
     run_paths = make_run_paths(output_root, "transformer", config["experiment_name"], int(config["seed"]), resume=bool(config.get("resume", False)))
     logger.info("Transformer run directory: %s", run_paths.root)
     write_json(config, run_paths.artifacts / "config.json")
     write_json(metadata.to_payload(), run_paths.artifacts / "planner_metadata.json")
+    remap_summary = metadata.primitive_remap_summary or {"enabled": False}
+    write_json(remap_summary, run_paths.artifacts / "primitive_remap_summary.json")
     write_table(pd.DataFrame(family_mapping_records(metadata)), run_paths.artifacts / "primitive_family_mapping")
     if metadata.continuous_param_dim > 0:
         write_table(
@@ -109,6 +113,9 @@ def run_transformer_training(config: dict[str, Any], logger: logging.Logger) -> 
                 "planner/family_mapping_mode": metadata.family_mapping_mode,
                 "planner/num_families": metadata.num_families,
                 "planner/plan_embedding_dim": int(config["plan_embedding_dim"]),
+                "planner/primitive_selector_type": str(config.get("primitive_selector_type", "linear")),
+                "planner/primitive_remap_enabled": bool(remap_summary.get("enabled", False)),
+                "planner/num_remapped_primitives": int(remap_summary.get("num_remapped_primitives", 0)),
             }
         )
 
@@ -335,6 +342,11 @@ def normalize_transformer_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("balanced_sampler_target", "family")
     normalized.setdefault("eval_temperature", 1.0)
     normalized.setdefault("topk", 5)
+    normalized.setdefault("primitive_selector_type", "linear")
+    normalized.setdefault("primitive_selector_hidden_dim", int(normalized.get("d_model", 256)) * 2)
+    normalized.setdefault("primitive_selector_layers", 2)
+    normalized.setdefault("primitive_selector_dropout", normalized.get("dropout", 0.0))
+    normalized.setdefault("primitive_remap", {"enabled": False})
     return normalized
 
 
@@ -356,6 +368,12 @@ def validate_transformer_config(config: dict[str, Any]) -> None:
         raise ValueError("focal_gamma must be non-negative.")
     if str(config.get("balanced_sampler_target", "family")) not in {"family", "primitive", "hybrid"}:
         raise ValueError("balanced_sampler_target must be one of: family, primitive, hybrid.")
+    if str(config.get("primitive_selector_type", "linear")) not in {"linear", "mlp"}:
+        raise ValueError("primitive_selector_type must be one of: linear, mlp.")
+    if int(config.get("primitive_selector_layers", 2)) < 1:
+        raise ValueError("primitive_selector_layers must be >= 1.")
+    if int(config.get("primitive_selector_hidden_dim", 1)) <= 0:
+        raise ValueError("primitive_selector_hidden_dim must be positive.")
 
 
 def build_dataloaders_and_model(token_df, metadata: PlannerMetadata, primitive_root: Path, config: dict[str, Any]):
@@ -492,6 +510,12 @@ def build_loss_config(
         "family_class_weights": family_class_weights,
         "primitive_class_weights": primitive_class_weights,
         "family_primitive_mask": family_mask_tensor(metadata, device=device),
+        "primitive_remap_tensor": build_remap_tensor(
+            metadata.num_primitives,
+            metadata.primitive_remap_summary,
+            metadata.primitive_ids,
+            device=device,
+        ),
         "loss_weights": {
             "family": float(config.get("family_loss_weight", 1.0)),
             "primitive": float(config.get("primitive_loss_weight", 1.0)),
@@ -594,6 +618,7 @@ def evaluate(
             outputs,
             family_mask=loss_config["family_primitive_mask"],
             temperature=eval_temperature,
+            remap_tensor=loss_config.get("primitive_remap_tensor"),
         )
         scaled_family_logits = decoded["scaled_family_logits"]
         masked_primitive_logits = decoded["masked_primitive_logits"]

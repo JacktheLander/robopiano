@@ -17,14 +17,35 @@ def mask_logits_to_family(logits: torch.Tensor, family_index: torch.Tensor, fami
     return logits.masked_fill(~mask, fill_value)
 
 
+def collapse_weak_primitive_logits(
+    primitive_logits: torch.Tensor,
+    remap_tensor: torch.Tensor | None,
+) -> torch.Tensor:
+    if remap_tensor is None:
+        return primitive_logits
+    collapsed = primitive_logits.clone()
+    remap = remap_tensor.to(device=collapsed.device, dtype=torch.long)
+    for weak_index, strong_index in enumerate(remap.tolist()):
+        if int(strong_index) == int(weak_index):
+            continue
+        collapsed[..., int(strong_index)] = torch.logaddexp(
+            collapsed[..., int(strong_index)],
+            collapsed[..., int(weak_index)],
+        )
+        collapsed[..., int(weak_index)] = -1.0e4
+    return collapsed
+
+
 def decode_factored_outputs(
     outputs: dict[str, torch.Tensor],
     *,
     family_mask: torch.Tensor,
     temperature: float = 1.0,
+    remap_tensor: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     scaled_family_logits = scale_logits(torch.nan_to_num(outputs["family_logits"]), temperature)
     scaled_primitive_logits = scale_logits(torch.nan_to_num(outputs["primitive_logits"]), temperature)
+    scaled_primitive_logits = collapse_weak_primitive_logits(scaled_primitive_logits, remap_tensor)
     scaled_duration_logits = scale_logits(torch.nan_to_num(outputs["duration_logits"]), temperature)
     scaled_dynamics_logits = scale_logits(torch.nan_to_num(outputs["dynamics_logits"]), temperature)
 

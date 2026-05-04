@@ -11,7 +11,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from sonata.transformer.dataset import PlannerMetadata, family_mask_tensor
-from sonata.transformer.trainer import compute_loss
+from sonata.transformer.trainer import compute_loss, normalize_transformer_config, validate_transformer_config
 
 
 def _metadata() -> PlannerMetadata:
@@ -71,3 +71,40 @@ def test_compute_loss_masks_primitive_predictions_by_family() -> None:
     assert metrics["family_accuracy"] == 1.0
     assert metrics["primitive_accuracy"] in {0.0, 1.0}
     assert metrics["primitive_loss"] > 0.0
+
+
+def test_transformer_config_defaults_keep_linear_selector_and_remap_disabled() -> None:
+    config = normalize_transformer_config(
+        {
+            "model_variant": "factored_goal_conditioned",
+            "d_model": 16,
+            "context_length": 4,
+            "plan_embedding_dim": 12,
+            "eval_temperature": 1.0,
+        }
+    )
+
+    validate_transformer_config(config)
+
+    assert config["primitive_selector_type"] == "linear"
+    assert config["primitive_selector_hidden_dim"] == 32
+    assert config["primitive_remap"] == {"enabled": False}
+
+
+def test_transformer_config_rejects_invalid_primitive_selector() -> None:
+    config = normalize_transformer_config(
+        {
+            "model_variant": "factored_goal_conditioned",
+            "d_model": 16,
+            "context_length": 4,
+            "plan_embedding_dim": 12,
+            "primitive_selector_type": "bad",
+        }
+    )
+
+    try:
+        validate_transformer_config(config)
+    except ValueError as exc:
+        assert "primitive_selector_type" in str(exc)
+    else:
+        raise AssertionError("Expected invalid primitive selector config to raise ValueError.")

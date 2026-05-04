@@ -38,6 +38,10 @@ class PrimitivePlannerTransformer(nn.Module):
         dropout: float,
         max_length: int,
         plan_embedding_dim: int | None = None,
+        primitive_selector_type: str = "linear",
+        primitive_selector_hidden_dim: int | None = None,
+        primitive_selector_layers: int = 2,
+        primitive_selector_dropout: float | None = None,
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
@@ -84,7 +88,18 @@ class PrimitivePlannerTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.LayerNorm(d_model),
         )
-        self.primitive_head = nn.Linear(d_model, num_primitives)
+        if str(primitive_selector_type) == "mlp":
+            self.primitive_head = PrimitiveSelectionMLP(
+                input_dim=d_model,
+                hidden_dim=primitive_selector_hidden_dim or d_model * 2,
+                output_dim=num_primitives,
+                dropout=primitive_selector_dropout if primitive_selector_dropout is not None else dropout,
+                num_layers=primitive_selector_layers,
+            )
+        elif str(primitive_selector_type) == "linear":
+            self.primitive_head = nn.Linear(d_model, num_primitives)
+        else:
+            raise ValueError("primitive_selector_type must be one of: linear, mlp.")
         self.primitive_intent_embed = nn.Embedding(num_primitives, d_model)
         self.duration_head = nn.Linear(d_model, num_duration_buckets)
         self.duration_intent_embed = nn.Embedding(num_duration_buckets, d_model)
@@ -360,7 +375,47 @@ def build_planner_from_config(metadata: PlannerMetadata, config: dict[str, Any])
         dropout=float(config["dropout"]),
         max_length=int(config["context_length"]),
         plan_embedding_dim=planner_output_dim_from_config(config),
+        primitive_selector_type=str(config.get("primitive_selector_type", "linear")),
+        primitive_selector_hidden_dim=int(config["primitive_selector_hidden_dim"])
+        if config.get("primitive_selector_hidden_dim") is not None
+        else None,
+        primitive_selector_layers=int(config.get("primitive_selector_layers", 2)),
+        primitive_selector_dropout=float(config["primitive_selector_dropout"])
+        if config.get("primitive_selector_dropout") is not None
+        else None,
     )
+
+
+class PrimitiveSelectionMLP(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        dropout: float,
+        num_layers: int = 2,
+    ) -> None:
+        super().__init__()
+        if int(num_layers) <= 1:
+            self.net = nn.Linear(int(input_dim), int(output_dim))
+            return
+        layers: list[nn.Module] = []
+        current_dim = int(input_dim)
+        for _ in range(int(num_layers) - 1):
+            layers.extend(
+                [
+                    nn.Linear(current_dim, int(hidden_dim)),
+                    nn.LayerNorm(int(hidden_dim)),
+                    nn.GELU(),
+                    nn.Dropout(float(dropout)),
+                ]
+            )
+            current_dim = int(hidden_dim)
+        layers.append(nn.Linear(current_dim, int(output_dim)))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.net(inputs)
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

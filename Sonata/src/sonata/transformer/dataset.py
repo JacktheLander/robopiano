@@ -12,6 +12,11 @@ from torch.utils.data import Dataset
 
 from sonata.data.loading import build_manifest_lookup, load_episode_record, load_stage1_source_manifest
 from sonata.transformer.families import PrimitiveFamilyMapping, derive_primitive_family_mapping
+from sonata.transformer.primitive_remap import (
+    apply_primitive_remap_to_token_df,
+    load_primitive_remap,
+    resolve_remap_path,
+)
 from sonata.utils.io import read_json, read_table
 
 SCORE_HISTOGRAM_DIM = 12
@@ -97,6 +102,7 @@ class PlannerMetadata:
     continuous_param_std: list[float]
     goal_context_features: list[str]
     history_context_features: list[str]
+    primitive_remap_summary: dict[str, Any] | None = None
 
     @property
     def continuous_param_dim(self) -> int:
@@ -134,6 +140,7 @@ class PlannerMetadata:
             "continuous_param_std": [float(value) for value in self.continuous_param_std],
             "goal_context_features": list(self.goal_context_features),
             "history_context_features": list(self.history_context_features),
+            "primitive_remap_summary": self.primitive_remap_summary,
         }
 
     @classmethod
@@ -158,6 +165,7 @@ class PlannerMetadata:
             continuous_param_std=[float(item) for item in payload.get("continuous_param_std", [])],
             goal_context_features=[str(item) for item in payload.get("goal_context_features", [])],
             history_context_features=[str(item) for item in payload.get("history_context_features", [])],
+            primitive_remap_summary=payload.get("primitive_remap_summary"),
         )
 
 
@@ -425,6 +433,7 @@ def load_transformer_inputs(
     *,
     family_mapping_mode: str = "heuristic_stats",
     continuous_param_names: list[str] | tuple[str, ...] | None = None,
+    primitive_remap_config: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, PlannerMetadata]:
     token_df = read_table(primitive_root / "tokens" / "primitive_tokens")
     vocabulary = read_json(primitive_root / "tokens" / "primitive_vocabulary.json")
@@ -449,6 +458,22 @@ def load_transformer_inputs(
     primitive_ids = [str(item) for item in vocabulary.get("primitive_ids", [])]
     if not primitive_ids:
         primitive_ids = sorted(token_df["primitive_id"].astype(str).unique().tolist())
+
+    remap_summary: dict[str, Any] | None = None
+    if bool((primitive_remap_config or {}).get("enabled", False)):
+        remap_path = resolve_remap_path(primitive_root, primitive_remap_config)
+        remap_payload = load_primitive_remap(remap_path)
+        token_df, remap_summary = apply_primitive_remap_to_token_df(
+            token_df,
+            vocabulary,
+            remap_payload,
+            apply_to_history=bool((primitive_remap_config or {}).get("apply_to_history", False)),
+            preserve_original_columns=bool((primitive_remap_config or {}).get("preserve_original_columns", True)),
+        )
+        if remap_payload is None:
+            remap_summary["path"] = str(remap_path) if remap_path is not None else None
+    else:
+        remap_summary = {"enabled": False, "num_remapped_primitives": 0, "remapped_primitives": [], "canonical_targets": [], "path": None}
 
     family_mapping = derive_primitive_family_mapping(
         token_df,
@@ -498,6 +523,7 @@ def load_transformer_inputs(
         continuous_param_std=param_std,
         goal_context_features=goal_context_feature_names(),
         history_context_features=history_context_feature_names(),
+        primitive_remap_summary=remap_summary,
     )
     return token_df, metadata
 

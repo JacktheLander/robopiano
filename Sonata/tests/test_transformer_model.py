@@ -11,7 +11,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from sonata.transformer.dataset import PlannerMetadata
-from sonata.transformer.model import build_planner_from_config
+from sonata.transformer.model import PrimitiveSelectionMLP, build_planner_from_config
 
 
 def _metadata() -> PlannerMetadata:
@@ -77,3 +77,27 @@ def test_oracle_plan_embedding_uses_forced_tokens() -> None:
     assert oracle_outputs["plan_embedding"].shape == (2, 12)
     assert oracle_outputs["family_intent"].shape == (2, 16)
     assert not torch.allclose(default_outputs["plan_embedding"], oracle_outputs["plan_embedding"])
+
+
+def test_build_planner_uses_mlp_primitive_selector() -> None:
+    model = build_planner_from_config(
+        _metadata(),
+        {
+            "d_model": 16,
+            "nhead": 4,
+            "num_layers": 1,
+            "dim_feedforward": 32,
+            "dropout": 0.0,
+            "context_length": 4,
+            "plan_embedding_dim": 12,
+            "primitive_selector_type": "mlp",
+            "primitive_selector_hidden_dim": 24,
+            "primitive_selector_layers": 2,
+            "primitive_selector_dropout": 0.1,
+        },
+    )
+
+    outputs = model(_batch())
+
+    assert isinstance(model.primitive_head, PrimitiveSelectionMLP)
+    assert outputs["primitive_logits"].shape == (2, 4)
