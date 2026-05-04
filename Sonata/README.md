@@ -233,6 +233,119 @@ Planner validation metrics are written during training into:
 - `outputs/transformer/<run>/artifacts/family_confusion_best.csv`
 - `outputs/transformer/<run>/artifacts/primitive_family_mapping.csv`
 - `outputs/transformer/<run>/artifacts/planner_metadata.json`
+ ## Stage 2 Primitive Remap + MLP Selector
+
+  Stage 2 supports two conservative ablation switches for improving primitive selection without
+  rerunning Stage 1:
+
+  1. `primitive_selector_type`: choose the primitive prediction head.
+  2. `primitive_remap`: optionally canonicalize weak Stage 1 primitive labels to stronger similar
+  primitives during Stage 2 dataset loading.
+
+  Stage 1 primitives are not deleted, and the primitive vocabulary size is unchanged.
+
+  ### Primitive Selector Head
+
+  Default behavior preserves the original linear primitive head:
+
+  ```yaml
+  primitive_selector_type: linear
+
+  To use the FFN MLP primitive selector:
+
+  primitive_selector_type: mlp
+  primitive_selector_hidden_dim: 384
+  primitive_selector_layers: 2
+  primitive_selector_dropout: 0.3
+
+  The MLP only replaces the primitive selection head. The factored planner structure remains:
+
+  transformer history encoder
+  → family prediction
+  → primitive prediction
+  → duration/dynamics prediction
+  → plan embedding
+
+  ### Weak-to-Strong Primitive Remap
+
+  Primitive remapping is optional and runs during Stage 2 dataset loading. It maps weak primitive
+  labels to stronger canonical primitives without modifying Stage 1 artifacts.
+
+  Example config:
+
+  primitive_remap:
+    enabled: true
+    path: null
+    apply_to_history: true
+    preserve_original_columns: true
+    recompute_family_after_remap: true
+
+  If path is null, the default remap path is:
+
+  <primitive_root>/artifacts/primitive_remap.json
+
+  Example remap JSON:
+
+  {
+    "enabled": true,
+    "mode": "weak_to_strong",
+    "remap": {
+      "3": "7",
+      "14": "9",
+      "22": "9"
+    },
+    "reason": {
+      "3": "low_f1_similar_to_7"
+    }
+  }
+
+  Remap keys and values may be primitive IDs or integer primitive indices represented as strings.
+
+  ### Build a Remap File
+
+  python Sonata/scripts/build_primitive_remap.py \
+    --primitive-root Sonata/outputs/primitives/medium \
+    --min-frequency 50 \
+    --max-weak-f1 0.25 \
+    --same-family-only \
+    --min-similarity 0.70
+
+  This writes:
+
+  <primitive_root>/artifacts/primitive_remap.json
+  <primitive_root>/artifacts/primitive_remap_report.csv
+
+  ### Train With Remap + MLP
+
+  python Sonata/scripts/train_transformer.py \
+    --profile medium \
+    --config Sonata/configs/transformer/medium_remap_mlp.yaml
+
+  ### Ablations
+
+  Use these settings to compare:
+
+  # A. Baseline
+  primitive_selector_type: linear
+  primitive_remap:
+    enabled: false
+
+  # B. Remap only
+  primitive_selector_type: linear
+  primitive_remap:
+    enabled: true
+
+  # C. MLP only
+  primitive_selector_type: mlp
+  primitive_remap:
+    enabled: false
+
+  # D. Remap + MLP
+  primitive_selector_type: mlp
+  primitive_remap:
+    enabled: true
+
+  Training writes primitive_remap_summary.json into the transformer run artifacts for inspection.
 
 ## Key Stage 2 config fields
 
