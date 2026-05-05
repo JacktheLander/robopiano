@@ -42,6 +42,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--rollout-device", default=None)
     parser.add_argument("--rollout-source-mode", default=None)
+    parser.add_argument("--restore-mode", choices=["hands_only", "neutral", "unsafe_legacy"], default=None)
+    parser.add_argument("--render-video", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--max-render-instances", type=int, default=None)
+    parser.add_argument("--video-audio-source", choices=["none", "robot_midi"], default=None)
+    parser.add_argument("--causal-eval", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--zero-action-ablation", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--require-contact", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--example-midi-paths", nargs="*", default=None)
     parser.add_argument("--robopianist-root", default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -84,6 +91,7 @@ def main() -> None:
     sampling = dict(config.get("sampling", {}))
     events = dict(config.get("events", {}))
     rollout = dict(config.get("rollout", {}))
+    causal_eval = dict(config.get("causal_eval", rollout.get("causal_eval", {})))
     if args.max_instances is not None:
         sampling["max_instances"] = int(args.max_instances)
     if args.instances_per_primitive is not None:
@@ -106,10 +114,29 @@ def main() -> None:
         events["use_piano_states"] = bool(args.use_piano_states)
     if args.rollout_source_mode is not None:
         rollout["source_mode"] = str(args.rollout_source_mode)
+    if args.restore_mode is not None:
+        rollout["restore_mode"] = str(args.restore_mode)
+        causal_eval["restore_mode"] = str(args.restore_mode)
+        if args.restore_mode == "unsafe_legacy":
+            causal_eval["enabled"] = False
+    if args.render_video is not None:
+        rollout["render_video"] = bool(args.render_video)
+    if args.max_render_instances is not None:
+        rollout["max_render_instances"] = int(args.max_render_instances)
+    if args.video_audio_source is not None:
+        rollout["video_audio_source"] = str(args.video_audio_source)
+        causal_eval["video_audio_source"] = str(args.video_audio_source)
+    if args.causal_eval is not None:
+        causal_eval["enabled"] = bool(args.causal_eval)
+    if args.zero_action_ablation is not None:
+        causal_eval["run_zero_action_ablation"] = bool(args.zero_action_ablation)
+    if args.require_contact is not None:
+        causal_eval["require_contact_for_keypress"] = bool(args.require_contact)
     if args.example_midi_paths is not None:
         rollout["example_midi_paths"] = [str(_resolve_user_path(path)) for path in args.example_midi_paths]
     config["sampling"] = sampling
     config["events"] = events
+    config["causal_eval"] = causal_eval
     config["rollout"] = rollout
 
     payload = evaluate_primitives_online(config=config, logger=logger)
@@ -131,6 +158,8 @@ def _resolve_user_path(value: str | Path) -> Path:
     path = Path(str(value)).expanduser()
     if path.is_absolute():
         return path.resolve()
+    if path.parts and path.parts[0] == PROJECT_ROOT.name:
+        return (Path.cwd() / path).resolve()
     cwd_candidate = (Path.cwd() / path).resolve()
     if cwd_candidate.exists():
         return cwd_candidate

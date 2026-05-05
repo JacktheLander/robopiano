@@ -14,6 +14,7 @@ import pandas as pd
 
 from sonata.data.loading import build_manifest_lookup, load_stage1_source_manifest
 from sonata.evaluation.offline import stitch_segment_predictions
+from sonata.evaluation.causal_rollout_contract import CausalRolloutConfig, reset_or_validate_neutral_piano
 from sonata.evaluation.task_config import build_rollout_task_kwargs, validate_rollout_action_dim
 from sonata.training.mjx_rollout import MJXRolloutBackend, mjx_availability
 from sonata.utils.io import write_json, write_table
@@ -37,10 +38,12 @@ def evaluate_dm_control_rollout(
     video_height: int = 480,
     video_width: int = 640,
     max_render_episodes: int | None = None,
+    causal_eval: dict[str, Any] | None = None,
     wandb_run: Any | None = None,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
     logger = logger or LOGGER
+    causal_config = CausalRolloutConfig.from_mapping(causal_eval)
     ensure_local_robopianist_on_path()
     try:
         from robopianist import suite
@@ -106,6 +109,12 @@ def evaluate_dm_control_rollout(
                 deque_size=1,
             )
             timestep = env.reset()
+            neutral_check = reset_or_validate_neutral_piano(env, causal_config=causal_config)
+            if causal_config.enabled and causal_config.require_neutral_piano_start and not neutral_check.passed:
+                raise RuntimeError(
+                    "Causal DM-Control rollout failed neutral piano start validation: "
+                    f"{neutral_check.initial_active_key_indices}"
+                )
             total_reward = 0.0
             action_dim = int(env.action_spec().shape[0])
             validate_rollout_action_dim(
@@ -144,7 +153,11 @@ def evaluate_dm_control_rollout(
                 rendered_episodes += 1
                 if render_error is None:
                     try:
-                        audio_events = _find_piano_midi_events(env)
+                        audio_events = (
+                            _find_piano_midi_events(env)
+                            if str(causal_config.video_audio_source) == "robot_midi"
+                            else []
+                        )
                         video_path, video_format, video_warning = _write_rollout_video(
                             frames=frames,
                             output_path=videos_root
@@ -174,6 +187,10 @@ def evaluate_dm_control_rollout(
                 "video_format": video_format,
                 "video_warning": video_warning,
                 "metrics_note": metrics_note,
+                "causal_eval_enabled": bool(causal_config.enabled),
+                "causal_validated": bool(causal_config.enabled and neutral_check.passed),
+                "causal_failure_reason": None if neutral_check.passed else neutral_check.failure_reason,
+                "restore_mode": causal_config.restore_mode,
                 **metrics,
             }
             results.append(episode_result)
@@ -202,6 +219,8 @@ def evaluate_dm_control_rollout(
     summary = _summarize_rollout_results(results)
     payload = {
         "available": True,
+        "causal_eval": causal_config.to_dict(),
+        "causal_note": "DM-Control rollout reports environment reward/MIDI wrapper metrics as legacy_state_metrics; causal success is not inferred from reference MIDI.",
         "videos_dir": _relative_output_path(videos_root if videos_root.exists() else None, output_root),
         "summary": summary,
         "episodes": results,

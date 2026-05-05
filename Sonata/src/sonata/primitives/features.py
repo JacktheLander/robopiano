@@ -429,7 +429,12 @@ def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | No
 
 
 def build_gmr_target_from_arrays(arrays: dict[str, np.ndarray | None], config: dict[str, Any]) -> tuple[np.ndarray, str]:
-    target_name = "actions" if bool(config.get("gmr_target_actions", True)) and arrays.get("actions") is not None else "hand_joints"
+    if bool(config.get("gmr_target_actions", True)):
+        if arrays.get("actions") is None:
+            raise ValueError("gmr_target_actions=true requires action trajectories; refusing hand-joint fallback.")
+        target_name = "actions"
+    else:
+        target_name = "hand_joints"
     trajectory = arrays.get(target_name)
     if trajectory is None:
         trajectory = arrays.get("hand_joints")

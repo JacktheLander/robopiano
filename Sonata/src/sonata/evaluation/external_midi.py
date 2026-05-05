@@ -13,6 +13,7 @@ from sonata.data.loading import load_manifest
 from sonata.data.score import dumps_score_context, load_note_events, score_context_from_roll
 from sonata.data.schema import ScoreEvent
 from sonata.diffusion.dataset import load_diffusion_inputs, resample_sequence
+from sonata.evaluation.causal_rollout_contract import CausalRolloutConfig, reset_or_validate_neutral_piano
 from sonata.evaluation.offline import resample_prediction
 from sonata.evaluation.rollout import (
     _build_video_caption,
@@ -66,10 +67,12 @@ def evaluate_external_midi_benchmark(
     video_height: int = 480,
     video_width: int = 640,
     max_render_episodes: int | None = None,
+    causal_eval: dict[str, Any] | None = None,
     wandb_run: Any | None = None,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
     logger = logger or LOGGER
+    causal_config = CausalRolloutConfig.from_mapping(causal_eval)
     output_root.mkdir(parents=True, exist_ok=True)
     ensure_local_robopianist_on_path()
     try:
@@ -184,6 +187,12 @@ def evaluate_external_midi_benchmark(
                 deque_size=1,
             )
             timestep = env.reset()
+            neutral_check = reset_or_validate_neutral_piano(env, causal_config=causal_config)
+            if causal_config.enabled and causal_config.require_neutral_piano_start and not neutral_check.passed:
+                raise RuntimeError(
+                    "Causal external MIDI rollout failed neutral piano start validation: "
+                    f"{neutral_check.initial_active_key_indices}"
+                )
             action_dim = int(env.action_spec().shape[0])
             validate_rollout_action_dim(
                 actual_action_dim=action_dim,
@@ -326,7 +335,11 @@ def evaluate_external_midi_benchmark(
                 rendered_episodes += 1
                 if render_error is None:
                     try:
-                        audio_events = _find_piano_midi_events(env)
+                        audio_events = (
+                            _find_piano_midi_events(env)
+                            if str(causal_config.video_audio_source) == "robot_midi"
+                            else []
+                        )
                         video_path, video_format, video_warning = _write_rollout_video(
                             frames=frames,
                             output_path=videos_root / f"{_safe_filename(str(row.song_id))}_{_safe_filename(str(row.episode_id))}.mp4",
@@ -362,6 +375,10 @@ def evaluate_external_midi_benchmark(
                 "video_format": video_format,
                 "video_warning": video_warning,
                 "metrics_note": metrics_note,
+                "causal_eval_enabled": bool(causal_config.enabled),
+                "causal_validated": bool(causal_config.enabled and neutral_check.passed),
+                "causal_failure_reason": None if neutral_check.passed else neutral_check.failure_reason,
+                "restore_mode": causal_config.restore_mode,
                 **metrics,
             }
             results.append(result)
@@ -404,6 +421,8 @@ def evaluate_external_midi_benchmark(
     )
     payload = {
         "available": True,
+        "causal_eval": causal_config.to_dict(),
+        "causal_note": "External MIDI benchmark uses note_path as target conditioning only; reference MIDI is not counted as causal success.",
         "benchmark_name": "paper_aligned_external_test",
         "summary": summary,
         "episodes": results,

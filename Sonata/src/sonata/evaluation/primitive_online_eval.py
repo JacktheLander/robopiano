@@ -16,7 +16,16 @@ import numpy as np
 import pandas as pd
 
 from sonata.data.loading import build_manifest_lookup, load_episode_record, load_stage1_source_manifest
-from sonata.diffusion.dataset import resample_sequence
+from sonata.evaluation.causal_rollout_contract import (
+    CausalRolloutConfig,
+    collect_fingertip_key_contacts,
+    contact_gated_keypress_metrics,
+    default_causal_eval_config,
+    forbid_dataset_piano_state_restore,
+    mark_uncausal_result,
+    reset_or_validate_neutral_piano,
+    run_zero_action_ablation,
+)
 from sonata.evaluation.task_config import build_rollout_task_kwargs, validate_rollout_action_dim
 from sonata.primitives.features import build_feature_vector_from_arrays, load_feature_matrix_from_store
 from sonata.utils.io import ensure_dir, read_json, save_npz, write_json, write_table
@@ -105,6 +114,7 @@ class PrimitiveInstance:
     hand_fingertips_gt: np.ndarray | None = None
     joint_velocities_gt: np.ndarray | None = None
     source_midi_path: str | None = None
+    target_source: str = "goals"
 
     @property
     def conditioning_feature_norm(self) -> float:
@@ -144,6 +154,24 @@ class PrimitiveOnlineRolloutResult:
     rollout_midi_path: str | None
     observed_key_events: list[KeyEvent] = field(default_factory=list)
     observed_key_roll: np.ndarray | None = None
+    contact_roll: np.ndarray | None = None
+    contact_method: str = "unavailable"
+    causal_metrics: dict[str, Any] = field(default_factory=dict)
+    zero_action_metrics: dict[str, Any] = field(default_factory=dict)
+    causal_validated: bool = False
+    causal_failure_reason: str | None = None
+    neutral_start_passed: bool = False
+    zero_action_ablation_passed: bool | None = None
+    contact_gate_passed: bool = False
+    target_source: str = "goals"
+    observed_source: str = "simulator_piano_activation"
+    action_max_abs: float = float("nan")
+    hand_action_max_abs: float = float("nan")
+    pedal_action_max_abs: float = float("nan")
+    pedal_action_indices: tuple[int, ...] = ()
+    video_path: str | None = None
+    video_format: str | None = None
+    video_warning: str | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -232,6 +260,8 @@ def evaluate_primitives_online(config: dict[str, Any], logger: logging.Logger | 
     output_root = ensure_dir(resolved["output_root"])
     plots_dir = output_root / "plots"
     debug_dir = output_root / "debug"
+    videos_dir = output_root / "videos"
+    frames_tmp_dir = output_root / "frames_tmp"
     if bool(resolved.get("force", False)):
         _clear_previous_outputs(output_root)
     ensure_dir(output_root)
@@ -239,6 +269,8 @@ def evaluate_primitives_online(config: dict[str, Any], logger: logging.Logger | 
         ensure_dir(plots_dir)
     if bool(resolved.get("save_debug", False)):
         ensure_dir(debug_dir)
+    if bool(resolved["rollout"].get("render_video", False)):
+        ensure_dir(videos_dir)
 
     write_json(_json_ready(resolved), output_root / "config_snapshot.json")
     artifacts = load_primitive_online_artifacts(primitive_root)
@@ -325,16 +357,27 @@ def evaluate_primitives_online(config: dict[str, Any], logger: logging.Logger | 
         result_rows.append(row)
         completed_segment_ids.add(str(row["segment_id"]))
 
+    rendered_instances = 0
+    max_render_instances = resolved["rollout"].get("max_render_instances")
     for instance in instances:
         if instance.segment_id in completed_segment_ids:
             continue
         library_entry = primitive_library.get(instance.primitive_id)
+        rollout_config = dict(resolved["rollout"])
+        should_render = bool(rollout_config.get("render_video", False)) and (
+            max_render_instances is None or rendered_instances < int(max_render_instances)
+        )
+        rollout_config["render_video"] = should_render
+        rollout_config["videos_dir"] = str(videos_dir)
+        rollout_config["frames_tmp_dir"] = str(frames_tmp_dir)
         rollout = rollout_primitive_instance(
             instance=instance,
             library_entry=library_entry,
             runtime=runtime,
-            rollout_config=resolved["rollout"],
+            rollout_config=rollout_config,
         )
+        if should_render and rollout.video_path is not None:
+            rendered_instances += 1
         debug_artifact_path = None
         if bool(resolved.get("save_debug", False)):
             debug_artifact_path = save_rollout_debug_artifact(
@@ -598,6 +641,7 @@ def build_primitive_instances(
                         start_piano_state=_first_frame(
                             arrays["piano_states"] if arrays["piano_states"] is not None else arrays["goals"]
                         ),
+                        target_source=str(intended_bundle.source),
                     )
                 )
             except Exception as exc:
@@ -639,7 +683,11 @@ def infer_instance_key_events(
         if use_piano_states and piano_states is not None
         else empty_key_event_bundle(source="piano_states")
     )
-    if not intended.events and realized.events:
+    if (
+        bool(events_config.get("allow_piano_state_intended_fallback", False))
+        and not intended.events
+        and realized.events
+    ):
         intended = KeyEventBundle(
             source="piano_states_as_intended",
             key_roll=realized.key_roll.copy(),
@@ -647,7 +695,11 @@ def infer_instance_key_events(
             events=list(realized.events),
             unique_keys=tuple(realized.unique_keys),
         )
-    if not realized.events and intended.events:
+    if (
+        bool(events_config.get("allow_goal_realized_fallback", False))
+        and not realized.events
+        and intended.events
+    ):
         realized = KeyEventBundle(
             source="goals_as_realized",
             key_roll=intended.key_roll.copy(),
@@ -775,60 +827,56 @@ def rollout_primitive_instance(
     runtime: RoboPianistPrimitiveRuntime,
     rollout_config: dict[str, Any],
 ) -> PrimitiveOnlineRolloutResult:
+    causal_config = CausalRolloutConfig.from_mapping(rollout_config.get("causal_eval"))
+    restore_mode = str(rollout_config.get("restore_mode", causal_config.restore_mode) or causal_config.restore_mode)
+    if restore_mode not in {"unsafe_legacy", "hands_only", "neutral"}:
+        return _failed_rollout_result(
+            instance=instance,
+            source=resolve_instance_rollout_source(
+                instance=instance,
+                rollout_config=rollout_config,
+                robopianist_root=runtime.robopianist_root,
+            ),
+            status="invalid_restore_mode",
+            error=f"Unsupported restore_mode={restore_mode!r}.",
+            causal_failure_reason="invalid_restore_mode",
+        )
+    if restore_mode == "unsafe_legacy":
+        causal_config = CausalRolloutConfig.from_mapping({"enabled": False, "restore_mode": "unsafe_legacy"})
+        LOGGER.warning(
+            "UNSAFE LEGACY PRIMITIVE EVALUATION ENABLED: dataset task/piano/goal state may be restored; "
+            "all outputs from this mode are marked causal_validated=false."
+        )
     source = resolve_instance_rollout_source(
         instance=instance,
         rollout_config=rollout_config,
         robopianist_root=runtime.robopianist_root,
     )
     if library_entry is None or library_entry.prior_mean is None:
-        return PrimitiveOnlineRolloutResult(
-            segment_id=instance.segment_id,
-            primitive_id=instance.primitive_id,
+        return _failed_rollout_result(
+            instance=instance,
+            source=source,
             status="missing_prior",
-            success=False,
             error=f"Missing primitive prior for `{instance.primitive_id}`.",
-            restore_mode="none",
-            alignment_mode="none",
-            predicted_actions=None,
-            raw_observed_piano_states=None,
-            observed_piano_states=None,
-            raw_observed_hand_joints=None,
-            observed_hand_joints=None,
-            raw_observed_hand_fingertips=None,
-            observed_hand_fingertips=None,
-            rollout_source_mode=str(source["source_mode"]),
-            rollout_source_label=_optional_string(source.get("source_label")),
-            rollout_environment_name=str(source["environment_name"]),
-            rollout_midi_path=str(source["midi_file"]) if source.get("midi_file") is not None else None,
+            restore_mode=restore_mode,
+            causal_failure_reason="missing_prior",
         )
     if str(instance.gmr_target_name) != "actions":
-        return PrimitiveOnlineRolloutResult(
-            segment_id=instance.segment_id,
-            primitive_id=instance.primitive_id,
+        return _failed_rollout_result(
+            instance=instance,
+            source=source,
             status="unsupported_target",
-            success=False,
             error=(
                 f"Primitive `{instance.primitive_id}` stores `{instance.gmr_target_name}` priors. "
                 "Only action-space priors can be replayed online."
             ),
-            restore_mode="none",
-            alignment_mode="none",
-            predicted_actions=None,
-            raw_observed_piano_states=None,
-            observed_piano_states=None,
-            raw_observed_hand_joints=None,
-            observed_hand_joints=None,
-            raw_observed_hand_fingertips=None,
-            observed_hand_fingertips=None,
-            rollout_source_mode=str(source["source_mode"]),
-            rollout_source_label=_optional_string(source.get("source_label")),
-            rollout_environment_name=str(source["environment_name"]),
-            rollout_midi_path=str(source["midi_file"]) if source.get("midi_file") is not None else None,
+            restore_mode=restore_mode,
+            causal_failure_reason="non_action_prior",
         )
 
     selected_prior = select_primitive_prior_mean(instance=instance, library_entry=library_entry)
     expected_action_dim = int(selected_prior.shape[-1])
-    predicted_actions = resample_sequence(
+    predicted_actions = _resample_sequence(
         np.asarray(selected_prior, dtype=np.float32),
         max(int(instance.duration_steps), 1),
     )
@@ -839,8 +887,6 @@ def rollout_primitive_instance(
             control_timestep=float(instance.control_timestep),
             expected_action_dim=expected_action_dim,
         )
-        env.reset()
-        restore_mode, notes = restore_instance_state(env=env, instance=instance)
         action_dim = int(env.action_spec().shape[0])
         if bool(rollout_config.get("validate_action_dim", True)):
             validate_rollout_action_dim(
@@ -848,30 +894,26 @@ def rollout_primitive_instance(
                 expected_action_dim=expected_action_dim,
                 environment_name=str(source["environment_name"]),
             )
-
-        piano_frames = [_capture_piano_state(env)]
-        hand_frames = [_capture_hand_joint_state(env)]
-        fingertip_frames = [_capture_fingertips(env)]
-        status = "completed"
-        error = None
-        for action in predicted_actions:
-            control = np.zeros((action_dim,), dtype=np.float32)
-            width = min(action_dim, action.shape[0])
-            control[:width] = action[:width]
-            timestep = env.step(control)
-            piano_frames.append(_capture_piano_state(env))
-            hand_frames.append(_capture_hand_joint_state(env))
-            fingertip_frames.append(_capture_fingertips(env))
-            if timestep.last():
-                status = "terminated_early"
-                break
-        raw_piano = _stack_frames(piano_frames)
-        raw_hand = _stack_frames(hand_frames)
-        raw_tip = _stack_frames(fingertip_frames)
+        action_diag = _action_diagnostics(predicted_actions, action_dim=action_dim, rollout_config=rollout_config)
+        render_video = bool(rollout_config.get("render_video", False))
+        rollout_payload = _execute_action_rollout(
+            env=env,
+            instance=instance,
+            actions=predicted_actions,
+            action_dim=action_dim,
+            restore_mode=restore_mode,
+            causal_config=causal_config,
+            rollout_config=rollout_config,
+            render_video=render_video,
+        )
+        notes = list(rollout_payload["notes"])
+        raw_piano = rollout_payload["raw_piano"]
+        raw_hand = rollout_payload["raw_hand"]
+        raw_tip = rollout_payload["raw_tip"]
         observed_piano, alignment_mode = align_rollout_sequence(
             observed=raw_piano,
-            ground_truth=instance.piano_states_gt,
-            preferred_mode=None,
+            ground_truth=None if causal_config.enabled else instance.piano_states_gt,
+            preferred_mode="post_action" if causal_config.enabled else None,
         )
         observed_hand, _ = align_rollout_sequence(
             observed=raw_hand,
@@ -885,15 +927,106 @@ def rollout_primitive_instance(
         )
         observed_bundle = extract_key_events_from_rollout(
             observed_piano,
-            key_threshold=float(rollout_config.get("piano_state_threshold", 0.5)),
+            key_threshold=float(causal_config.key_activation_threshold),
             sustain_threshold=float(rollout_config.get("piano_sustain_threshold", 0.5)),
         )
+        contact_for_metrics = _prepend_initial_contact_frame(
+            rollout_payload["contact_roll"],
+            steps=raw_piano.shape[0] if raw_piano is not None else 0,
+        )
+        causal_metrics = contact_gated_keypress_metrics(
+            target_key_indices=instance.intended_keys,
+            activation_roll=raw_piano,
+            contact_roll=contact_for_metrics,
+            config=causal_config,
+            contact_method=str(rollout_payload["contact_method"]),
+        )
+        zero_action_metrics: dict[str, Any] = {}
+        zero_action_ablation_passed: bool | None = None
+        if bool(causal_config.run_zero_action_ablation) and restore_mode != "unsafe_legacy":
+            zero_payload = run_zero_action_ablation(
+                action_shape=(int(predicted_actions.shape[0]), int(action_dim)),
+                rollout_fn=lambda zero_actions: _execute_action_rollout(
+                    env=env,
+                    instance=instance,
+                    actions=zero_actions,
+                    action_dim=action_dim,
+                    restore_mode=restore_mode,
+                    causal_config=causal_config,
+                    rollout_config=rollout_config | {"render_video": False},
+                    render_video=False,
+                ),
+            )
+            zero_bundle = extract_key_events_from_rollout(
+                zero_payload["observed_piano"],
+                key_threshold=float(causal_config.key_activation_threshold),
+                sustain_threshold=float(rollout_config.get("piano_sustain_threshold", 0.5)),
+            )
+            zero_keys = sorted({int(event.key_id) for event in zero_bundle.events})
+            same_target = bool(set(zero_keys).intersection(set(int(key) for key in instance.intended_keys)))
+            zero_action_metrics = {
+                "zero_action_pressed_keys": zero_keys,
+                "zero_action_key_events": [list(event.as_tuple()) for event in zero_bundle.events],
+                "zero_action_any_key_pressed": bool(zero_keys),
+                "zero_action_same_target_pressed": same_target,
+            }
+            zero_action_ablation_passed = not same_target
+            if same_target:
+                causal_metrics = mark_uncausal_result(
+                    causal_metrics,
+                    reason="zero_action_pressed_target",
+                    status="contaminated_zero_action",
+                )
+        elif restore_mode == "unsafe_legacy":
+            zero_action_ablation_passed = False
+        if restore_mode == "unsafe_legacy":
+            causal_metrics = mark_uncausal_result(
+                causal_metrics,
+                reason="unsafe_legacy_eval",
+                status="unsafe_legacy_eval",
+            )
+            notes.append(
+                "WARNING: restore_mode=unsafe_legacy restores task/piano/goal state and is not causal-valid."
+            )
+        video_path = None
+        video_format = None
+        video_warning = rollout_payload.get("video_warning")
+        if render_video and rollout_payload.get("render_frames"):
+            final_overlay = {
+                "causal_validated": bool(causal_metrics.get("causal_validated", False)),
+                "action_max_abs": float(action_diag["action_max_abs"]),
+                "initial_active_key_indices": causal_metrics.get("initial_active_key_indices", []),
+                "physical_pressed_key_indices": sorted({event.key_id for event in observed_bundle.events}),
+                "contact_key_indices": causal_metrics.get("contact_key_indices", []),
+                "activation_without_contact_key_indices": causal_metrics.get("activation_without_contact_key_indices", []),
+                "zero_action_same_target_pressed": zero_action_metrics.get("zero_action_same_target_pressed"),
+            }
+            try:
+                video_path, video_format, video_warning = _write_primitive_video(
+                    frames=_overlay_final_on_frames(
+                        rollout_payload["render_frames"],
+                        instance=instance,
+                        restore_mode=restore_mode,
+                        payload=final_overlay,
+                    ),
+                    instance=instance,
+                    rollout_config=rollout_config,
+                )
+            except Exception as exc:
+                video_warning = str(exc)
+                notes.append(f"Video export failed: {exc}")
+        status = str(causal_metrics.get("status", rollout_payload["status"]))
+        if status == "ok":
+            status = str(rollout_payload["status"])
+        success = bool(causal_metrics.get("contact_gated_success", False))
+        if not bool(causal_metrics.get("causal_validated", False)):
+            success = False
         return PrimitiveOnlineRolloutResult(
             segment_id=instance.segment_id,
             primitive_id=instance.primitive_id,
             status=status,
-            success=True,
-            error=error,
+            success=success,
+            error=rollout_payload["error"],
             restore_mode=restore_mode,
             alignment_mode=alignment_mode,
             predicted_actions=predicted_actions.astype(np.float32),
@@ -909,6 +1042,24 @@ def rollout_primitive_instance(
             rollout_midi_path=str(source["midi_file"]) if source.get("midi_file") is not None else None,
             observed_key_events=list(observed_bundle.events),
             observed_key_roll=observed_bundle.key_roll,
+            contact_roll=rollout_payload["contact_roll"],
+            contact_method=str(causal_metrics.get("contact_method", rollout_payload["contact_method"])),
+            causal_metrics=causal_metrics,
+            zero_action_metrics=zero_action_metrics,
+            causal_validated=bool(causal_metrics.get("causal_validated", False)),
+            causal_failure_reason=causal_metrics.get("causal_failure_reason"),
+            neutral_start_passed=bool(rollout_payload["neutral_start_passed"]),
+            zero_action_ablation_passed=zero_action_ablation_passed,
+            contact_gate_passed=bool(causal_metrics.get("contact_gate_passed", False)),
+            target_source=instance.target_source,
+            observed_source="simulator_piano_activation",
+            action_max_abs=float(action_diag["action_max_abs"]),
+            hand_action_max_abs=float(action_diag["hand_action_max_abs"]),
+            pedal_action_max_abs=float(action_diag["pedal_action_max_abs"]),
+            pedal_action_indices=tuple(action_diag["pedal_action_indices"]),
+            video_path=video_path,
+            video_format=video_format,
+            video_warning=video_warning,
             notes=list(notes),
         )
     except Exception as exc:  # pragma: no cover
@@ -931,10 +1082,336 @@ def rollout_primitive_instance(
             rollout_source_label=_optional_string(source.get("source_label")),
             rollout_environment_name=str(source["environment_name"]),
             rollout_midi_path=str(source["midi_file"]) if source.get("midi_file") is not None else None,
+            causal_validated=False,
+            causal_failure_reason=str(exc),
+            target_source=instance.target_source,
         )
 
 
-def restore_instance_state(env: Any, instance: PrimitiveInstance) -> tuple[str, list[str]]:
+def _failed_rollout_result(
+    *,
+    instance: PrimitiveInstance,
+    source: dict[str, Any],
+    status: str,
+    error: str,
+    restore_mode: str = "none",
+    causal_failure_reason: str,
+) -> PrimitiveOnlineRolloutResult:
+    return PrimitiveOnlineRolloutResult(
+        segment_id=instance.segment_id,
+        primitive_id=instance.primitive_id,
+        status=status,
+        success=False,
+        error=error,
+        restore_mode=restore_mode,
+        alignment_mode="none",
+        predicted_actions=None,
+        raw_observed_piano_states=None,
+        observed_piano_states=None,
+        raw_observed_hand_joints=None,
+        observed_hand_joints=None,
+        raw_observed_hand_fingertips=None,
+        observed_hand_fingertips=None,
+        rollout_source_mode=str(source["source_mode"]),
+        rollout_source_label=_optional_string(source.get("source_label")),
+        rollout_environment_name=str(source["environment_name"]),
+        rollout_midi_path=str(source["midi_file"]) if source.get("midi_file") is not None else None,
+        causal_validated=False,
+        causal_failure_reason=causal_failure_reason,
+        target_source=instance.target_source,
+    )
+
+
+def _execute_action_rollout(
+    *,
+    env: Any,
+    instance: PrimitiveInstance,
+    actions: np.ndarray,
+    action_dim: int,
+    restore_mode: str,
+    causal_config: CausalRolloutConfig,
+    rollout_config: dict[str, Any],
+    render_video: bool,
+) -> dict[str, Any]:
+    notes: list[str] = []
+    env.reset()
+    restore_label, restore_notes = restore_instance_state(
+        env=env,
+        instance=instance,
+        restore_mode=restore_mode,
+        causal_config=causal_config,
+    )
+    notes.extend(restore_notes)
+    neutral_check = reset_or_validate_neutral_piano(env, causal_config=causal_config)
+    if (
+        causal_config.enabled
+        and causal_config.require_neutral_piano_start
+        and causal_config.fail_if_initial_keys_active
+        and not neutral_check.passed
+    ):
+        raw_piano = _stack_frames([_capture_piano_state(env)])
+        raw_hand = _stack_frames([_capture_hand_joint_state(env)])
+        raw_tip = _stack_frames([_capture_fingertips(env)])
+        return {
+            "status": "initial_keys_active",
+            "error": neutral_check.failure_reason,
+            "restore_label": restore_label,
+            "notes": notes,
+            "raw_piano": raw_piano,
+            "observed_piano": raw_piano,
+            "raw_hand": raw_hand,
+            "raw_tip": raw_tip,
+            "contact_roll": None,
+            "contact_method": "unavailable",
+            "neutral_start_passed": False,
+            "render_frames": [],
+            "video_warning": None,
+        }
+
+    piano_frames = [_capture_piano_state(env)]
+    hand_frames = [_capture_hand_joint_state(env)]
+    fingertip_frames = [_capture_fingertips(env)]
+    contact_frames: list[np.ndarray] = []
+    contact_method = "unavailable"
+    render_frames: list[np.ndarray] = []
+    render_error: str | None = None
+    if render_video:
+        try:
+            render_frames.append(_render_primitive_frame(env, rollout_config=rollout_config, step_index=0, instance=instance, overlay_payload={}))
+        except Exception as exc:
+            render_error = str(exc)
+            notes.append(f"Initial render failed: {exc}")
+    status = "completed"
+    error = None
+    for step_index, action in enumerate(np.asarray(actions, dtype=np.float32), start=1):
+        control = np.zeros((int(action_dim),), dtype=np.float32)
+        width = min(int(action_dim), int(action.shape[0]))
+        control[:width] = action[:width]
+        timestep = env.step(control)
+        piano_frames.append(_capture_piano_state(env))
+        hand_frames.append(_capture_hand_joint_state(env))
+        fingertip_frames.append(_capture_fingertips(env))
+        contact = collect_fingertip_key_contacts(
+            env,
+            distance_threshold_m=float(causal_config.fingertip_key_distance_threshold_m),
+        )
+        if contact.contact_roll is not None:
+            contact_frames.append(np.asarray(contact.contact_roll[0], dtype=np.float32))
+            if contact_method == "unavailable":
+                contact_method = str(contact.contact_method)
+        elif contact_method == "unavailable":
+            notes.extend(contact.notes)
+        if render_video and render_error is None:
+            try:
+                render_frames.append(
+                    _render_primitive_frame(
+                        env,
+                        rollout_config=rollout_config,
+                        step_index=step_index,
+                        instance=instance,
+                        overlay_payload={},
+                    )
+                )
+            except Exception as exc:
+                render_error = str(exc)
+                notes.append(f"Render failed: {exc}")
+        if timestep.last():
+            status = "terminated_early"
+            break
+    raw_piano = _stack_frames(piano_frames)
+    raw_hand = _stack_frames(hand_frames)
+    raw_tip = _stack_frames(fingertip_frames)
+    observed_piano = raw_piano[1:] if raw_piano is not None and raw_piano.shape[0] > 1 else raw_piano
+    contact_roll = _stack_contact_frames(contact_frames, steps=observed_piano.shape[0] if observed_piano is not None else len(contact_frames))
+    video_warning = None
+    if render_error is not None:
+        video_warning = render_error if video_warning is None else f"{video_warning} {render_error}"
+    return {
+        "status": status,
+        "error": error,
+        "restore_label": restore_label,
+        "notes": notes,
+        "raw_piano": raw_piano,
+        "observed_piano": observed_piano,
+        "raw_hand": raw_hand,
+        "raw_tip": raw_tip,
+        "contact_roll": contact_roll,
+        "contact_method": contact_method,
+        "neutral_start_passed": bool(neutral_check.passed),
+        "render_frames": render_frames if render_error is None else [],
+        "video_warning": video_warning,
+    }
+
+
+def _action_diagnostics(actions: np.ndarray, *, action_dim: int, rollout_config: dict[str, Any]) -> dict[str, Any]:
+    array = np.asarray(actions, dtype=np.float32)
+    if array.size == 0:
+        return {
+            "action_max_abs": 0.0,
+            "hand_action_max_abs": 0.0,
+            "pedal_action_max_abs": 0.0,
+            "pedal_action_indices": [],
+        }
+    pedal_indices = _pedal_action_indices(action_dim=action_dim, rollout_config=rollout_config)
+    hand_indices = [index for index in range(min(int(action_dim), array.shape[-1])) if index not in set(pedal_indices)]
+    pedal_values = array[:, pedal_indices] if pedal_indices and max(pedal_indices) < array.shape[-1] else np.zeros((array.shape[0], 0), dtype=np.float32)
+    hand_values = array[:, hand_indices] if hand_indices else np.zeros((array.shape[0], 0), dtype=np.float32)
+    return {
+        "action_max_abs": float(np.max(np.abs(array))),
+        "hand_action_max_abs": float(np.max(np.abs(hand_values))) if hand_values.size else 0.0,
+        "pedal_action_max_abs": float(np.max(np.abs(pedal_values))) if pedal_values.size else 0.0,
+        "pedal_action_indices": pedal_indices,
+    }
+
+
+def _pedal_action_indices(*, action_dim: int, rollout_config: dict[str, Any]) -> list[int]:
+    configured = rollout_config.get("pedal_action_indices")
+    if configured is not None:
+        return [int(index) for index in configured if 0 <= int(index) < int(action_dim)]
+    if int(action_dim) == 39:
+        return [38]
+    return []
+
+
+def _stack_contact_frames(frames: list[np.ndarray], *, steps: int) -> np.ndarray | None:
+    if not frames:
+        return None
+    stacked = np.stack([np.asarray(frame, dtype=np.float32).reshape(-1)[:_NUM_PIANO_KEYS] for frame in frames], axis=0)
+    if stacked.shape[0] == int(steps):
+        return stacked.astype(np.float32)
+    output = np.zeros((int(steps), _NUM_PIANO_KEYS), dtype=np.float32)
+    usable = min(output.shape[0], stacked.shape[0])
+    output[:usable, : stacked.shape[1]] = stacked[:usable]
+    return output
+
+
+def _prepend_initial_contact_frame(contact_roll: np.ndarray | None, *, steps: int) -> np.ndarray | None:
+    if contact_roll is None:
+        return None
+    array = np.asarray(contact_roll, dtype=np.float32)
+    if array.ndim == 1:
+        array = array[None, :]
+    output = np.zeros((int(steps), _NUM_PIANO_KEYS), dtype=np.float32)
+    usable = min(max(int(steps) - 1, 0), array.shape[0])
+    if usable > 0:
+        output[1 : 1 + usable, : min(array.shape[1], _NUM_PIANO_KEYS)] = array[:usable, :_NUM_PIANO_KEYS]
+    return output
+
+
+def _render_primitive_frame(
+    env: Any,
+    *,
+    rollout_config: dict[str, Any],
+    step_index: int,
+    instance: PrimitiveInstance,
+    overlay_payload: dict[str, Any],
+) -> np.ndarray:
+    from sonata.evaluation.rollout import _render_frame
+
+    frame = _render_frame(
+        env,
+        height=int(rollout_config.get("video_height", 480)),
+        width=int(rollout_config.get("video_width", 640)),
+    )
+    return _overlay_primitive_debug_text(
+        frame,
+        lines=[
+            f"step={step_index} primitive={instance.primitive_id} segment={instance.segment_id}",
+            f"restore={rollout_config.get('restore_mode', rollout_config.get('causal_eval', {}).get('restore_mode', 'hands_only'))}",
+            f"target_key_indices={list(instance.intended_keys)}",
+            *[f"{key}={value}" for key, value in overlay_payload.items()],
+        ],
+    )
+
+
+def _overlay_primitive_debug_text(frame: np.ndarray, *, lines: list[str]) -> np.ndarray:
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return frame
+    image = Image.fromarray(np.asarray(frame, dtype=np.uint8))
+    draw = ImageDraw.Draw(image, "RGBA")
+    height = 8 + 16 * len(lines)
+    draw.rectangle((0, 0, image.width, height), fill=(0, 0, 0, 165))
+    for index, line in enumerate(lines):
+        draw.text((8, 6 + index * 16), str(line)[:160], fill=(255, 255, 255, 255))
+    return np.asarray(image, dtype=np.uint8)
+
+
+def _overlay_final_on_frames(
+    frames: list[np.ndarray],
+    *,
+    instance: PrimitiveInstance,
+    restore_mode: str,
+    payload: dict[str, Any],
+) -> list[np.ndarray]:
+    lines = [
+        f"primitive_id={instance.primitive_id} segment_id={instance.segment_id} restore_mode={restore_mode}",
+        f"causal_validated={payload.get('causal_validated')} action_max_abs={payload.get('action_max_abs')}",
+        f"initial_active_key_indices={payload.get('initial_active_key_indices')}",
+        f"target_key_indices={list(instance.intended_keys)}",
+        f"physical_pressed_key_indices={payload.get('physical_pressed_key_indices')}",
+        f"contact_key_indices={payload.get('contact_key_indices')}",
+        f"activation_without_contact_key_indices={payload.get('activation_without_contact_key_indices')}",
+        f"zero_action_same_target_pressed={payload.get('zero_action_same_target_pressed')}",
+    ]
+    warning = (
+        bool(payload.get("initial_active_key_indices"))
+        or bool(payload.get("activation_without_contact_key_indices"))
+        or bool(payload.get("zero_action_same_target_pressed"))
+        or not bool(payload.get("causal_validated"))
+    )
+    if warning:
+        lines.append("WARNING: causal_validated=false or contact/zero-action contamination detected")
+    return [_overlay_primitive_debug_text(frame, lines=lines) for frame in frames]
+
+
+def _write_primitive_video(
+    *,
+    frames: list[np.ndarray],
+    instance: PrimitiveInstance,
+    rollout_config: dict[str, Any],
+) -> tuple[str | None, str | None, str | None]:
+    from sonata.evaluation.rollout import _relative_output_path, _safe_filename, _write_rollout_video
+
+    videos_dir = Path(str(rollout_config.get("videos_dir", "."))).resolve()
+    output_root = videos_dir.parent
+    frames_tmp = Path(str(rollout_config.get("frames_tmp_dir", output_root / "frames_tmp"))).resolve()
+    video_path, video_format, warning = _write_rollout_video(
+        frames=frames,
+        output_path=videos_dir / f"{_safe_filename(instance.primitive_id)}_{_safe_filename(instance.segment_id)}.mp4",
+        fps=int(rollout_config.get("video_fps", 20)),
+        temp_root=frames_tmp,
+        audio_events=None,
+    )
+    return _relative_output_path(video_path, output_root), video_format, warning
+
+
+def restore_instance_state(env: Any, instance: PrimitiveInstance, *, restore_mode: str, causal_config: CausalRolloutConfig) -> tuple[str, list[str]]:
+    if restore_mode == "unsafe_legacy":
+        return restore_instance_state_unsafe_legacy(env=env, instance=instance)
+    notes: list[str] = []
+    task = getattr(env, "task", None)
+    physics = getattr(env, "physics", None)
+    if task is None or physics is None:
+        return "env_reset_only", ["Environment does not expose task/physics handles for state restoration."]
+    if restore_mode == "neutral":
+        return "neutral", notes
+    if restore_mode == "hands_only":
+        forbid_dataset_piano_state_restore(
+            restore_mode=restore_mode,
+            causal_config=causal_config,
+            source="piano_state",
+        )
+        if _restore_hand_state(task=task, physics=physics, instance=instance):
+            if hasattr(physics, "forward"):
+                physics.forward()
+            return "hands_only", notes
+        return "hands_only_unavailable", ["Hand joint state was unavailable or incompatible; used env reset state."]
+    raise ValueError(f"Unsupported restore_mode={restore_mode!r}")
+
+
+def restore_instance_state_unsafe_legacy(env: Any, instance: PrimitiveInstance) -> tuple[str, list[str]]:
     notes: list[str] = []
     task = getattr(env, "task", None)
     physics = getattr(env, "physics", None)
@@ -962,7 +1439,7 @@ def restore_instance_state(env: Any, instance: PrimitiveInstance) -> tuple[str, 
 
     if _restore_hand_state(task=task, physics=physics, instance=instance):
         restore_mode = "direct_hand_state_restore"
-    if _restore_piano_state(task=task, physics=physics, instance=instance):
+    if _restore_piano_state_unsafe_legacy(task=task, physics=physics, instance=instance):
         restore_mode = "direct_state_restore"
     if hasattr(physics, "forward"):
         physics.forward()
@@ -1005,6 +1482,8 @@ def build_instance_result_row(
     fingertip_mse = _aligned_mse(rollout.observed_hand_fingertips, instance.hand_fingertips_gt)
     action_mse = _aligned_mse(rollout.predicted_actions, instance.actions_gt)
     observed_key_count = len({event.key_id for event in rollout.observed_key_events})
+    causal_metrics = dict(rollout.causal_metrics or {})
+    zero_metrics = dict(rollout.zero_action_metrics or {})
     intended_key_center = _mean_key_center(instance.intended_keys)
     realized_key_center = _mean_key_center(instance.realized_keys_gt)
     predicted_key_center = _mean_key_center(tuple(sorted({event.key_id for event in rollout.observed_key_events})))
@@ -1061,6 +1540,10 @@ def build_instance_result_row(
         "onset_precision": float(realized_metrics["precision"]),
         "onset_recall": float(realized_metrics["recall"]),
         "onset_f1": float(realized_metrics["f1"]),
+        "legacy_state_onset_precision": float(realized_metrics["precision"]),
+        "legacy_state_onset_recall": float(realized_metrics["recall"]),
+        "legacy_state_onset_f1": float(realized_metrics["f1"]),
+        "state_onset_f1": float(realized_metrics["f1"]),
         "false_positive_key_events": int(realized_metrics["false_positive_events"]),
         "missed_key_events": int(realized_metrics["missed_events"]),
         "false_positive_unique_keys": int(realized_metrics["false_positive_unique_keys"]),
@@ -1080,8 +1563,50 @@ def build_instance_result_row(
         "activation_toggle_count": int(toggle_count),
         "invalid_motion_flag": bool(invalid_motion_flag),
         "rollout_diverged": bool(not rollout.success or rollout.status not in {"completed", "terminated_early"}),
+        "causal_validated": bool(rollout.causal_validated),
+        "causal_failure_reason": rollout.causal_failure_reason,
+        "zero_action_ablation_passed": rollout.zero_action_ablation_passed,
+        "neutral_start_passed": bool(rollout.neutral_start_passed),
+        "contact_gate_passed": bool(rollout.contact_gate_passed),
+        "target_source": rollout.target_source,
+        "observed_source": rollout.observed_source,
+        "causal_true_positive_events": int(causal_metrics.get("causal_true_positive_events", 0)),
+        "causal_false_positive_events": int(causal_metrics.get("causal_false_positive_events", 0)),
+        "causal_missed_events": int(causal_metrics.get("causal_missed_events", 0)),
+        "causal_precision": float(causal_metrics.get("causal_precision", float("nan"))),
+        "causal_recall": float(causal_metrics.get("causal_recall", float("nan"))),
+        "causal_f1": float(causal_metrics.get("causal_f1", float("nan"))),
+        "contact_gated_success": bool(causal_metrics.get("contact_gated_success", False)),
+        "contact_method": str(causal_metrics.get("contact_method", rollout.contact_method)),
+        "action_max_abs": float(rollout.action_max_abs),
+        "hand_action_max_abs": float(rollout.hand_action_max_abs),
+        "pedal_action_max_abs": float(rollout.pedal_action_max_abs),
+        "video_path": rollout.video_path,
+        "video_format": rollout.video_format,
+        "video_warning": rollout.video_warning,
         "debug_artifact_path": str(debug_artifact_path.resolve()) if debug_artifact_path is not None else None,
         "source_midi_path": instance.source_midi_path,
+        "target_key_indices_json": json.dumps(list(instance.intended_keys)),
+        "physical_pressed_key_indices_json": json.dumps(sorted({event.key_id for event in rollout.observed_key_events})),
+        "contact_key_indices_json": json.dumps(list(causal_metrics.get("contact_key_indices", []))),
+        "activation_key_indices_json": json.dumps(list(causal_metrics.get("activation_key_indices", []))),
+        "initial_active_key_indices_json": json.dumps(list(causal_metrics.get("initial_active_key_indices", []))),
+        "activation_without_contact_key_indices_json": json.dumps(
+            list(causal_metrics.get("activation_without_contact_key_indices", []))
+        ),
+        "contact_without_activation_key_indices_json": json.dumps(
+            list(causal_metrics.get("contact_without_activation_key_indices", []))
+        ),
+        "robot_midi_key_indices_json": json.dumps([]),
+        "reference_midi_key_indices_json": json.dumps(list(instance.intended_keys)),
+        "zero_action_pressed_keys_json": json.dumps(list(zero_metrics.get("zero_action_pressed_keys", []))),
+        "zero_action_key_events_json": json.dumps(list(zero_metrics.get("zero_action_key_events", []))),
+        "zero_action_any_key_pressed": bool(zero_metrics.get("zero_action_any_key_pressed", False)),
+        "zero_action_same_target_pressed": bool(zero_metrics.get("zero_action_same_target_pressed", False)),
+        "primitive_passes_zero_action_control": bool(rollout.zero_action_ablation_passed)
+        if rollout.zero_action_ablation_passed is not None
+        else None,
+        "pedal_action_indices_json": json.dumps(list(rollout.pedal_action_indices)),
         "intended_keys_json": json.dumps(list(instance.intended_keys)),
         "realized_keys_gt_json": json.dumps(list(instance.realized_keys_gt)),
         "predicted_keys_json": json.dumps(sorted({event.key_id for event in rollout.observed_key_events})),
@@ -1099,7 +1624,8 @@ def aggregate_per_primitive_reports(result_df: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for primitive_id, group in result_df.groupby("primitive_id", sort=True):
         usable = group.loc[group["status"].astype(str).isin({"completed", "terminated_early"})].copy()
-        representative_success = _representative_segments(usable, metric="onset_f1", ascending=False, top_k=3)
+        causal_usable = group.loc[group.get("causal_validated", pd.Series(False, index=group.index)).astype(bool)].copy()
+        representative_success = _representative_segments(causal_usable, metric="causal_f1", ascending=False, top_k=3)
         representative_failure = _representative_failures(group, top_k=3)
         intended_hist = _value_histogram_json(group["intended_key_count"].tolist())
         chord_hist = _value_histogram_json(
@@ -1110,19 +1636,23 @@ def aggregate_per_primitive_reports(result_df: pd.DataFrame) -> pd.DataFrame:
             {
                 "primitive_id": str(primitive_id),
                 "num_instances": int(len(group)),
-                "num_successful_rollouts": int(len(usable)),
-                "num_failed_rollouts": int(len(group) - len(usable)),
-                "mean_onset_precision": float(pd.to_numeric(usable["onset_precision"], errors="coerce").mean()) if not usable.empty else float("nan"),
-                "mean_onset_recall": float(pd.to_numeric(usable["onset_recall"], errors="coerce").mean()) if not usable.empty else float("nan"),
-                "mean_onset_f1": float(pd.to_numeric(usable["onset_f1"], errors="coerce").mean()) if not usable.empty else float("nan"),
-                "median_onset_f1": float(pd.to_numeric(usable["onset_f1"], errors="coerce").median()) if not usable.empty else float("nan"),
+                "num_successful_rollouts": int(group.get("success", pd.Series(False, index=group.index)).astype(bool).sum()),
+                "num_failed_rollouts": int(len(group) - group.get("success", pd.Series(False, index=group.index)).astype(bool).sum()),
+                "num_causal_validated": int(len(causal_usable)),
+                "mean_legacy_state_onset_precision": float(pd.to_numeric(usable["legacy_state_onset_precision"], errors="coerce").mean()) if not usable.empty and "legacy_state_onset_precision" in usable else float("nan"),
+                "mean_legacy_state_onset_recall": float(pd.to_numeric(usable["legacy_state_onset_recall"], errors="coerce").mean()) if not usable.empty and "legacy_state_onset_recall" in usable else float("nan"),
+                "mean_legacy_state_onset_f1": float(pd.to_numeric(usable["legacy_state_onset_f1"], errors="coerce").mean()) if not usable.empty and "legacy_state_onset_f1" in usable else float("nan"),
+                "mean_causal_precision": float(pd.to_numeric(causal_usable["causal_precision"], errors="coerce").mean()) if not causal_usable.empty and "causal_precision" in causal_usable else float("nan"),
+                "mean_causal_recall": float(pd.to_numeric(causal_usable["causal_recall"], errors="coerce").mean()) if not causal_usable.empty and "causal_recall" in causal_usable else float("nan"),
+                "mean_causal_f1": float(pd.to_numeric(causal_usable["causal_f1"], errors="coerce").mean()) if not causal_usable.empty and "causal_f1" in causal_usable else float("nan"),
+                "median_causal_f1": float(pd.to_numeric(causal_usable["causal_f1"], errors="coerce").median()) if not causal_usable.empty and "causal_f1" in causal_usable else float("nan"),
                 "false_positive_rate": float(pd.to_numeric(usable["false_positive_key_events"], errors="coerce").mean()) if not usable.empty else float("nan"),
                 "missed_note_rate": float(pd.to_numeric(usable["missed_key_events"], errors="coerce").mean()) if not usable.empty else float("nan"),
                 "mean_abs_timing_error_frames": float(pd.to_numeric(usable["mean_abs_timing_error_frames"], errors="coerce").mean()) if not usable.empty else float("nan"),
                 "typical_duration_steps": float(pd.to_numeric(group["duration_steps"], errors="coerce").median()),
                 "mean_intended_key_count": float(pd.to_numeric(group["intended_key_count"], errors="coerce").mean()),
                 "mean_realized_key_count_gt": float(pd.to_numeric(group["realized_key_count_gt"], errors="coerce").mean()),
-                "mean_predicted_key_count": float(pd.to_numeric(usable["predicted_key_count"], errors="coerce").mean()) if not usable.empty else float("nan"),
+                "mean_predicted_key_count": float(pd.to_numeric(causal_usable["predicted_key_count"], errors="coerce").mean()) if not causal_usable.empty else float("nan"),
                 "keyboard_region_summary": _keyboard_region_label(mean_center),
                 "hand_summary": _mode_or_unknown(group.get("hand", pd.Series(dtype=object))),
                 "intended_key_count_histogram_json": intended_hist,
@@ -1145,20 +1675,34 @@ def build_aggregate_metrics(
     runtime_error: str | None,
 ) -> dict[str, Any]:
     usable = result_df.loc[result_df["status"].astype(str).isin({"completed", "terminated_early"})].copy()
+    causal_usable = result_df.loc[result_df.get("causal_validated", pd.Series(False, index=result_df.index)).astype(bool)].copy()
+    legacy_state_metrics = {
+        "mean_onset_precision": float(pd.to_numeric(usable.get("legacy_state_onset_precision", pd.Series(dtype=float)), errors="coerce").mean()) if not usable.empty else float("nan"),
+        "mean_onset_recall": float(pd.to_numeric(usable.get("legacy_state_onset_recall", pd.Series(dtype=float)), errors="coerce").mean()) if not usable.empty else float("nan"),
+        "mean_onset_f1": float(pd.to_numeric(usable.get("legacy_state_onset_f1", pd.Series(dtype=float)), errors="coerce").mean()) if not usable.empty else float("nan"),
+        "mean_false_positive_key_events": float(pd.to_numeric(usable["false_positive_key_events"], errors="coerce").mean()) if not usable.empty else float("nan"),
+        "mean_missed_key_events": float(pd.to_numeric(usable["missed_key_events"], errors="coerce").mean()) if not usable.empty else float("nan"),
+    }
+    causal_contact_metrics = {
+        "num_causal_validated": int(len(causal_usable)),
+        "mean_causal_precision": float(pd.to_numeric(causal_usable.get("causal_precision", pd.Series(dtype=float)), errors="coerce").mean()) if not causal_usable.empty else float("nan"),
+        "mean_causal_recall": float(pd.to_numeric(causal_usable.get("causal_recall", pd.Series(dtype=float)), errors="coerce").mean()) if not causal_usable.empty else float("nan"),
+        "mean_causal_f1": float(pd.to_numeric(causal_usable.get("causal_f1", pd.Series(dtype=float)), errors="coerce").mean()) if not causal_usable.empty else float("nan"),
+        "causal_success_rate": float(causal_usable.get("success", pd.Series(False, index=causal_usable.index)).astype(bool).mean()) if not causal_usable.empty else float("nan"),
+    }
     return {
         "status": "completed",
         "runtime_error": runtime_error,
         "num_assignment_rows": int(preflight.get("num_assignment_rows", 0)),
         "num_sampled_rows": int(preflight.get("num_sampled_rows", 0)),
         "num_result_rows": int(len(result_df)),
-        "num_successful_rollouts": int(len(usable)),
-        "num_failed_rollouts": int(len(result_df) - len(usable)),
+        "num_successful_rollouts": int(result_df.get("success", pd.Series(False, index=result_df.index)).astype(bool).sum()),
+        "num_failed_rollouts": int(len(result_df) - result_df.get("success", pd.Series(False, index=result_df.index)).astype(bool).sum()),
+        "num_causal_validated": int(len(causal_usable)),
         "num_primitives_evaluated": int(summary_df["primitive_id"].nunique()) if not summary_df.empty else 0,
-        "mean_onset_precision": float(pd.to_numeric(usable["onset_precision"], errors="coerce").mean()) if not usable.empty else float("nan"),
-        "mean_onset_recall": float(pd.to_numeric(usable["onset_recall"], errors="coerce").mean()) if not usable.empty else float("nan"),
-        "mean_onset_f1": float(pd.to_numeric(usable["onset_f1"], errors="coerce").mean()) if not usable.empty else float("nan"),
-        "mean_false_positive_key_events": float(pd.to_numeric(usable["false_positive_key_events"], errors="coerce").mean()) if not usable.empty else float("nan"),
-        "mean_missed_key_events": float(pd.to_numeric(usable["missed_key_events"], errors="coerce").mean()) if not usable.empty else float("nan"),
+        "legacy_state_metrics": legacy_state_metrics,
+        "causal_contact_metrics": causal_contact_metrics,
+        "mean_causal_f1": causal_contact_metrics["mean_causal_f1"],
         "mean_abs_timing_error_frames": float(pd.to_numeric(usable["mean_abs_timing_error_frames"], errors="coerce").mean()) if not usable.empty else float("nan"),
         "mean_piano_state_mse": float(pd.to_numeric(usable["piano_state_mse"], errors="coerce").mean()) if not usable.empty else float("nan"),
         "mean_action_mse": float(pd.to_numeric(usable["action_mse"], errors="coerce").mean()) if not usable.empty else float("nan"),
@@ -1382,6 +1926,7 @@ def save_rollout_debug_artifact(
         predicted_actions=_empty_array_if_none(rollout.predicted_actions),
         observed_piano_states=_empty_array_if_none(rollout.observed_piano_states),
         observed_key_roll=_empty_array_if_none(rollout.observed_key_roll),
+        contact_roll=_empty_array_if_none(rollout.contact_roll),
         observed_hand_joints=_empty_array_if_none(rollout.observed_hand_joints),
         observed_hand_fingertips=_empty_array_if_none(rollout.observed_hand_fingertips),
         actions_gt=_empty_array_if_none(instance.actions_gt),
@@ -1409,14 +1954,14 @@ def save_summary_plots(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    usable = result_df.loc[result_df["status"].astype(str).isin({"completed", "terminated_early"})].copy()
+    usable = result_df.loc[result_df.get("causal_validated", pd.Series(False, index=result_df.index)).astype(bool)].copy()
     if usable.empty:
         return
     _plot_histogram(
-        output_path=output_dir / "onset_f1_distribution.png",
-        values=pd.to_numeric(usable["onset_f1"], errors="coerce").dropna().to_numpy(dtype=np.float32),
-        title="Onset F1 Distribution",
-        xlabel="Onset F1",
+        output_path=output_dir / "causal_f1_distribution.png",
+        values=pd.to_numeric(usable["causal_f1"], errors="coerce").dropna().to_numpy(dtype=np.float32),
+        title="Causal Contact F1 Distribution",
+        xlabel="Causal F1",
         plt=plt,
     )
     _plot_histogram(
@@ -1429,16 +1974,16 @@ def save_summary_plots(
     )
     if not summary_df.empty:
         top = summary_df.sort_values(
-            ["num_instances", "mean_onset_f1"], ascending=[False, False], kind="stable"
+            ["num_instances", "mean_causal_f1"], ascending=[False, False], kind="stable"
         ).head(max(int(max_plot_primitives), 1))
         fig, ax = plt.subplots(figsize=(max(10, 0.35 * len(top) + 4), 5))
-        ax.bar(top["primitive_id"].astype(str), pd.to_numeric(top["mean_onset_f1"], errors="coerce").fillna(0.0))
-        ax.set_title("Per-Primitive Mean Onset F1")
-        ax.set_ylabel("Mean Onset F1")
+        ax.bar(top["primitive_id"].astype(str), pd.to_numeric(top["mean_causal_f1"], errors="coerce").fillna(0.0))
+        ax.set_title("Per-Primitive Mean Causal F1")
+        ax.set_ylabel("Mean Causal F1")
         ax.set_xlabel("Primitive")
         ax.tick_params(axis="x", rotation=90)
         fig.tight_layout()
-        fig.savefig(output_dir / "primitive_mean_onset_f1.png", dpi=200)
+        fig.savefig(output_dir / "primitive_mean_causal_f1.png", dpi=200)
         plt.close(fig)
         _plot_primitive_frequency_accuracy_bar_chart(
             output_path=output_dir / "primitive_frequency_vs_accuracy.png",
@@ -1646,7 +2191,7 @@ def _clear_previous_outputs(output_root: Path) -> None:
         path = output_root / name
         if path.exists():
             path.unlink()
-    for directory_name in ("plots", "debug"):
+    for directory_name in ("plots", "debug", "videos", "frames_tmp"):
         path = output_root / directory_name
         if path.exists():
             shutil.rmtree(path)
@@ -1657,10 +2202,12 @@ def _resolve_eval_config(config: dict[str, Any]) -> dict[str, Any]:
     sampling = dict(resolved.get("sampling", {}))
     events = dict(resolved.get("events", {}))
     rollout = dict(resolved.get("rollout", {}))
+    causal_eval = default_causal_eval_config(resolved.get("causal_eval") or rollout.get("causal_eval"))
     aggregation = dict(resolved.get("aggregation", {}))
     resolved["sampling"] = sampling
     resolved["events"] = events
     resolved["rollout"] = rollout
+    resolved["causal_eval"] = causal_eval
     resolved["aggregation"] = aggregation
     resolved.setdefault("seed", 7)
     resolved.setdefault("resume", True)
@@ -1670,6 +2217,8 @@ def _resolve_eval_config(config: dict[str, Any]) -> dict[str, Any]:
     sampling.setdefault("primitive_ids", [])
     events.setdefault("use_goals", True)
     events.setdefault("use_piano_states", True)
+    events.setdefault("allow_goal_realized_fallback", False)
+    events.setdefault("allow_piano_state_intended_fallback", False)
     events.setdefault("goal_key_threshold", 0.5)
     events.setdefault("goal_sustain_threshold", 0.5)
     events.setdefault("piano_state_threshold", 0.5)
@@ -1677,11 +2226,19 @@ def _resolve_eval_config(config: dict[str, Any]) -> dict[str, Any]:
     events.setdefault("onset_tolerance_frames", 1)
     rollout.setdefault("validate_action_dim", True)
     rollout.setdefault("source_mode", "dataset_song")
+    rollout.setdefault("restore_mode", causal_eval["restore_mode"])
+    rollout.setdefault("video_audio_source", causal_eval["video_audio_source"])
+    rollout.setdefault("render_video", False)
+    rollout.setdefault("max_render_instances", None)
+    rollout.setdefault("video_fps", 20)
+    rollout.setdefault("video_height", 480)
+    rollout.setdefault("video_width", 640)
     rollout.setdefault("example_midi_paths", [])
     rollout.setdefault("example_environment_names", [])
     rollout.setdefault("example_midi_labels", [])
     rollout.setdefault("piano_state_threshold", events["piano_state_threshold"])
     rollout.setdefault("piano_sustain_threshold", events["piano_sustain_threshold"])
+    rollout["causal_eval"] = causal_eval
     aggregation.setdefault("top_k_examples", 3)
     aggregation.setdefault("max_plot_primitives", 24)
     return resolved
@@ -1751,6 +2308,22 @@ def _empty_event_metrics() -> dict[str, Any]:
     }
 
 
+def _resample_sequence(sequence: np.ndarray, steps: int) -> np.ndarray:
+    array = np.asarray(sequence, dtype=np.float32)
+    if array.ndim != 2:
+        array = array.reshape(array.shape[0], -1)
+    if int(steps) <= 0:
+        raise ValueError("Cannot resample a sequence to zero steps.")
+    if array.shape[0] == int(steps):
+        return array.astype(np.float32)
+    x_old = np.linspace(0.0, 1.0, array.shape[0], dtype=np.float32)
+    x_new = np.linspace(0.0, 1.0, int(steps), dtype=np.float32)
+    output = np.zeros((int(steps), array.shape[1]), dtype=np.float32)
+    for dim in range(array.shape[1]):
+        output[:, dim] = np.interp(x_new, x_old, array[:, dim])
+    return output.astype(np.float32)
+
+
 def _aligned_mse(left: np.ndarray | None, right: np.ndarray | None) -> float:
     if left is None or right is None:
         return float("nan")
@@ -1804,9 +2377,27 @@ def _build_failure_row_from_build_failure(item: PrimitiveInstanceBuildFailure) -
             "onset_precision": float("nan"),
             "onset_recall": float("nan"),
             "onset_f1": float("nan"),
+            "legacy_state_onset_precision": float("nan"),
+            "legacy_state_onset_recall": float("nan"),
+            "legacy_state_onset_f1": float("nan"),
+            "state_onset_f1": float("nan"),
             "false_positive_key_events": float("nan"),
             "missed_key_events": float("nan"),
             "mean_abs_timing_error_frames": float("nan"),
+            "causal_validated": False,
+            "causal_failure_reason": item.error,
+            "restore_mode": "none",
+            "zero_action_ablation_passed": False,
+            "neutral_start_passed": False,
+            "contact_gate_passed": False,
+            "target_source": "unavailable",
+            "observed_source": "unavailable",
+            "causal_true_positive_events": 0,
+            "causal_false_positive_events": 0,
+            "causal_missed_events": 0,
+            "causal_precision": float("nan"),
+            "causal_recall": float("nan"),
+            "causal_f1": float("nan"),
         }
     )
     return row
@@ -1907,7 +2498,7 @@ def _restore_hand_state(*, task: Any, physics: Any, instance: PrimitiveInstance)
     return True
 
 
-def _restore_piano_state(*, task: Any, physics: Any, instance: PrimitiveInstance) -> bool:
+def _restore_piano_state_unsafe_legacy(*, task: Any, physics: Any, instance: PrimitiveInstance) -> bool:
     if instance.start_piano_state is None:
         return False
     piano = getattr(task, "piano", None)
@@ -2032,7 +2623,8 @@ def _plot_primitive_frequency_accuracy_bar_chart(
     frame = summary_df.sort_values("num_instances", ascending=False, kind="stable").head(max_plot_primitives)
     labels = frame["primitive_id"].astype(str).tolist()
     counts = pd.to_numeric(frame["num_instances"], errors="coerce").fillna(0).to_numpy(dtype=float)
-    accuracy = pd.to_numeric(frame["mean_onset_f1"], errors="coerce").to_numpy(dtype=float)
+    accuracy_column = "mean_causal_f1" if "mean_causal_f1" in frame.columns else "mean_legacy_state_onset_f1"
+    accuracy = pd.to_numeric(frame[accuracy_column], errors="coerce").to_numpy(dtype=float)
 
     cmap = plt.cm.viridis
     norm = Normalize(vmin=0.0, vmax=1.0, clip=True)
@@ -2052,7 +2644,7 @@ def _plot_primitive_frequency_accuracy_bar_chart(
     sm = ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
-    cbar.set_label("Mean onset F1")
+    cbar.set_label("Mean causal F1")
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)

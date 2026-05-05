@@ -117,6 +117,12 @@ class SegmentRecord:
     raw_chunk_path: str = ""
     raw_chunk_index: int = -1
     gmr_target_name: str = ""
+    causal_segment: bool = False
+    segment_alignment: str = ""
+    inactive_start: bool = False
+    activation_after_start: bool = False
+    contact_near_onset: bool = False
+    rejection_reason: str = ""
 
     def as_row(self) -> dict[str, Any]:
         return asdict(self)

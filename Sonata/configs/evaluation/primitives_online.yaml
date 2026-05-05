@@ -21,14 +21,40 @@ sampling:
 events:
   use_goals: true
   use_piano_states: true
+  allow_goal_realized_fallback: false
+  allow_piano_state_intended_fallback: false
   goal_key_threshold: 0.5
   goal_sustain_threshold: 0.5
   piano_state_threshold: 0.5
   piano_sustain_threshold: 0.5
   onset_tolerance_frames: 1
 
+causal_eval:
+  enabled: true
+  restore_mode: hands_only
+  allow_piano_state_restore: false
+  allow_goal_state_restore: false
+  allow_reference_midi_scoring: false
+  allow_target_state_as_observation: false
+  require_neutral_piano_start: true
+  fail_if_initial_keys_active: true
+  initial_key_activation_threshold: 0.1
+  run_zero_action_ablation: true
+  require_contact_for_keypress: true
+  contact_tolerance_frames: 2
+  key_activation_threshold: 0.1
+  fingertip_key_distance_threshold_m: 0.025
+  video_audio_source: none
+
 rollout:
   validate_action_dim: true
+  restore_mode: hands_only
+  video_audio_source: none
+  render_video: false
+  max_render_instances: null
+  video_fps: 20
+  video_height: 480
+  video_width: 640
 
 aggregation:
   top_k_examples: 3

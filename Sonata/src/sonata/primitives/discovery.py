@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import joblib
@@ -177,6 +178,19 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
             storage_summary=store_summary,
             config=config,
         )
+        contract = build_primitive_training_contract(
+            primitive_root=primitive_root,
+            manifest_df=manifest_df,
+            segment_df=segment_df,
+            library_df=library_df,
+            storage_summary=store_summary,
+            config=config,
+        )
+        contract_path = primitive_root / "validation" / "primitive_training_contract.json"
+        contract_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(contract, contract_path)
+        if not bool(contract["pass_training_contract"]):
+            raise RuntimeError(f"Primitive training contract failed; see {contract_path}")
         metrics_dir = primitive_root / "metrics"
         metrics_dir.mkdir(parents=True, exist_ok=True)
         metrics_path = metrics_dir / "stage1_metrics.json"
@@ -345,6 +359,29 @@ def _fit_gmm_bucket(
     scaler = StandardScaler()
     train_scaled = scaler.fit_transform(train_source)
     all_scaled = scaler.transform(feature_matrix)
+    if train_scaled.shape[0] < 2 or feature_matrix.shape[0] < 2:
+        return {
+            "labels": np.zeros((feature_matrix.shape[0],), dtype=np.int64),
+            "probabilities": np.ones((feature_matrix.shape[0], 1), dtype=np.float32),
+            "all_reduced": np.zeros((feature_matrix.shape[0], 1), dtype=np.float32),
+            "scaler": scaler,
+            "embedding_model": None,
+            "model": SimpleNamespace(n_components=1),
+            "selected_k": 1,
+            "selected_covariance_type": "singleton",
+            "silhouette": float("nan"),
+            "sweep_rows": [
+                {
+                    "bucket_name": bucket_name,
+                    "stage": "singleton",
+                    "k": 1,
+                    "covariance_type": "singleton",
+                    "bic": float("nan"),
+                    "aic": float("nan"),
+                    "criterion_value": float("nan"),
+                }
+            ],
+        }
     pca_components = min(int(config["pca_components"]), max(1, train_scaled.shape[0]), train_scaled.shape[1])
     train_reduced, all_reduced, embedding_model = fit_pca_embedding(
         train_scaled=np.asarray(train_scaled, dtype=np.float32),
@@ -613,7 +650,14 @@ def _fit_library_models(
             diagnostics = {"selected": selected_metrics, "candidates": []}
 
         prior_path = library_dir / f"{primitive_id}_prior.npz"
-        save_npz(prior_path, prior_mean=predicted_mean.astype(np.float32), trajectory_examples=stacked[: min(8, len(stacked))])
+        save_npz(
+            prior_path,
+            prior_mean=predicted_mean.astype(np.float32),
+            trajectory_examples=stacked[: min(8, len(stacked))],
+            gmr_target_name=np.asarray(["actions" if bool(config.get("gmr_target_actions", True)) else "hand_joints"], dtype=object),
+            causal_segment=np.asarray([bool(config.get("segmentation_strategy") == "prepress_causal" or config.get("segmenter_name") == "prepress_causal")]),
+            segment_alignment=np.asarray(["prepress_to_onset" if str(config.get("segmentation_strategy", "")) == "prepress_causal" or str(config.get("segmenter_name", "")) == "prepress_causal" else ""], dtype=object),
+        )
         if gmr is not None:
             gmr_payload["models"][primitive_id] = gmr.to_payload()
         gmr_payload["diagnostics"][primitive_id] = diagnostics
@@ -645,6 +689,9 @@ def _fit_library_models(
             "low_quality_flag": bool(low_quality),
             "fit_failed": bool(fit_failed),
             "prior_path": str(prior_path.resolve()),
+            "gmr_target_name": "actions" if bool(config.get("gmr_target_actions", True)) else "hand_joints",
+            "causal_segment": bool(config.get("segmentation_strategy") == "prepress_causal" or config.get("segmenter_name") == "prepress_causal"),
+            "segment_alignment": "prepress_to_onset" if str(config.get("segmentation_strategy", "")) == "prepress_causal" or str(config.get("segmenter_name", "")) == "prepress_causal" else "",
         }
         library_rows.append(row_payload)
         if evaluator is not None:
@@ -854,6 +901,66 @@ def compute_stage1_metrics(
     return metrics
 
 
+def build_primitive_training_contract(
+    *,
+    primitive_root: Path,
+    manifest_df: pd.DataFrame,
+    segment_df: pd.DataFrame,
+    library_df: pd.DataFrame,
+    storage_summary: dict[str, Any] | None,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    del storage_summary
+    action_values = pd.to_numeric(manifest_df.get("action_dim", pd.Series(dtype=float)), errors="coerce").dropna()
+    action_dim = int(action_values.iloc[0]) if not action_values.empty else int(config.get("fallback_action_dim", 39))
+    prior_shapes: dict[str, list[int]] = {}
+    any_prior_not_action_dim = False
+    for row in library_df.itertuples(index=False):
+        prior_path = Path(str(getattr(row, "prior_path", "")))
+        if not prior_path.exists():
+            any_prior_not_action_dim = True
+            prior_shapes[str(getattr(row, "primitive_id", "unknown"))] = []
+            continue
+        payload = np.load(prior_path, allow_pickle=True)
+        prior = np.asarray(payload["prior_mean"], dtype=np.float32)
+        prior_shapes[str(row.primitive_id)] = [int(dim) for dim in prior.shape]
+        if prior.ndim < 2 or int(prior.shape[-1]) != int(action_dim):
+            any_prior_not_action_dim = True
+    segment_manifest = read_json(primitive_root / "segments" / "segment_manifest.json") if (primitive_root / "segments" / "segment_manifest.json").exists() else {}
+    rejection_counts = segment_manifest.get("rejection_counts", {})
+    inactive_start = _percent_bool(segment_df.get("inactive_start"))
+    activation_after_start = _percent_bool(segment_df.get("activation_after_start"))
+    contact_near_onset = _percent_bool(segment_df.get("contact_near_onset"))
+    causal_segment = bool(
+        str(config.get("segmentation_strategy", config.get("segmenter_name", ""))) == "prepress_causal"
+        or _percent_bool(segment_df.get("causal_segment")) >= 99.0
+    )
+    action_target = bool(config.get("gmr_target_actions", True)) and not any_prior_not_action_dim
+    pass_contract = bool(action_target and (not causal_segment or (inactive_start >= 99.0 and activation_after_start >= 99.0)))
+    return {
+        "action_dim": int(action_dim),
+        "gmr_target_name": "actions" if bool(config.get("gmr_target_actions", True)) else "hand_joints",
+        "causal_segment": bool(causal_segment),
+        "segment_alignment": "prepress_to_onset" if causal_segment else "",
+        "prior_shapes": prior_shapes,
+        "num_segments": int(len(segment_df)),
+        "num_rejected_segments": int(segment_manifest.get("num_rejected_segments", sum(int(value) for value in rejection_counts.values())) if isinstance(rejection_counts, dict) else 0),
+        "rejection_counts": rejection_counts if isinstance(rejection_counts, dict) else {},
+        "percent_segments_with_inactive_start": float(inactive_start),
+        "percent_segments_with_activation_after_start": float(activation_after_start),
+        "percent_segments_with_contact_near_onset": float(contact_near_onset),
+        "any_prior_not_action_dim": bool(any_prior_not_action_dim),
+        "pass_training_contract": bool(pass_contract),
+    }
+
+
+def _percent_bool(series: pd.Series | None) -> float:
+    if series is None or len(series) == 0:
+        return 0.0
+    values = pd.Series(series).fillna(False).astype(bool)
+    return float(values.mean() * 100.0) if len(values) else 0.0
+
+
 def _apply_stage1_defaults(config: dict[str, Any]) -> dict[str, Any]:
     output = dict(config)
     output.setdefault("online_segment_processing", True if output.get("write_slim_cache", True) else False)
@@ -865,6 +972,17 @@ def _apply_stage1_defaults(config: dict[str, Any]) -> dict[str, Any]:
     output.setdefault("segment_press_pre_steps", min(int(output.get("pre_steps", 2)), 2))
     output.setdefault("segment_press_post_steps", min(int(output.get("post_steps", 6)), 6))
     output.setdefault("segment_truncate_at_next_onset", True)
+    output.setdefault("prepress_steps", 12)
+    output.setdefault("post_onset_steps", 3)
+    output.setdefault("min_inactive_pre_steps", 4)
+    output.setdefault("min_hold_steps", 2)
+    output.setdefault("activation_threshold", 0.5)
+    output.setdefault("max_events_per_onset", None)
+    output.setdefault("require_contact_near_onset", False)
+    output.setdefault("contact_tolerance_frames", 2)
+    output.setdefault("fingertip_key_distance_threshold_m", 0.025)
+    output.setdefault("segment_end_mode", "onset_plus_post")
+    output.setdefault("segment_start_mode", "fixed_prepress")
     output.setdefault("use_process_pool", True)
     output.setdefault("gpu_acceleration", False)
     output.setdefault("gpu_backend_preference", ["rapids", "cupy", "torch"])

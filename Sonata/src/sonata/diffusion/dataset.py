@@ -23,8 +23,8 @@ from sonata.transformer.dataset import (
 
 @dataclass
 class DiffusionMetadata(PlannerMetadata):
-    action_dim: int
-    state_dim: int
+    action_dim: int = 0
+    state_dim: int = 0
 
 
 class DiffusionChunkDataset(Dataset):

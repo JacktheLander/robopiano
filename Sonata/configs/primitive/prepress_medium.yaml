@@ -1,0 +1,80 @@
+output_root: ../../outputs/primitives/prepress_medium
+data_output_root: ../../outputs/data/medium
+data_manifest_name: dataset_manifest
+data_profile: medium
+experiment_name: Sonata-3-prepress-medium-primitives
+wandb:
+  enabled: true
+  project: robopianist
+  entity: tnguyen31-santa-clara-university
+  mode: online
+  tags: ["sonata", "primitives", "prepress_medium"]
+seed: 7
+force: false
+segmenter_name: prepress_causal
+segmentation_strategy: prepress_causal
+prepress_steps: 12
+post_onset_steps: 3
+min_inactive_pre_steps: 4
+min_hold_steps: 2
+activation_threshold: 0.5
+max_events_per_onset: null
+require_contact_near_onset: false
+contact_tolerance_frames: 2
+fingertip_key_distance_threshold_m: 0.025
+segment_end_mode: onset_plus_post
+segment_start_mode: fixed_prepress
+window_steps: 24
+stride_steps: 12
+pre_steps: 12
+post_steps: 3
+segment_press_pre_steps: 12
+segment_press_post_steps: 3
+segment_truncate_at_next_onset: false
+segment_min_len: 8
+segment_max_len: 20
+min_gap_steps: 8
+velocity_quantile: 0.85
+acceleration_quantile: 0.85
+alignment_radius: 4
+dtw_template_window: 20
+chord_tolerance_steps: 1
+segment_chunk_size: 512
+online_segment_processing: true
+save_raw_segment_chunks: false
+online_storage_format: npz_shards
+write_full_segment_cache: false
+write_slim_cache: true
+migrate_existing_segment_chunks: true
+delete_raw_chunks_after_migration: false
+slim_cache_dir: slim
+slim_feature_dir: features
+slim_gmr_target_dir: gmr_targets
+slim_index_dir: index
+trajectory_resample_steps: 16
+include_action_trajectory: true
+fallback_action_dim: 39
+pca_components: 128
+gmm_k_candidates: [16, 24, 32, 40]
+gmm_k_candidates_by_family:
+  single_press: [12, 16, 20]
+  dyad_press: [8, 12]
+  triad_press: [6, 8]
+  chord_press: [4, 6]
+  default: [8, 12]
+model_selection_metric: bic
+gmm_covariance_type: full
+gmm_reg_covar: 0.0001
+silhouette_max_examples: 2048
+gmr_resample_steps: 32
+gmr_horizon: 32
+gmr_components: 6
+gmr_reg_covar: 0.0001
+gmr_target_actions: true
+num_duration_buckets: 8
+num_dynamics_buckets: 6
+min_segments_per_primitive: 8
+segment_num_workers: 16
+feature_num_workers: 16
+stage1_max_segments_per_score_onset: 1.5
+stage1_max_p95_segment_duration_steps: 20

@@ -37,7 +37,8 @@ def main() -> None:
         config["output_root"] = args.output_root
     config["output_root"] = str(resolve_path(config["output_root"], config_dir))
     config["data_output_root"] = str(resolve_path(config["data_output_root"], config_dir))
-    data_config = load_stage_config("data", profile=args.profile)
+    data_profile = str(config.get("data_profile", args.profile))
+    data_config = load_stage_config("data", profile=data_profile)
     data_config_dir = resolve_path(data_config["config_path"]).parent
     data_config["dataset_root"] = str(resolve_path(data_config["dataset_root"], data_config_dir))
     # Use the same tree as primitive `data_output_root` so scan_dataset and Stage 1 agree.

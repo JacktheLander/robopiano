@@ -37,6 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-height", type=int, default=480)
     parser.add_argument("--video-width", type=int, default=640)
     parser.add_argument("--max-render-episodes", type=int, default=None)
+    parser.add_argument("--causal-eval", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--restore-mode", choices=["hands_only", "neutral", "unsafe_legacy"], default="hands_only")
+    parser.add_argument("--video-audio-source", choices=["none", "robot_midi"], default="none")
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--log-level", default="INFO")
     add_wandb_arguments(parser)
@@ -91,6 +94,11 @@ def main() -> None:
             video_height=args.video_height,
             video_width=args.video_width,
             max_render_episodes=args.max_render_episodes,
+            causal_eval={
+                "enabled": bool(args.causal_eval and args.restore_mode != "unsafe_legacy"),
+                "restore_mode": str(args.restore_mode),
+                "video_audio_source": str(args.video_audio_source),
+            },
             wandb_run=wandb_run,
             logger=logger,
         )

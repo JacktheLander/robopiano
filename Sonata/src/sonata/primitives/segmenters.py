@@ -69,6 +69,12 @@ class CandidateSegment:
     target_onset_step: int = -1
     next_onset_gap_steps: int = -1
     truncated_by_next_onset: bool = False
+    causal_segment: bool = False
+    segment_alignment: str = ""
+    inactive_start: bool = False
+    activation_after_start: bool = False
+    contact_near_onset: bool = False
+    rejection_reason: str = ""
 
 
 @dataclass
@@ -919,6 +925,177 @@ def _segment_iou(left: CandidateSegment, right: CandidateSegment) -> float:
     return float(intersection / max(union, 1))
 
 
+class PrepressCausalSegmenter(BaseSegmenter):
+    name = "prepress_causal"
+
+    def __init__(
+        self,
+        *,
+        prepress_steps: int,
+        post_onset_steps: int,
+        min_inactive_pre_steps: int,
+        min_hold_steps: int,
+        activation_threshold: float,
+        max_events_per_onset: int | None,
+        require_contact_near_onset: bool,
+        contact_tolerance_frames: int,
+        fingertip_key_distance_threshold_m: float,
+        segment_min_len: int,
+        segment_max_len: int,
+    ):
+        self.prepress_steps = max(int(prepress_steps), 1)
+        self.post_onset_steps = max(int(post_onset_steps), 1)
+        self.min_inactive_pre_steps = max(int(min_inactive_pre_steps), 1)
+        self.min_hold_steps = max(int(min_hold_steps), 1)
+        self.activation_threshold = float(activation_threshold)
+        self.max_events_per_onset = None if max_events_per_onset is None else max(int(max_events_per_onset), 1)
+        self.require_contact_near_onset = bool(require_contact_near_onset)
+        self.contact_tolerance_frames = max(int(contact_tolerance_frames), 0)
+        self.fingertip_key_distance_threshold_m = float(fingertip_key_distance_threshold_m)
+        self.segment_min_len = max(int(segment_min_len), 1)
+        self.segment_max_len = max(int(segment_max_len), self.segment_min_len)
+        self.last_stats = {"proposed_segments": 0, "accepted_segments": 0, "rejection_counts": {}}
+
+    def segment(self, episode, score_events: list[ScoreEvent]) -> list[CandidateSegment]:
+        del score_events
+        roll_source = episode.piano_states if episode.piano_states is not None else episode.goals
+        rejection_counts: dict[str, int] = {}
+        if episode.hand_joints is None:
+            self.last_stats = {"proposed_segments": 0, "accepted_segments": 0, "rejection_counts": {"missing_hand_joints": 1}}
+            return []
+        if episode.actions is None:
+            self.last_stats = {"proposed_segments": 0, "accepted_segments": 0, "rejection_counts": {"missing_actions": 1}}
+            return []
+        if roll_source is None:
+            self.last_stats = {"proposed_segments": 0, "accepted_segments": 0, "rejection_counts": {"missing_activation_roll": 1}}
+            return []
+        roll = np.asarray(roll_source, dtype=np.float32)
+        if roll.ndim != 2 or roll.shape[0] == 0:
+            self.last_stats = {"proposed_segments": 0, "accepted_segments": 0, "rejection_counts": {"invalid_activation_roll": 1}}
+            return []
+        key_roll = np.zeros((roll.shape[0], 88), dtype=bool)
+        key_roll[:, : min(88, roll.shape[1])] = roll[:, : min(88, roll.shape[1])] >= self.activation_threshold
+        onset_groups = self._activation_onset_groups(key_roll)
+        proposed = len(onset_groups)
+        accepted: list[CandidateSegment] = []
+        for onset_step, keys in onset_groups:
+            if self.max_events_per_onset is not None:
+                keys = keys[: self.max_events_per_onset]
+            candidate = self._build_candidate(
+                episode=episode,
+                key_roll=key_roll,
+                onset_step=int(onset_step),
+                keys=[int(key) for key in keys],
+                rejection_counts=rejection_counts,
+            )
+            if candidate is not None:
+                accepted.append(candidate)
+        self.last_stats = {
+            "proposed_segments": int(proposed),
+            "accepted_segments": int(len(accepted)),
+            "rejection_counts": dict(sorted(rejection_counts.items())),
+        }
+        return accepted
+
+    def _activation_onset_groups(self, key_roll: np.ndarray) -> list[tuple[int, list[int]]]:
+        groups: list[tuple[int, list[int]]] = []
+        previous = key_roll[0]
+        for frame_index in range(1, key_roll.shape[0]):
+            current = key_roll[frame_index]
+            onset_keys = np.flatnonzero(current & ~previous).astype(int).tolist()
+            if onset_keys:
+                groups.append((int(frame_index), onset_keys))
+            previous = current
+        return groups
+
+    def _build_candidate(
+        self,
+        *,
+        episode,
+        key_roll: np.ndarray,
+        onset_step: int,
+        keys: list[int],
+        rejection_counts: dict[str, int],
+    ) -> CandidateSegment | None:
+        start = int(onset_step) - self.prepress_steps
+        end = int(onset_step) + self.post_onset_steps
+        if start < 0:
+            self._reject(rejection_counts, "insufficient_prepress_history")
+            return None
+        if end > key_roll.shape[0]:
+            self._reject(rejection_counts, "insufficient_post_onset_window")
+            return None
+        duration = int(end) - int(start)
+        if duration < self.segment_min_len or duration > self.segment_max_len:
+            self._reject(rejection_counts, "duration_out_of_bounds")
+            return None
+        if episode.actions is None or np.asarray(episode.actions[start:end]).size == 0:
+            self._reject(rejection_counts, "empty_action_segment")
+            return None
+        if np.any(key_roll[start, keys]):
+            self._reject(rejection_counts, "target_active_at_segment_start")
+            return None
+        inactive_left = max(int(onset_step) - self.min_inactive_pre_steps, start)
+        if np.any(key_roll[inactive_left:onset_step, :][:, keys]):
+            self._reject(rejection_counts, "target_not_inactive_before_onset")
+            return None
+        if np.any(key_roll[start:onset_step, :][:, keys]):
+            self._reject(rejection_counts, "target_active_in_prepress_window")
+            return None
+        hold_right = min(int(onset_step) + self.min_hold_steps, key_roll.shape[0])
+        if hold_right - int(onset_step) < self.min_hold_steps or not np.all(key_roll[onset_step:hold_right, :][:, keys]):
+            self._reject(rejection_counts, "min_hold_failed")
+            return None
+        contact_near_onset = self._contact_near_onset(episode=episode, keys=keys, onset_step=int(onset_step))
+        if self.require_contact_near_onset and not contact_near_onset:
+            self._reject(rejection_counts, "contact_near_onset_failed")
+            return None
+        key_signature = "-".join(str(key) for key in sorted(keys)) if keys else "none"
+        chord_size = len(keys)
+        return CandidateSegment(
+            onset_step=int(start),
+            end_step=int(end),
+            segment_source=self.name,
+            score_event_id=f"{episode.episode_id}_prepress_{int(onset_step):06d}_{key_signature}",
+            key_signature=key_signature,
+            heuristic_family="single" if chord_size <= 1 else "chord",
+            chord_size=int(chord_size),
+            key_center=float(np.mean(keys) / 87.0) if keys else 0.0,
+            coarse_family=_keyset_coarse_family(chord_size),
+            proposal_size=int(chord_size),
+            proposal_span_steps=max(int(self.post_onset_steps), 1),
+            target_key_count=int(chord_size),
+            target_key_signature=key_signature,
+            target_onset_step=int(onset_step),
+            causal_segment=True,
+            segment_alignment="prepress_to_onset",
+            inactive_start=True,
+            activation_after_start=True,
+            contact_near_onset=bool(contact_near_onset),
+        )
+
+    def _contact_near_onset(self, *, episode, keys: list[int], onset_step: int) -> bool:
+        if episode.hand_fingertips is None:
+            return False
+        # RP1M caches fingertip poses but not a stable piano-key position table. Keep this hook
+        # explicit for future datasets instead of fabricating contact from piano state.
+        key_positions = getattr(episode, "key_positions", None)
+        if key_positions is None:
+            return False
+        tips = np.asarray(episode.hand_fingertips, dtype=np.float32).reshape(episode.hand_fingertips.shape[0], -1, 3)
+        keys_xyz = np.asarray(key_positions, dtype=np.float32).reshape(-1, 3)
+        left = max(int(onset_step) - self.contact_tolerance_frames, 0)
+        right = min(int(onset_step) + self.contact_tolerance_frames + 1, tips.shape[0])
+        if right <= left or not keys:
+            return False
+        distances = np.linalg.norm(tips[left:right, :, None, :] - keys_xyz[None, None, keys, :], axis=-1)
+        return bool(np.any(distances < self.fingertip_key_distance_threshold_m))
+
+    @staticmethod
+    def _reject(rejection_counts: dict[str, int], reason: str) -> None:
+        rejection_counts[str(reason)] = int(rejection_counts.get(str(reason), 0)) + 1
+
+
 def build_segmenter(config: dict[str, Any]) -> BaseSegmenter:
     strategy = str(config.get("segmenter_name", config.get("segmentation_strategy", "note_aligned")))
     if strategy == "fixed_window":
@@ -964,6 +1141,20 @@ def build_segmenter(config: dict[str, Any]) -> BaseSegmenter:
             group_max_span_steps=int(config.get("segment_group_max_span_steps", config.get("segment_max_len", 48))),
             key_center_tolerance=float(config.get("segment_group_key_center_tolerance", 0.12)),
             repeat_window_steps=int(config.get("segment_repeat_window_steps", 12)),
+        )
+    if strategy == "prepress_causal":
+        return PrepressCausalSegmenter(
+            prepress_steps=int(config.get("prepress_steps", 12)),
+            post_onset_steps=int(config.get("post_onset_steps", 3)),
+            min_inactive_pre_steps=int(config.get("min_inactive_pre_steps", 4)),
+            min_hold_steps=int(config.get("min_hold_steps", 2)),
+            activation_threshold=float(config.get("activation_threshold", 0.5)),
+            max_events_per_onset=config.get("max_events_per_onset"),
+            require_contact_near_onset=bool(config.get("require_contact_near_onset", False)),
+            contact_tolerance_frames=int(config.get("contact_tolerance_frames", 2)),
+            fingertip_key_distance_threshold_m=float(config.get("fingertip_key_distance_threshold_m", 0.025)),
+            segment_min_len=int(config.get("segment_min_len", 8)),
+            segment_max_len=int(config.get("segment_max_len", 20)),
         )
     raise ValueError(f"Unknown segmentation strategy: {strategy}")
 
@@ -1095,6 +1286,17 @@ _SEGMENT_CONFIG_SIGNATURE_KEYS = (
     "segment_group_max_span_steps",
     "segment_group_key_center_tolerance",
     "segment_repeat_window_steps",
+    "prepress_steps",
+    "post_onset_steps",
+    "min_inactive_pre_steps",
+    "min_hold_steps",
+    "activation_threshold",
+    "max_events_per_onset",
+    "require_contact_near_onset",
+    "contact_tolerance_frames",
+    "fingertip_key_distance_threshold_m",
+    "segment_end_mode",
+    "segment_start_mode",
 )
 
 
@@ -1312,6 +1514,12 @@ def run_segmentation_legacy(manifest_df: pd.DataFrame, output_dir: Path, config:
                 target_onset_step=int(candidate.target_onset_step if candidate.target_onset_step >= 0 else candidate.onset_step),
                 next_onset_gap_steps=int(candidate.next_onset_gap_steps),
                 truncated_by_next_onset=bool(candidate.truncated_by_next_onset),
+                causal_segment=bool(candidate.causal_segment),
+                segment_alignment=str(candidate.segment_alignment),
+                inactive_start=bool(candidate.inactive_start),
+                activation_after_start=bool(candidate.activation_after_start),
+                contact_near_onset=bool(candidate.contact_near_onset),
+                rejection_reason=str(candidate.rejection_reason),
             )
             writer.add(record.as_row() | {"split": row.split}, arrays)
 
@@ -1440,6 +1648,7 @@ def run_segmentation_slim(
     log_interval = max(int(config.get("segment_log_interval_episodes", 32)), 1)
     processed_this_loop = 0
     segments_this_loop = 0
+    aggregate_rejection_counts: dict[str, int] = {}
     if raw_writer is None:
         segment_num_workers = resolve_worker_count(config.get("segment_num_workers"), default=0)
         prepared_batches = _iter_prepared_episode_batches(
@@ -1473,6 +1682,7 @@ def run_segmentation_slim(
             processed_episode_ids.add(batch.episode_id)
             processed_this_loop += 1
             segments_this_loop += len(batch.prepared_segments)
+            _merge_rejection_counts(aggregate_rejection_counts, batch.stats.get("rejection_counts", {}))
             if evaluator is not None:
                 early_stop_decision = evaluator.observe_segmentation(
                     [segment.row for segment in batch.prepared_segments],
@@ -1534,6 +1744,7 @@ def run_segmentation_slim(
             processed_episode_ids.add(episode_id)
             processed_this_loop += 1
             segments_this_loop += len(prepared_segments)
+            _merge_rejection_counts(aggregate_rejection_counts, getattr(segmenter, "last_stats", {}).get("rejection_counts", {}))
             if evaluator is not None:
                 early_stop_decision = evaluator.observe_segmentation(
                     [segment.row for segment in prepared_segments],
@@ -1574,6 +1785,8 @@ def run_segmentation_slim(
         "online_storage_format": resolve_online_storage_format(config),
         "segment_strategy": config.get("segmenter_name", config.get("segmentation_strategy", "note_aligned")),
         "segment_config_signature": _segment_config_signature(config),
+        "rejection_counts": dict(sorted(aggregate_rejection_counts.items())),
+        "num_rejected_segments": int(sum(aggregate_rejection_counts.values())),
         "num_segments": int(store_summary["num_segments"]),
         "num_chunks": int(store_summary["num_chunks"]),
         "feature_dim": int(store_summary["feature_dim"]),
@@ -1606,6 +1819,8 @@ def run_segmentation_slim(
             "slim_chunk_files": collect_slim_chunk_names(slim_paths, completed_only=True),
             "segment_strategy": config.get("segmenter_name", config.get("segmentation_strategy", "note_aligned")),
             "segment_config_signature": _segment_config_signature(config),
+            "rejection_counts": dict(sorted(aggregate_rejection_counts.items())),
+            "num_rejected_segments": int(sum(aggregate_rejection_counts.values())),
             "online_segment_processing": True,
             "save_raw_segment_chunks": save_raw_segment_chunks_enabled(config),
             "online_storage_format": resolve_online_storage_format(config),
@@ -1684,6 +1899,17 @@ def _merge_score_tables(existing_score_df: pd.DataFrame, new_rows: list[dict[str
     if "event_id" in merged.columns:
         merged = merged.drop_duplicates(subset=["event_id"]).reset_index(drop=True)
     return merged
+
+
+def _merge_rejection_counts(target: dict[str, int], source: Any) -> None:
+    if not isinstance(source, dict):
+        return
+    for key, value in source.items():
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        target[str(key)] = int(target.get(str(key), 0)) + count
 
 
 def _load_or_infer_score_events(episode, config: dict[str, Any]) -> list[ScoreEvent]:
@@ -1838,6 +2064,12 @@ def iter_prepared_segments(
             target_onset_step=int(candidate.target_onset_step if candidate.target_onset_step >= 0 else candidate.onset_step),
             next_onset_gap_steps=int(candidate.next_onset_gap_steps),
             truncated_by_next_onset=bool(candidate.truncated_by_next_onset),
+            causal_segment=bool(candidate.causal_segment),
+            segment_alignment=str(candidate.segment_alignment),
+            inactive_start=bool(candidate.inactive_start),
+            activation_after_start=bool(candidate.activation_after_start),
+            contact_near_onset=bool(candidate.contact_near_onset),
+            rejection_reason=str(candidate.rejection_reason),
         )
         row_payload = record.as_row() | {"split": manifest_row.split}
         feature_vector, names = build_feature_vector_from_arrays(row=row_payload, arrays=arrays, config=config)

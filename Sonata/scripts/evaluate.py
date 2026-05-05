@@ -52,6 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-height", type=int, default=480)
     parser.add_argument("--video-width", type=int, default=640)
     parser.add_argument("--max-render-episodes", type=int, default=None)
+    parser.add_argument("--causal-eval", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--restore-mode", choices=["hands_only", "neutral", "unsafe_legacy"], default="hands_only")
+    parser.add_argument("--video-audio-source", choices=["none", "robot_midi"], default="none")
     parser.add_argument("--rollout-sample-size", type=int, default=32)
     parser.add_argument("--bootstrap-samples", type=int, default=1000)
     parser.add_argument("--sample-seed", type=int, default=7)
@@ -122,6 +125,13 @@ def main() -> None:
         logger.info("Offline metrics: %s", offline["metrics"])
         log_prefixed_metrics(wandb_run, offline["metrics"], prefix="offline", summary=True)
         if args.backend == "dm_control":
+            causal_eval = {
+                "enabled": bool(args.causal_eval),
+                "restore_mode": str(args.restore_mode),
+                "video_audio_source": str(args.video_audio_source),
+            }
+            if args.restore_mode == "unsafe_legacy":
+                causal_eval["enabled"] = False
             rollout = evaluate_dm_control_rollout(
                 primitive_root=primitive_root,
                 predictions_by_episode=offline["predictions_by_episode"],
@@ -131,6 +141,7 @@ def main() -> None:
                 video_height=args.video_height,
                 video_width=args.video_width,
                 max_render_episodes=args.max_render_episodes,
+                causal_eval=causal_eval,
                 wandb_run=wandb_run,
                 logger=logger,
             )
