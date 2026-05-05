@@ -31,6 +31,12 @@ events:
 
 rollout:
   validate_action_dim: true
+  render_video: false
+  video_fps: 20
+  video_height: 480
+  video_width: 640
+  max_render_instances: null
+  video_audio_source: robot_midi
 
 aggregation:
   top_k_examples: 2

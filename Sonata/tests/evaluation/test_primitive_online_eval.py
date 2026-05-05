@@ -13,12 +13,16 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from sonata.evaluation.primitive_online_eval import (
+    PrimitiveInstance,
+    PrimitiveOnlineRolloutResult,
     build_primitive_instances,
+    build_instance_result_row,
     extract_key_events_from_goals,
     extract_key_events_from_piano_states,
     load_primitive_online_artifacts,
     match_key_events,
     sample_primitive_assignment_rows,
+    _resolve_eval_config,
 )
 from sonata.primitives.slim_cache import resolve_slim_cache_paths, write_slim_chunk
 from sonata.utils.io import save_npz, write_table
@@ -248,3 +252,92 @@ def test_resolve_robopianist_import_root_accepts_clone_root_or_package_dir(tmp_p
 
     assert resolve_robopianist_import_root(clone_root) == clone_root
     assert resolve_robopianist_import_root(package_root) == clone_root
+
+
+def test_primitive_online_render_config_defaults_off() -> None:
+    config = _resolve_eval_config({})
+
+    assert config["rollout"]["render_video"] is False
+    assert config["rollout"]["video_fps"] == 20
+    assert config["rollout"]["max_render_instances"] is None
+
+
+def test_primitive_result_row_adds_video_fields_only_when_rendered() -> None:
+    instance = PrimitiveInstance(
+        segment_id="segment_a",
+        primitive_id="primitive_000",
+        song_id="song_a",
+        demo_id="demo_a",
+        episode_id="episode_a",
+        split="train",
+        start_frame=0,
+        end_frame=2,
+        duration_steps=2,
+        control_timestep=0.05,
+        hand=None,
+        start_joint_state=None,
+        start_joint_velocity=None,
+        start_fingertip_state=None,
+        start_piano_state=None,
+        intended_keys=(10,),
+        realized_keys_gt=(10,),
+        onset_frames_gt=(0,),
+        release_frames_gt=(2,),
+        conditioning_features=np.asarray([1.0], dtype=np.float32),
+        chunk_path="chunk.npz",
+        chunk_index=0,
+        raw_chunk_path=None,
+        raw_chunk_index=None,
+        gmr_target_name="actions",
+        primitive_prior_path=None,
+        intended_events=[],
+        realized_events_gt=[],
+        actions_gt=np.zeros((2, 3), dtype=np.float32),
+        goals=np.zeros((2, 89), dtype=np.float32),
+        piano_states_gt=np.zeros((2, 89), dtype=np.float32),
+        hand_joints_gt=np.zeros((2, 4), dtype=np.float32),
+        hand_fingertips_gt=np.zeros((2, 6), dtype=np.float32),
+    )
+    rollout = PrimitiveOnlineRolloutResult(
+        segment_id="segment_a",
+        primitive_id="primitive_000",
+        status="completed",
+        success=True,
+        error=None,
+        restore_mode="env_reset_only",
+        alignment_mode="direct",
+        predicted_actions=np.zeros((2, 3), dtype=np.float32),
+        raw_observed_piano_states=np.zeros((2, 89), dtype=np.float32),
+        observed_piano_states=np.zeros((2, 89), dtype=np.float32),
+        raw_observed_hand_joints=np.zeros((2, 4), dtype=np.float32),
+        observed_hand_joints=np.zeros((2, 4), dtype=np.float32),
+        raw_observed_hand_fingertips=np.zeros((2, 6), dtype=np.float32),
+        observed_hand_fingertips=np.zeros((2, 6), dtype=np.float32),
+        rollout_source_mode="dataset_song",
+        rollout_source_label=None,
+        rollout_environment_name="song_a",
+        rollout_midi_path=None,
+    )
+
+    row_without_video = build_instance_result_row(
+        instance=instance,
+        rollout=rollout,
+        event_config={"onset_tolerance_frames": 1},
+        debug_artifact_path=None,
+    )
+    assert "video_path" not in row_without_video
+
+    rollout.render_attempted = True
+    rollout.rendered_frames = 3
+    rollout.video_path = "videos/primitive_000_segment_a.mp4"
+    rollout.video_format = "mp4"
+    row_with_video = build_instance_result_row(
+        instance=instance,
+        rollout=rollout,
+        event_config={"onset_tolerance_frames": 1},
+        debug_artifact_path=None,
+    )
+
+    assert row_with_video["render_attempted"] is True
+    assert row_with_video["rendered_frames"] == 3
+    assert row_with_video["video_path"] == "videos/primitive_000_segment_a.mp4"

@@ -43,6 +43,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-device", default=None)
     parser.add_argument("--rollout-source-mode", default=None)
     parser.add_argument("--example-midi-paths", nargs="*", default=None)
+    parser.add_argument("--render-video", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--video-fps", type=int, default=None)
+    parser.add_argument("--video-height", type=int, default=None)
+    parser.add_argument("--video-width", type=int, default=None)
+    parser.add_argument("--max-render-instances", type=int, default=None)
+    parser.add_argument(
+        "--video-audio-source",
+        choices=["none", "robot_midi"],
+        default=None,
+        help="Audio track for primitive rollout videos.",
+    )
     parser.add_argument("--robopianist-root", default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--log-level", default="INFO")
@@ -108,6 +119,18 @@ def main() -> None:
         rollout["source_mode"] = str(args.rollout_source_mode)
     if args.example_midi_paths is not None:
         rollout["example_midi_paths"] = [str(_resolve_user_path(path)) for path in args.example_midi_paths]
+    if args.render_video is not None:
+        rollout["render_video"] = bool(args.render_video)
+    if args.video_fps is not None:
+        rollout["video_fps"] = int(args.video_fps)
+    if args.video_height is not None:
+        rollout["video_height"] = int(args.video_height)
+    if args.video_width is not None:
+        rollout["video_width"] = int(args.video_width)
+    if args.max_render_instances is not None:
+        rollout["max_render_instances"] = int(args.max_render_instances)
+    if args.video_audio_source is not None:
+        rollout["video_audio_source"] = str(args.video_audio_source)
     config["sampling"] = sampling
     config["events"] = events
     config["rollout"] = rollout

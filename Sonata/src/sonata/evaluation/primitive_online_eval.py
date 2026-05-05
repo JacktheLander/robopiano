@@ -17,6 +17,12 @@ import pandas as pd
 
 from sonata.data.loading import build_manifest_lookup, load_episode_record, load_stage1_source_manifest
 from sonata.diffusion.dataset import resample_sequence
+from sonata.evaluation.rollout import (
+    _find_piano_midi_events,
+    _relative_output_path,
+    _render_frame,
+    _write_rollout_video,
+)
 from sonata.evaluation.task_config import build_rollout_task_kwargs, validate_rollout_action_dim
 from sonata.primitives.features import build_feature_vector_from_arrays, load_feature_matrix_from_store
 from sonata.utils.io import ensure_dir, read_json, save_npz, write_json, write_table
@@ -145,6 +151,12 @@ class PrimitiveOnlineRolloutResult:
     observed_key_events: list[KeyEvent] = field(default_factory=list)
     observed_key_roll: np.ndarray | None = None
     notes: list[str] = field(default_factory=list)
+    render_attempted: bool = False
+    rendered_frames: int = 0
+    render_error: str | None = None
+    video_path: str | None = None
+    video_format: str | None = None
+    video_warning: str | None = None
 
 
 @dataclass(slots=True)
@@ -318,6 +330,10 @@ def evaluate_primitives_online(config: dict[str, Any], logger: logging.Logger | 
     jsonl_path = output_root / "primitive_instance_metrics.jsonl"
     result_rows = list(existing_rows)
     failure_rows = [_build_failure_row_from_build_failure(item) for item in build_failures]
+    rendered_instances = sum(1 for row in existing_rows if row.get("video_path"))
+    max_render_instances = _optional_int(resolved["rollout"].get("max_render_instances"))
+    videos_dir = output_root / "videos"
+    frames_tmp_dir = output_root / "frames_tmp"
     for row in failure_rows:
         if str(row["segment_id"]) in completed_segment_ids:
             continue
@@ -329,12 +345,26 @@ def evaluate_primitives_online(config: dict[str, Any], logger: logging.Logger | 
         if instance.segment_id in completed_segment_ids:
             continue
         library_entry = primitive_library.get(instance.primitive_id)
+        rollout_config = dict(resolved["rollout"])
+        should_render = bool(rollout_config.get("render_video", False)) and (
+            max_render_instances is None or rendered_instances < max_render_instances
+        )
+        rollout_config["render_video"] = bool(should_render)
+        if should_render:
+            rollout_config["video_output_path"] = videos_dir / (
+                f"{_safe_filename(instance.primitive_id)}_{_safe_filename(instance.segment_id)}.mp4"
+            )
+            rollout_config["video_temp_root"] = frames_tmp_dir
         rollout = rollout_primitive_instance(
             instance=instance,
             library_entry=library_entry,
             runtime=runtime,
-            rollout_config=resolved["rollout"],
+            rollout_config=rollout_config,
+            output_root=output_root,
+            logger=logger,
         )
+        if should_render:
+            rendered_instances += 1
         debug_artifact_path = None
         if bool(resolved.get("save_debug", False)):
             debug_artifact_path = save_rollout_debug_artifact(
@@ -774,7 +804,10 @@ def rollout_primitive_instance(
     library_entry: PrimitiveLibraryEntry | None,
     runtime: RoboPianistPrimitiveRuntime,
     rollout_config: dict[str, Any],
+    output_root: Path | None = None,
+    logger: logging.Logger | None = None,
 ) -> PrimitiveOnlineRolloutResult:
+    logger = logger or LOGGER
     source = resolve_instance_rollout_source(
         instance=instance,
         rollout_config=rollout_config,
@@ -849,6 +882,22 @@ def rollout_primitive_instance(
                 environment_name=str(source["environment_name"]),
             )
 
+        should_render = bool(rollout_config.get("render_video", False))
+        video_frames: list[np.ndarray] = []
+        render_error: str | None = None
+        if should_render:
+            try:
+                video_frames.append(
+                    _render_frame(
+                        env,
+                        height=int(rollout_config.get("video_height", 480)),
+                        width=int(rollout_config.get("video_width", 640)),
+                    )
+                )
+            except Exception as exc:
+                render_error = str(exc)
+                logger.warning("Initial primitive rollout render failed for `%s`: %s", instance.segment_id, exc)
+
         piano_frames = [_capture_piano_state(env)]
         hand_frames = [_capture_hand_joint_state(env)]
         fingertip_frames = [_capture_fingertips(env)]
@@ -862,6 +911,18 @@ def rollout_primitive_instance(
             piano_frames.append(_capture_piano_state(env))
             hand_frames.append(_capture_hand_joint_state(env))
             fingertip_frames.append(_capture_fingertips(env))
+            if should_render and render_error is None:
+                try:
+                    video_frames.append(
+                        _render_frame(
+                            env,
+                            height=int(rollout_config.get("video_height", 480)),
+                            width=int(rollout_config.get("video_width", 640)),
+                        )
+                    )
+                except Exception as exc:
+                    render_error = str(exc)
+                    logger.warning("Primitive rollout render failed for `%s`: %s", instance.segment_id, exc)
             if timestep.last():
                 status = "terminated_early"
                 break
@@ -888,6 +949,30 @@ def rollout_primitive_instance(
             key_threshold=float(rollout_config.get("piano_state_threshold", 0.5)),
             sustain_threshold=float(rollout_config.get("piano_sustain_threshold", 0.5)),
         )
+        video_path: Path | None = None
+        video_format: str | None = None
+        video_warning: str | None = None
+        if should_render and render_error is None:
+            try:
+                audio_events = _find_piano_midi_events(env)
+                video_path, video_format, video_warning = _write_rollout_video(
+                    frames=video_frames,
+                    output_path=Path(rollout_config["video_output_path"]),
+                    fps=int(rollout_config.get("video_fps", 20)),
+                    temp_root=Path(rollout_config["video_temp_root"]),
+                    audio_source=str(rollout_config.get("video_audio_source", "robot_midi" if audio_events else "none")),
+                    robot_midi_events=audio_events,
+                    logger=logger,
+                )
+            except Exception as exc:
+                render_error = str(exc)
+                logger.warning("Primitive rollout video export failed for `%s`: %s", instance.segment_id, exc)
+        if video_path is None:
+            video_path_text = None
+        elif output_root is not None:
+            video_path_text = _relative_output_path(video_path, output_root)
+        else:
+            video_path_text = str(video_path)
         return PrimitiveOnlineRolloutResult(
             segment_id=instance.segment_id,
             primitive_id=instance.primitive_id,
@@ -910,6 +995,12 @@ def rollout_primitive_instance(
             observed_key_events=list(observed_bundle.events),
             observed_key_roll=observed_bundle.key_roll,
             notes=list(notes),
+            render_attempted=bool(should_render),
+            rendered_frames=int(len(video_frames)) if should_render else 0,
+            render_error=render_error,
+            video_path=video_path_text,
+            video_format=video_format,
+            video_warning=video_warning,
         )
     except Exception as exc:  # pragma: no cover
         return PrimitiveOnlineRolloutResult(
@@ -931,6 +1022,8 @@ def rollout_primitive_instance(
             rollout_source_label=_optional_string(source.get("source_label")),
             rollout_environment_name=str(source["environment_name"]),
             rollout_midi_path=str(source["midi_file"]) if source.get("midi_file") is not None else None,
+            render_attempted=bool(rollout_config.get("render_video", False)),
+            render_error=str(exc) if bool(rollout_config.get("render_video", False)) else None,
         )
 
 
@@ -1090,6 +1183,17 @@ def build_instance_result_row(
         "predicted_events_json": json.dumps([list(event.as_tuple()) for event in rollout.observed_key_events]),
         "notes_json": json.dumps(list(rollout.notes)),
     }
+    if rollout.render_attempted or rollout.video_path is not None or rollout.render_error is not None:
+        row.update(
+            {
+                "render_attempted": bool(rollout.render_attempted),
+                "rendered_frames": int(rollout.rendered_frames),
+                "render_error": rollout.render_error,
+                "video_path": rollout.video_path,
+                "video_format": rollout.video_format,
+                "video_warning": rollout.video_warning,
+            }
+        )
     return row
 
 
@@ -1646,7 +1750,7 @@ def _clear_previous_outputs(output_root: Path) -> None:
         path = output_root / name
         if path.exists():
             path.unlink()
-    for directory_name in ("plots", "debug"):
+    for directory_name in ("plots", "debug", "videos", "frames_tmp"):
         path = output_root / directory_name
         if path.exists():
             shutil.rmtree(path)
@@ -1682,6 +1786,12 @@ def _resolve_eval_config(config: dict[str, Any]) -> dict[str, Any]:
     rollout.setdefault("example_midi_labels", [])
     rollout.setdefault("piano_state_threshold", events["piano_state_threshold"])
     rollout.setdefault("piano_sustain_threshold", events["piano_sustain_threshold"])
+    rollout.setdefault("render_video", False)
+    rollout.setdefault("video_fps", 20)
+    rollout.setdefault("video_height", 480)
+    rollout.setdefault("video_width", 640)
+    rollout.setdefault("max_render_instances", None)
+    rollout.setdefault("video_audio_source", "robot_midi")
     aggregation.setdefault("top_k_examples", 3)
     aggregation.setdefault("max_plot_primitives", 24)
     return resolved
