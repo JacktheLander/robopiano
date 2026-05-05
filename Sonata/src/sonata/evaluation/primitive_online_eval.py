@@ -115,6 +115,11 @@ class PrimitiveInstance:
     joint_velocities_gt: np.ndarray | None = None
     source_midi_path: str | None = None
     target_source: str = "goals"
+    primitive_frame_mode: str = "absolute"
+    relative_wrist_anchor: str = "[]"
+    finger_set: str = "unknown"
+    target_key_ids: str = "[]"
+    interval_pattern: str = "[]"
 
     @property
     def conditioning_feature_norm(self) -> float:
@@ -173,6 +178,15 @@ class PrimitiveOnlineRolloutResult:
     video_format: str | None = None
     video_warning: str | None = None
     notes: list[str] = field(default_factory=list)
+    condition_features_used: tuple[str, ...] = ()
+    condition_feature_norm: float = float("nan")
+    conditioned_prior_used: bool = False
+    unconditional_fallback_used: bool = True
+    primitive_frame_mode: str = "absolute"
+    relative_wrist_anchor: str = "[]"
+    finger_set: str = "unknown"
+    target_key_ids: str = "[]"
+    interval_pattern: str = "[]"
 
 
 @dataclass(slots=True)
@@ -185,6 +199,14 @@ class PrimitiveLibraryEntry:
     prototype_weights: np.ndarray | None
     default_prototype_index: int
     metadata: dict[str, Any]
+    condition_feature_names: tuple[str, ...] = ()
+    condition_feature_indices: tuple[int, ...] = ()
+    condition_mean: np.ndarray | None = None
+    condition_std: np.ndarray | None = None
+    condition_regression_coef: np.ndarray | None = None
+    condition_regression_intercept: np.ndarray | None = None
+    supports_conditioned_rollout: bool = False
+    fallback_unconditional_available: bool = True
 
 
 @dataclass(slots=True)
@@ -642,6 +664,11 @@ def build_primitive_instances(
                             arrays["piano_states"] if arrays["piano_states"] is not None else arrays["goals"]
                         ),
                         target_source=str(intended_bundle.source),
+                        primitive_frame_mode=str(getattr(row, "primitive_frame_mode", "absolute") or "absolute"),
+                        relative_wrist_anchor=str(getattr(row, "relative_wrist_anchor", "[]") or "[]"),
+                        finger_set=str(getattr(row, "finger_set", getattr(row, "finger_set_id", "unknown")) or "unknown"),
+                        target_key_ids=str(getattr(row, "target_key_ids", getattr(row, "target_key_ids_json", "[]")) or "[]"),
+                        interval_pattern=str(getattr(row, "interval_pattern", "[]") or "[]"),
                     )
                 )
             except Exception as exc:
@@ -874,7 +901,8 @@ def rollout_primitive_instance(
             causal_failure_reason="non_action_prior",
         )
 
-    selected_prior = select_primitive_prior_mean(instance=instance, library_entry=library_entry)
+    prior_selection = select_primitive_prior(instance=instance, library_entry=library_entry)
+    selected_prior = prior_selection["prior_mean"]
     expected_action_dim = int(selected_prior.shape[-1])
     predicted_actions = _resample_sequence(
         np.asarray(selected_prior, dtype=np.float32),
@@ -1061,6 +1089,15 @@ def rollout_primitive_instance(
             video_format=video_format,
             video_warning=video_warning,
             notes=list(notes),
+            condition_features_used=tuple(prior_selection["condition_features_used"]),
+            condition_feature_norm=float(instance.conditioning_feature_norm),
+            conditioned_prior_used=bool(prior_selection["conditioned_prior_used"]),
+            unconditional_fallback_used=bool(prior_selection["unconditional_fallback_used"]),
+            primitive_frame_mode=str(instance.primitive_frame_mode),
+            relative_wrist_anchor=str(instance.relative_wrist_anchor),
+            finger_set=str(instance.finger_set),
+            target_key_ids=str(instance.target_key_ids),
+            interval_pattern=str(instance.interval_pattern),
         )
     except Exception as exc:  # pragma: no cover
         return PrimitiveOnlineRolloutResult(
@@ -1085,6 +1122,15 @@ def rollout_primitive_instance(
             causal_validated=False,
             causal_failure_reason=str(exc),
             target_source=instance.target_source,
+            condition_features_used=tuple(prior_selection.get("condition_features_used", ())) if "prior_selection" in locals() else (),
+            condition_feature_norm=float(instance.conditioning_feature_norm),
+            conditioned_prior_used=bool(prior_selection.get("conditioned_prior_used", False)) if "prior_selection" in locals() else False,
+            unconditional_fallback_used=bool(prior_selection.get("unconditional_fallback_used", True)) if "prior_selection" in locals() else True,
+            primitive_frame_mode=str(instance.primitive_frame_mode),
+            relative_wrist_anchor=str(instance.relative_wrist_anchor),
+            finger_set=str(instance.finger_set),
+            target_key_ids=str(instance.target_key_ids),
+            interval_pattern=str(instance.interval_pattern),
         )
 
 
@@ -1119,6 +1165,12 @@ def _failed_rollout_result(
         causal_validated=False,
         causal_failure_reason=causal_failure_reason,
         target_source=instance.target_source,
+        condition_feature_norm=float(instance.conditioning_feature_norm),
+        primitive_frame_mode=str(instance.primitive_frame_mode),
+        relative_wrist_anchor=str(instance.relative_wrist_anchor),
+        finger_set=str(instance.finger_set),
+        target_key_ids=str(instance.target_key_ids),
+        interval_pattern=str(instance.interval_pattern),
     )
 
 
@@ -1519,6 +1571,15 @@ def build_instance_result_row(
         "primitive_prior_path": instance.primitive_prior_path,
         "conditioning_feature_norm": float(instance.conditioning_feature_norm),
         "conditioning_feature_dim": int(instance.conditioning_features.shape[0]) if instance.conditioning_features is not None else 0,
+        "condition_features_used": json.dumps(list(rollout.condition_features_used)),
+        "condition_feature_norm": float(rollout.condition_feature_norm),
+        "conditioned_prior_used": bool(rollout.conditioned_prior_used),
+        "unconditional_fallback_used": bool(rollout.unconditional_fallback_used),
+        "primitive_frame_mode": rollout.primitive_frame_mode,
+        "relative_wrist_anchor": rollout.relative_wrist_anchor,
+        "finger_set": rollout.finger_set,
+        "target_key_ids": rollout.target_key_ids,
+        "interval_pattern": rollout.interval_pattern,
         "intended_key_count": int(len(instance.intended_keys)),
         "realized_key_count_gt": int(len(instance.realized_keys_gt)),
         "predicted_key_count": int(observed_key_count),
@@ -1732,6 +1793,14 @@ def load_primitive_library_lookup(
         prototype_means = None
         prototype_latent_centroids = None
         prototype_weights = None
+        condition_feature_names: tuple[str, ...] = ()
+        condition_feature_indices: tuple[int, ...] = ()
+        condition_mean = None
+        condition_std = None
+        condition_regression_coef = None
+        condition_regression_intercept = None
+        supports_conditioned_rollout = bool(getattr(row, "supports_conditioned_rollout", False) or False)
+        fallback_unconditional_available = bool(getattr(row, "fallback_unconditional_available", True))
         default_prototype_index = int(getattr(row, "default_prototype_index", 0) or 0)
         if prior_path is not None and prior_path.exists():
             payload = np.load(prior_path, allow_pickle=True)
@@ -1742,6 +1811,22 @@ def load_primitive_library_lookup(
                 prototype_latent_centroids = np.asarray(payload["prototype_latent_centroids"], dtype=np.float32)
             if "prototype_weights" in payload:
                 prototype_weights = np.asarray(payload["prototype_weights"], dtype=np.float32)
+            if "condition_feature_names" in payload:
+                condition_feature_names = tuple(str(item) for item in np.asarray(payload["condition_feature_names"], dtype=object).reshape(-1).tolist())
+            if "condition_feature_indices" in payload:
+                condition_feature_indices = tuple(int(item) for item in np.asarray(payload["condition_feature_indices"], dtype=np.int64).reshape(-1).tolist())
+            if "condition_mean" in payload:
+                condition_mean = np.asarray(payload["condition_mean"], dtype=np.float32)
+            if "condition_std" in payload:
+                condition_std = np.asarray(payload["condition_std"], dtype=np.float32)
+            if "condition_regression_coef" in payload:
+                condition_regression_coef = np.asarray(payload["condition_regression_coef"], dtype=np.float32)
+            if "condition_regression_intercept" in payload:
+                condition_regression_intercept = np.asarray(payload["condition_regression_intercept"], dtype=np.float32)
+            if "supports_conditioned_rollout" in payload:
+                supports_conditioned_rollout = bool(np.asarray(payload["supports_conditioned_rollout"]).reshape(-1)[0])
+            if "fallback_unconditional_available" in payload:
+                fallback_unconditional_available = bool(np.asarray(payload["fallback_unconditional_available"]).reshape(-1)[0])
         lookup[primitive_id] = PrimitiveLibraryEntry(
             primitive_id=primitive_id,
             prior_path=prior_path,
@@ -1751,11 +1836,66 @@ def load_primitive_library_lookup(
             prototype_weights=prototype_weights,
             default_prototype_index=default_prototype_index,
             metadata=row._asdict(),
+            condition_feature_names=condition_feature_names,
+            condition_feature_indices=condition_feature_indices,
+            condition_mean=condition_mean,
+            condition_std=condition_std,
+            condition_regression_coef=condition_regression_coef,
+            condition_regression_intercept=condition_regression_intercept,
+            supports_conditioned_rollout=supports_conditioned_rollout,
+            fallback_unconditional_available=fallback_unconditional_available,
         )
     return lookup
 
 
+def select_primitive_prior(*, instance: PrimitiveInstance, library_entry: PrimitiveLibraryEntry) -> dict[str, Any]:
+    if (
+        library_entry.supports_conditioned_rollout
+        and instance.conditioning_features is not None
+        and library_entry.condition_mean is not None
+        and library_entry.condition_std is not None
+        and library_entry.condition_regression_coef is not None
+        and library_entry.condition_regression_intercept is not None
+    ):
+        if library_entry.condition_feature_indices:
+            valid_indices = [index for index in library_entry.condition_feature_indices if 0 <= int(index) < int(instance.conditioning_features.shape[0])]
+            condition_source = np.asarray(instance.conditioning_features[np.asarray(valid_indices, dtype=np.int64)], dtype=np.float32)
+        else:
+            condition_source = np.asarray(instance.conditioning_features, dtype=np.float32)
+        feature_dim = min(int(condition_source.shape[0]), int(library_entry.condition_mean.shape[0]), int(library_entry.condition_std.shape[0]))
+        if feature_dim > 0:
+            condition = np.asarray(condition_source[:feature_dim], dtype=np.float32)
+            mean = np.asarray(library_entry.condition_mean[:feature_dim], dtype=np.float32)
+            std = np.clip(np.asarray(library_entry.condition_std[:feature_dim], dtype=np.float32), 1e-6, None)
+            normalized = (condition - mean) / std
+            coef = np.asarray(library_entry.condition_regression_coef, dtype=np.float32)
+            intercept = np.asarray(library_entry.condition_regression_intercept, dtype=np.float32)
+            if coef.ndim == 2 and coef.shape[1] >= feature_dim and intercept.size == coef.shape[0]:
+                flat = intercept + coef[:, :feature_dim] @ normalized
+                if library_entry.prior_mean is not None:
+                    prior_shape = np.asarray(library_entry.prior_mean).shape
+                    if flat.size == int(np.prod(prior_shape)):
+                        return {
+                            "prior_mean": flat.reshape(prior_shape).astype(np.float32),
+                            "condition_features_used": library_entry.condition_feature_names[:feature_dim],
+                            "conditioned_prior_used": True,
+                            "unconditional_fallback_used": False,
+                        }
+    if not library_entry.fallback_unconditional_available:
+        raise ValueError(f"Primitive `{library_entry.primitive_id}` cannot condition rollout and has no unconditional fallback.")
+    return {
+        "prior_mean": _select_unconditional_or_prototype_prior(instance=instance, library_entry=library_entry),
+        "condition_features_used": (),
+        "conditioned_prior_used": False,
+        "unconditional_fallback_used": True,
+    }
+
+
 def select_primitive_prior_mean(*, instance: PrimitiveInstance, library_entry: PrimitiveLibraryEntry) -> np.ndarray:
+    return np.asarray(select_primitive_prior(instance=instance, library_entry=library_entry)["prior_mean"], dtype=np.float32)
+
+
+def _select_unconditional_or_prototype_prior(*, instance: PrimitiveInstance, library_entry: PrimitiveLibraryEntry) -> np.ndarray:
     if library_entry.prototype_means is None or library_entry.prototype_means.size == 0:
         if library_entry.prior_mean is None:
             raise ValueError(f"Primitive `{library_entry.primitive_id}` is missing a prior mean.")

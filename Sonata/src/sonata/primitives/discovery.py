@@ -11,7 +11,7 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import silhouette_score
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
@@ -19,7 +19,7 @@ from sklearn.preprocessing import StandardScaler
 from sonata.data.indexer import scan_dataset
 from sonata.data.loading import load_manifest
 from sonata.primitives.evaluation import Stage1EarlyStop, Stage1OnlineEvaluator
-from sonata.primitives.features import extract_segment_features, resolve_gmr_resample_steps
+from sonata.primitives.features import build_condition_feature_vector, extract_segment_features, resolve_gmr_resample_steps, select_feature_indices
 from sonata.primitives.gmr import fit_phase_gmr_with_selection
 from sonata.primitives.gpu_utils import GpuBackend, fit_pca_embedding, resolve_gpu_backend, screen_kmeans_candidates
 from sonata.primitives.segmenters import load_segment_arrays_from_bundle, run_segmentation
@@ -44,6 +44,8 @@ from sonata.primitives.visualization import (
 )
 from sonata.utils.io import read_json, read_table, save_npz, write_json, write_table
 from sonata.utils.wandb import WandbRun
+
+MAX_CONTEXT_FLAT_FINGERTIP_WIDTH = 24
 
 
 def _read_stage_status(manifest_path: Path) -> str:
@@ -153,6 +155,8 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
             config=config,
             evaluator=evaluator,
             logger=logger,
+            feature_matrix=feature_matrix,
+            feature_names=feature_names,
         )
         write_table(library_df, primitive_root / "library" / "primitive_library")
         joblib.dump(gmr_bundle, primitive_root / "library" / "primitive_gmr_bundle.joblib")
@@ -169,6 +173,7 @@ def run_primitive_pipeline(config: dict[str, Any], logger: logging.Logger) -> di
         token_base = primitive_root / "tokens" / "primitive_tokens"
         write_table(token_df, token_base)
         write_json(build_vocabulary_payload(token_df), primitive_root / "tokens" / "primitive_vocabulary.json")
+        write_primitive_diagnostics(assignments_df=assignments_df, library_df=library_df, output_dir=primitive_root)
 
         metrics = compute_stage1_metrics(
             segment_df=segment_df,
@@ -267,6 +272,13 @@ def fit_primitive_gmm(
     if segment_df.empty or feature_matrix.size == 0:
         return segment_df.copy(), pd.DataFrame(), {"feature_names": feature_names, "buckets": {}, "gpu_backend": gpu_backend.summary()}
 
+    original_feature_names = list(feature_names)
+    feature_matrix, feature_names, clustering_feature_indices = select_clustering_features(
+        feature_matrix=feature_matrix,
+        feature_names=feature_names,
+        config=config,
+    )
+
     train_mask = segment_df["split"].astype(str).to_numpy() == "train"
     if not np.any(train_mask):
         train_mask[:] = True
@@ -289,7 +301,15 @@ def fit_primitive_gmm(
     assignment_frame["gpu_backend"] = gpu_backend.name
 
     sweep_rows: list[dict[str, Any]] = []
-    bundle: dict[str, Any] = {"feature_names": feature_names, "buckets": {}, "gpu_backend": gpu_backend.summary(), "family_aware": bool(family_column)}
+    bundle: dict[str, Any] = {
+        "feature_names": feature_names,
+        "source_feature_names": original_feature_names,
+        "clustering_feature_indices": clustering_feature_indices,
+        "clustering_mode": str(config.get("clustering", {}).get("mode", config.get("clustering_mode", "absolute"))),
+        "buckets": {},
+        "gpu_backend": gpu_backend.summary(),
+        "family_aware": bool(family_column),
+    }
     global_label_offset = 0
 
     for bucket_name, indices in bucket_items:
@@ -528,6 +548,8 @@ def fit_gmr_library(
     config: dict[str, Any],
     evaluator: Stage1OnlineEvaluator | None = None,
     logger: logging.Logger | None = None,
+    feature_matrix: np.ndarray | None = None,
+    feature_names: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     refined_assignments = assignments_df.copy()
     library_df, gmr_bundle = _fit_library_models(
@@ -536,6 +558,8 @@ def fit_gmr_library(
         output_dir=output_dir,
         config=config,
         evaluator=evaluator,
+        feature_matrix=feature_matrix,
+        feature_names=feature_names,
     )
 
     if bool(config.get("primitive_split_merge_refinement", False)) and not library_df.empty:
@@ -555,6 +579,8 @@ def fit_gmr_library(
                 output_dir=output_dir,
                 config=config,
                 evaluator=evaluator,
+                feature_matrix=feature_matrix,
+                feature_names=feature_names,
             )
 
         merged_assignments = _merge_duplicate_primitives(
@@ -573,6 +599,8 @@ def fit_gmr_library(
                 output_dir=output_dir,
                 config=config,
                 evaluator=evaluator,
+                feature_matrix=feature_matrix,
+                feature_names=feature_names,
             )
 
     if evaluator is not None:
@@ -589,6 +617,8 @@ def _fit_library_models(
     output_dir: Path,
     config: dict[str, Any],
     evaluator: Stage1OnlineEvaluator | None = None,
+    feature_matrix: np.ndarray | None = None,
+    feature_names: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     library_dir = output_dir / "library"
     library_dir.mkdir(parents=True, exist_ok=True)
@@ -605,6 +635,9 @@ def _fit_library_models(
         source_group = train_group if len(train_group) >= int(config["min_segments_per_primitive"]) else group
         trajectories: list[np.ndarray] = []
         usable_indices: list[int] = []
+        condition_vectors: list[np.ndarray] = []
+        condition_feature_names: list[str] = []
+        condition_feature_indices: list[int] = []
         for row_index, row in source_group.iterrows():
             trajectory = load_gmr_trajectory(
                 row=row,
@@ -617,6 +650,16 @@ def _fit_library_models(
             if trajectory is not None:
                 trajectories.append(np.asarray(trajectory, dtype=np.float32))
                 usable_indices.append(int(row_index))
+                if feature_matrix is not None and feature_names is not None and int(row_index) < int(feature_matrix.shape[0]):
+                    condition_vector, names, indices = build_condition_feature_vector(
+                        feature_vector=np.asarray(feature_matrix[int(row_index)], dtype=np.float32),
+                        feature_names=list(feature_names),
+                        config=config,
+                    )
+                    if condition_vector.size:
+                        condition_vectors.append(condition_vector.astype(np.float32))
+                        condition_feature_names = condition_feature_names or names
+                        condition_feature_indices = condition_feature_indices or indices
         if not trajectories:
             continue
 
@@ -654,6 +697,14 @@ def _fit_library_models(
             prior_path,
             prior_mean=predicted_mean.astype(np.float32),
             trajectory_examples=stacked[: min(8, len(stacked))],
+            **_conditional_prior_npz_payload(
+                condition_vectors=condition_vectors,
+                condition_feature_names=condition_feature_names,
+                condition_feature_indices=condition_feature_indices,
+                trajectories=stacked,
+                predicted_mean=predicted_mean,
+                config=config,
+            ),
             gmr_target_name=np.asarray(["actions" if bool(config.get("gmr_target_actions", True)) else "hand_joints"], dtype=object),
             causal_segment=np.asarray([bool(config.get("segmentation_strategy") == "prepress_causal" or config.get("segmenter_name") == "prepress_causal")]),
             segment_alignment=np.asarray(["prepress_to_onset" if str(config.get("segmentation_strategy", "")) == "prepress_causal" or str(config.get("segmenter_name", "")) == "prepress_causal" else ""], dtype=object),
@@ -662,6 +713,14 @@ def _fit_library_models(
             gmr_payload["models"][primitive_id] = gmr.to_payload()
         gmr_payload["diagnostics"][primitive_id] = diagnostics
         gmr_payload["priors"][primitive_id] = predicted_mean.astype(np.float32)
+        conditional_summary = _conditional_prior_summary(
+            condition_vectors=condition_vectors,
+            condition_feature_names=condition_feature_names,
+            condition_feature_indices=condition_feature_indices,
+            trajectories=stacked,
+            predicted_mean=predicted_mean,
+            config=config,
+        )
 
         confidence_values = group["assignment_confidence"].astype(float).to_numpy(dtype=np.float32) if "assignment_confidence" in group.columns else np.ones((len(group),), dtype=np.float32)
         low_quality = bool(
@@ -690,6 +749,23 @@ def _fit_library_models(
             "fit_failed": bool(fit_failed),
             "prior_path": str(prior_path.resolve()),
             "gmr_target_name": "actions" if bool(config.get("gmr_target_actions", True)) else "hand_joints",
+            "target_name": "actions" if bool(config.get("gmr_target_actions", True)) else "hand_joints",
+            "target_action_dim": int(stacked.shape[-1]),
+            "primitive_family": dominant_family,
+            "hand": _dominant_label(group.get("hand_side", pd.Series(dtype=object))) if "hand_side" in group.columns else "unknown",
+            "finger_set": _dominant_label(group.get("finger_set", group.get("finger_set_id", pd.Series(dtype=object)))) if ("finger_set" in group.columns or "finger_set_id" in group.columns) else "unknown",
+            "finger_set_id": _dominant_label(group.get("finger_set_id", pd.Series(dtype=object))) if "finger_set_id" in group.columns else "unknown",
+            "chord_size": int(round(float(group["chord_size"].median()))) if "chord_size" in group.columns and not group.empty else 0,
+            "interval_pattern_bucket": _dominant_label(group.get("interval_pattern_bucket", pd.Series(dtype=object))) if "interval_pattern_bucket" in group.columns else "none",
+            "condition_feature_names": json.dumps(condition_feature_names),
+            "condition_feature_count": int(len(condition_feature_names)),
+            "frame_mode": _primitive_frame_mode(config),
+            "primitive_frame_mode": _primitive_frame_mode(config),
+            "supports_conditioned_rollout": bool(conditional_summary["supports_conditioned_rollout"]),
+            "fallback_unconditional_available": True,
+            "unconditional_fallback_available": True,
+            "conditioned_reconstruction_mse": float(conditional_summary["conditioned_reconstruction_mse"]),
+            "conditioned_vs_unconditioned_delta": float(conditional_summary["conditioned_vs_unconditioned_delta"]),
             "causal_segment": bool(config.get("segmentation_strategy") == "prepress_causal" or config.get("segmenter_name") == "prepress_causal"),
             "segment_alignment": "prepress_to_onset" if str(config.get("segmentation_strategy", "")) == "prepress_causal" or str(config.get("segmenter_name", "")) == "prepress_causal" else "",
         }
@@ -807,6 +883,145 @@ def _merge_duplicate_primitives(
     return _renumber_primitives(refined)
 
 
+def select_clustering_features(
+    *,
+    feature_matrix: np.ndarray,
+    feature_names: list[str],
+    config: dict[str, Any],
+) -> tuple[np.ndarray, list[str], list[int]]:
+    clustering_config = config.get("clustering", {}) if isinstance(config.get("clustering"), dict) else {}
+    mode = str(clustering_config.get("mode", config.get("clustering_mode", "")))
+    if mode != "reusable_motor_motif":
+        return np.asarray(feature_matrix, dtype=np.float32), list(feature_names), list(range(len(feature_names)))
+
+    selectors: list[str] = []
+    if bool(clustering_config.get("include_relative_geometry", True)):
+        selectors.extend(["relative_geometry"])
+    if bool(clustering_config.get("include_finger_set", True)):
+        selectors.extend(["finger_set"])
+    if bool(clustering_config.get("include_chord_interval_pattern", True)):
+        selectors.extend(["chord_interval_pattern"])
+    if bool(clustering_config.get("include_motion_family", True)):
+        selectors.extend(["motion_family"])
+    if bool(clustering_config.get("include_wrist_relative_features", True)):
+        selectors.extend(["wrist_relative_features"])
+    selectors.extend(["context_duration_dynamics", "joint_rel_", "traj_joint_rel", "traj_joint_velocity_rel", "action_", "traj_action_delta"])
+    indices = select_feature_indices(feature_names=feature_names, selectors=selectors)
+    if bool(clustering_config.get("exclude_absolute_key_position_from_clustering", True)):
+        excluded_prefixes = ("target_keyset_", "context_wrist_start_", "score_scalar_0005", "context_chord_geometry_0001")
+        indices = [index for index in indices if not any(feature_names[index].startswith(prefix) for prefix in excluded_prefixes)]
+    if not indices:
+        return np.asarray(feature_matrix, dtype=np.float32), list(feature_names), list(range(len(feature_names)))
+    selected = np.asarray(feature_matrix[:, np.asarray(indices, dtype=np.int64)], dtype=np.float32)
+    return selected, [feature_names[index] for index in indices], indices
+
+
+def _conditional_prior_npz_payload(
+    *,
+    condition_vectors: list[np.ndarray],
+    condition_feature_names: list[str],
+    condition_feature_indices: list[int],
+    trajectories: np.ndarray,
+    predicted_mean: np.ndarray,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    model = _fit_conditioned_regressor(
+        condition_vectors=condition_vectors,
+        trajectories=trajectories,
+        predicted_mean=predicted_mean,
+        config=config,
+    )
+    if model is None:
+        return {
+            "condition_feature_names": np.asarray(condition_feature_names, dtype=object),
+            "condition_feature_indices": np.asarray(condition_feature_indices, dtype=np.int64),
+            "supports_conditioned_rollout": np.asarray([False]),
+            "fallback_unconditional_available": np.asarray([True]),
+        }
+    return {
+        "condition_feature_names": np.asarray(condition_feature_names, dtype=object),
+        "condition_feature_indices": np.asarray(condition_feature_indices, dtype=np.int64),
+        "condition_mean": np.asarray(model["condition_mean"], dtype=np.float32),
+        "condition_std": np.asarray(model["condition_std"], dtype=np.float32),
+        "condition_regression_coef": np.asarray(model["coef"], dtype=np.float32),
+        "condition_regression_intercept": np.asarray(model["intercept"], dtype=np.float32),
+        "conditioned_train_mse": np.asarray([float(model["train_mse"])], dtype=np.float32),
+        "unconditional_train_mse": np.asarray([float(model["unconditional_mse"])], dtype=np.float32),
+        "supports_conditioned_rollout": np.asarray([True]),
+        "fallback_unconditional_available": np.asarray([True]),
+    }
+
+
+def _conditional_prior_summary(
+    *,
+    condition_vectors: list[np.ndarray],
+    condition_feature_names: list[str],
+    condition_feature_indices: list[int],
+    trajectories: np.ndarray,
+    predicted_mean: np.ndarray,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    model = _fit_conditioned_regressor(
+        condition_vectors=condition_vectors,
+        trajectories=trajectories,
+        predicted_mean=predicted_mean,
+        config=config,
+    )
+    if model is None:
+        return {
+            "supports_conditioned_rollout": False,
+            "condition_feature_names": condition_feature_names,
+            "condition_feature_indices": condition_feature_indices,
+            "conditioned_reconstruction_mse": float("nan"),
+            "conditioned_vs_unconditioned_delta": float("nan"),
+        }
+    return {
+        "supports_conditioned_rollout": True,
+        "condition_feature_names": condition_feature_names,
+        "condition_feature_indices": condition_feature_indices,
+        "conditioned_reconstruction_mse": float(model["train_mse"]),
+        "conditioned_vs_unconditioned_delta": float(model["unconditional_mse"] - model["train_mse"]),
+    }
+
+
+def _fit_conditioned_regressor(
+    *,
+    condition_vectors: list[np.ndarray],
+    trajectories: np.ndarray,
+    predicted_mean: np.ndarray,
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not bool(config.get("condition_gmr_on_context", False)):
+        return None
+    if len(condition_vectors) != int(trajectories.shape[0]) or len(condition_vectors) < 2:
+        return None
+    condition_matrix = np.stack(condition_vectors, axis=0).astype(np.float32)
+    if condition_matrix.ndim != 2 or condition_matrix.shape[1] == 0:
+        return None
+    target = trajectories.reshape(trajectories.shape[0], -1).astype(np.float32)
+    condition_mean = condition_matrix.mean(axis=0)
+    condition_std = np.clip(condition_matrix.std(axis=0), 1e-6, None)
+    normalized = (condition_matrix - condition_mean[None, :]) / condition_std[None, :]
+    alpha = float(config.get("condition_regression_alpha", 1.0))
+    model = Ridge(alpha=alpha, fit_intercept=True)
+    model.fit(normalized, target)
+    predicted = model.predict(normalized).astype(np.float32)
+    unconditional = predicted_mean.reshape(1, -1).astype(np.float32)
+    return {
+        "condition_mean": condition_mean,
+        "condition_std": condition_std,
+        "coef": np.asarray(model.coef_, dtype=np.float32),
+        "intercept": np.asarray(model.intercept_, dtype=np.float32),
+        "train_mse": float(np.mean((target - predicted) ** 2)),
+        "unconditional_mse": float(np.mean((target - unconditional) ** 2)),
+    }
+
+
+def _primitive_frame_mode(config: dict[str, Any]) -> str:
+    frame_config = config.get("primitive_frame", {}) if isinstance(config.get("primitive_frame"), dict) else {}
+    return str(frame_config.get("mode", config.get("primitive_frame_mode", "absolute")))
+
+
 def load_gmr_trajectory(
     row,
     slim_paths,
@@ -901,6 +1116,84 @@ def compute_stage1_metrics(
     return metrics
 
 
+def write_primitive_diagnostics(
+    *,
+    assignments_df: pd.DataFrame,
+    library_df: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    diagnostics_dir = output_dir / "diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    if assignments_df.empty or "primitive_id" not in assignments_df.columns:
+        pd.DataFrame().to_csv(diagnostics_dir / "primitive_key_transposition_coverage.csv", index=False)
+        pd.DataFrame().to_csv(diagnostics_dir / "primitive_condition_coverage.csv", index=False)
+        pd.DataFrame().to_csv(diagnostics_dir / "primitive_reusability_score.csv", index=False)
+        return
+
+    key_rows: list[dict[str, Any]] = []
+    condition_rows: list[dict[str, Any]] = []
+    score_rows: list[dict[str, Any]] = []
+    for primitive_id, group in assignments_df.groupby("primitive_id", sort=True):
+        key_centers = pd.to_numeric(group.get("chord_center_key_id", group.get("key_center", pd.Series(dtype=float))), errors="coerce")
+        if "key_center" in group.columns and key_centers.max(skipna=True) <= 1.0:
+            key_centers = key_centers * 87.0
+        key_centers = key_centers.dropna()
+        hand_distribution = _distribution_json(group.get("hand_side"))
+        finger_distribution = _distribution_json(group.get("finger_set", group.get("finger_set_id")))
+        chord_distribution = _distribution_json(group.get("chord_size"))
+        interval_distribution = _distribution_json(group.get("interval_pattern_bucket"))
+        key_rows.append(
+            {
+                "primitive_id": str(primitive_id),
+                "min_key_center": float(key_centers.min()) if not key_centers.empty else float("nan"),
+                "max_key_center": float(key_centers.max()) if not key_centers.empty else float("nan"),
+                "key_center_std": float(key_centers.std(ddof=0)) if not key_centers.empty else float("nan"),
+                "number_of_unique_key_centers": int(key_centers.round(3).nunique()) if not key_centers.empty else 0,
+                "hand_distribution": hand_distribution,
+                "finger_set_distribution": finger_distribution,
+                "chord_size_distribution": chord_distribution,
+                "interval_pattern_distribution": interval_distribution,
+            }
+        )
+        wrist_values = _json_vector_stack(group.get("relative_wrist_anchor"), width=3)
+        fingertip_values = _json_vector_stack(group.get("fingertip_to_target_key_offsets"), width=MAX_CONTEXT_FLAT_FINGERTIP_WIDTH)
+        duration_distribution = _distribution_json(group.get("duration_bucket"))
+        dynamics_distribution = _distribution_json(group.get("dynamics_bucket"))
+        condition_rows.append(
+            {
+                "primitive_id": str(primitive_id),
+                "relative_wrist_anchor_mean": json.dumps(np.nanmean(wrist_values, axis=0).round(6).tolist()) if wrist_values.size else "[]",
+                "relative_wrist_anchor_std": json.dumps(np.nanstd(wrist_values, axis=0).round(6).tolist()) if wrist_values.size else "[]",
+                "fingertip_to_key_offset_mean": json.dumps(np.nanmean(fingertip_values, axis=0).round(6).tolist()) if fingertip_values.size else "[]",
+                "fingertip_to_key_offset_std": json.dumps(np.nanstd(fingertip_values, axis=0).round(6).tolist()) if fingertip_values.size else "[]",
+                "duration_distribution": duration_distribution,
+                "dynamics_distribution": dynamics_distribution,
+            }
+        )
+        key_coverage = min(float(key_centers.nunique()) / 4.0, 1.0) if not key_centers.empty else 0.0
+        finger_consistency = _purity(group.get("finger_set", group.get("finger_set_id")))
+        interval_consistency = _purity(group.get("interval_pattern_bucket"))
+        action_consistency = 1.0 / (1.0 + float(library_df.loc[library_df["primitive_id"].astype(str) == str(primitive_id), "reconstruction_mse"].mean()) if not library_df.empty and "reconstruction_mse" in library_df.columns else 1.0)
+        sample_score = min(float(len(group)) / 8.0, 1.0)
+        reusability = float(0.25 * key_coverage + 0.25 * finger_consistency + 0.20 * interval_consistency + 0.20 * action_consistency + 0.10 * sample_score)
+        score_rows.append(
+            {
+                "primitive_id": str(primitive_id),
+                "reusability_score": reusability,
+                "key_coverage": key_coverage,
+                "finger_consistency": finger_consistency,
+                "chord_interval_consistency": interval_consistency,
+                "action_trajectory_consistency": action_consistency,
+                "sample_count_score": sample_score,
+                "sample_count": int(len(group)),
+            }
+        )
+
+    pd.DataFrame(key_rows).to_csv(diagnostics_dir / "primitive_key_transposition_coverage.csv", index=False)
+    pd.DataFrame(condition_rows).to_csv(diagnostics_dir / "primitive_condition_coverage.csv", index=False)
+    pd.DataFrame(score_rows).to_csv(diagnostics_dir / "primitive_reusability_score.csv", index=False)
+
+
 def build_primitive_training_contract(
     *,
     primitive_root: Path,
@@ -915,6 +1208,7 @@ def build_primitive_training_contract(
     action_dim = int(action_values.iloc[0]) if not action_values.empty else int(config.get("fallback_action_dim", 39))
     prior_shapes: dict[str, list[int]] = {}
     any_prior_not_action_dim = False
+    any_prior_uses_non_action_target = False
     for row in library_df.itertuples(index=False):
         prior_path = Path(str(getattr(row, "prior_path", "")))
         if not prior_path.exists():
@@ -926,6 +1220,13 @@ def build_primitive_training_contract(
         prior_shapes[str(row.primitive_id)] = [int(dim) for dim in prior.shape]
         if prior.ndim < 2 or int(prior.shape[-1]) != int(action_dim):
             any_prior_not_action_dim = True
+        target_names = (
+            [str(item) for item in np.asarray(payload["gmr_target_name"], dtype=object).reshape(-1).tolist()]
+            if "gmr_target_name" in payload
+            else []
+        )
+        if any(item in {"goals", "piano_states"} for item in target_names):
+            any_prior_uses_non_action_target = True
     segment_manifest = read_json(primitive_root / "segments" / "segment_manifest.json") if (primitive_root / "segments" / "segment_manifest.json").exists() else {}
     rejection_counts = segment_manifest.get("rejection_counts", {})
     inactive_start = _percent_bool(segment_df.get("inactive_start"))
@@ -936,10 +1237,42 @@ def build_primitive_training_contract(
         or _percent_bool(segment_df.get("causal_segment")) >= 99.0
     )
     action_target = bool(config.get("gmr_target_actions", True)) and not any_prior_not_action_dim
-    pass_contract = bool(action_target and (not causal_segment or (inactive_start >= 99.0 and activation_after_start >= 99.0)))
+    frame_mode = _primitive_frame_mode(config)
+    wrist_relative_mode = frame_mode == "wrist_key_relative"
+    required_library_columns = ["finger_set", "hand", "chord_size", "interval_pattern_bucket", "primitive_frame_mode"]
+    missing_library_metadata = [column for column in required_library_columns if column not in library_df.columns]
+    conditioned_missing = bool(
+        wrist_relative_mode
+        and bool(config.get("condition_gmr_on_context", False))
+        and (
+            library_df.empty
+            or "condition_feature_count" not in library_df.columns
+            or pd.to_numeric(library_df["condition_feature_count"], errors="coerce").fillna(0).le(0).any()
+        )
+    )
+    absolute_key_position_main_clustering_driver = bool(
+        wrist_relative_mode
+        and isinstance(config.get("clustering"), dict)
+        and not bool(config.get("clustering", {}).get("exclude_absolute_key_position_from_clustering", False))
+    )
+    pass_contract = bool(
+        action_target
+        and not any_prior_uses_non_action_target
+        and not missing_library_metadata
+        and not conditioned_missing
+        and not absolute_key_position_main_clustering_driver
+        and (not causal_segment or (inactive_start >= 99.0 and activation_after_start >= 99.0))
+    )
     return {
         "action_dim": int(action_dim),
         "gmr_target_name": "actions" if bool(config.get("gmr_target_actions", True)) else "hand_joints",
+        "primitive_frame_mode": frame_mode,
+        "wrist_key_relative_frame": bool(wrist_relative_mode),
+        "condition_gmr_on_context": bool(config.get("condition_gmr_on_context", False)),
+        "condition_features_exist": bool(not conditioned_missing),
+        "missing_library_metadata_columns": missing_library_metadata,
+        "absolute_key_position_main_clustering_driver": absolute_key_position_main_clustering_driver,
+        "no_piano_state_or_goal_target": bool(not any_prior_uses_non_action_target),
         "causal_segment": bool(causal_segment),
         "segment_alignment": "prepress_to_onset" if causal_segment else "",
         "prior_shapes": prior_shapes,
@@ -950,6 +1283,7 @@ def build_primitive_training_contract(
         "percent_segments_with_activation_after_start": float(activation_after_start),
         "percent_segments_with_contact_near_onset": float(contact_near_onset),
         "any_prior_not_action_dim": bool(any_prior_not_action_dim),
+        "any_prior_uses_non_action_target": bool(any_prior_uses_non_action_target),
         "pass_training_contract": bool(pass_contract),
     }
 
@@ -959,6 +1293,38 @@ def _percent_bool(series: pd.Series | None) -> float:
         return 0.0
     values = pd.Series(series).fillna(False).astype(bool)
     return float(values.mean() * 100.0) if len(values) else 0.0
+
+
+def _distribution_json(series: pd.Series | None) -> str:
+    if series is None or len(series) == 0:
+        return "{}"
+    counts = pd.Series(series).fillna("unknown").astype(str).value_counts().to_dict()
+    return json.dumps({str(key): int(value) for key, value in counts.items()}, sort_keys=True)
+
+
+def _purity(series: pd.Series | None) -> float:
+    if series is None or len(series) == 0:
+        return 0.0
+    counts = pd.Series(series).fillna("unknown").astype(str).value_counts(normalize=True)
+    return float(counts.iloc[0]) if not counts.empty else 0.0
+
+
+def _json_vector_stack(series: pd.Series | None, width: int) -> np.ndarray:
+    if series is None or len(series) == 0:
+        return np.zeros((0, int(width)), dtype=np.float32)
+    rows: list[np.ndarray] = []
+    for item in pd.Series(series).fillna("[]").astype(str).tolist():
+        try:
+            value = json.loads(item)
+        except Exception:
+            value = []
+        array = np.asarray(value, dtype=np.float32).reshape(-1)
+        row = np.zeros((int(width),), dtype=np.float32)
+        count = min(row.size, array.size)
+        if count:
+            row[:count] = array[:count]
+        rows.append(row)
+    return np.stack(rows, axis=0).astype(np.float32) if rows else np.zeros((0, int(width)), dtype=np.float32)
 
 
 def _apply_stage1_defaults(config: dict[str, Any]) -> dict[str, Any]:
@@ -1021,6 +1387,10 @@ def _apply_stage1_defaults(config: dict[str, Any]) -> dict[str, Any]:
     output.setdefault("relative_wrist_frame", True)
     output.setdefault("relative_key_center_frame", True)
     output.setdefault("hand_specific_normalization", True)
+    output.setdefault("primitive_frame", {"mode": "absolute"})
+    output.setdefault("clustering", {"mode": "absolute"})
+    output.setdefault("condition_gmr_on_context", False)
+    output.setdefault("gmr_target_name", "actions" if bool(output.get("gmr_target_actions", True)) else "hand_joints")
     override_workers = os.environ.get("SONATA_PRIMITIVE_NUM_WORKERS", "").strip()
     if override_workers:
         count = max(int(override_workers), 1)

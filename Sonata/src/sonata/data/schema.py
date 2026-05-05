@@ -123,6 +123,42 @@ class SegmentRecord:
     activation_after_start: bool = False
     contact_near_onset: bool = False
     rejection_reason: str = ""
+    target_key_ids: str = "[]"
+    target_key_ids_json: str = "[]"
+    chord_center_key_id: float = 0.0
+    chord_center_key_id_normalized: float = 0.0
+    chord_span_semitones: float = 0.0
+    interval_pattern: str = "[]"
+    interval_pattern_bucket: str = "none"
+    white_black_pattern: str = "[]"
+    key_world_positions: str = "[]"
+    wrist_world_position: str = "[]"
+    wrist_world_orientation: str = "[]"
+    wrist_velocity: str = "[]"
+    wrist_to_chord_center_offset: str = "[]"
+    wrist_to_each_target_key_offset: str = "[]"
+    relative_wrist_anchor: str = "[]"
+    fingertip_world_positions: str = "[]"
+    fingertip_to_target_key_offsets: str = "[]"
+    nearest_finger_to_each_target_key: str = "[]"
+    nearest_finger_labels: str = "[]"
+    contact_finger_ids: str = "[]"
+    finger_set_id: str = "unknown"
+    finger_set: str = "unknown"
+    fingertip_height_above_key: str = "[]"
+    lateral_fingertip_key_offsets: str = "[]"
+    start_joint_state: str = "[]"
+    start_joint_velocity: str = "[]"
+    normalized_joint_state: str = "[]"
+    hand_side: str = "unknown"
+    key_inactive_at_segment_start: bool = False
+    key_activation_onset_step: int = -1
+    contact_step: int = -1
+    duration_bucket: int = 0
+    dynamics_value: float = 0.0
+    dynamics_bucket: int = 0
+    motion_family: str = ""
+    primitive_frame_mode: str = "absolute"
 
     def as_row(self) -> dict[str, Any]:
         return asdict(self)

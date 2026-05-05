@@ -1521,7 +1521,10 @@ def run_segmentation_legacy(manifest_df: pd.DataFrame, output_dir: Path, config:
                 contact_near_onset=bool(candidate.contact_near_onset),
                 rejection_reason=str(candidate.rejection_reason),
             )
-            writer.add(record.as_row() | {"split": row.split}, arrays)
+            from sonata.primitives.features import enrich_segment_row_with_primitive_context
+
+            row_payload = enrich_segment_row_with_primitive_context(record.as_row() | {"split": row.split}, arrays, config)
+            writer.add(row_payload, arrays)
 
         flushed_rows = writer.flush()
         if flushed_rows:
@@ -2016,7 +2019,11 @@ def iter_prepared_segments(
     *,
     include_arrays: bool,
 ) -> Iterator[PreparedSegment]:
-    from sonata.primitives.features import build_feature_vector_from_arrays, build_gmr_target_from_arrays
+    from sonata.primitives.features import (
+        build_feature_vector_from_arrays,
+        build_gmr_target_from_arrays,
+        enrich_segment_row_with_primitive_context,
+    )
 
     if episode.hand_joints is None:
         return
@@ -2071,7 +2078,7 @@ def iter_prepared_segments(
             contact_near_onset=bool(candidate.contact_near_onset),
             rejection_reason=str(candidate.rejection_reason),
         )
-        row_payload = record.as_row() | {"split": manifest_row.split}
+        row_payload = enrich_segment_row_with_primitive_context(record.as_row() | {"split": manifest_row.split}, arrays, config)
         feature_vector, names = build_feature_vector_from_arrays(row=row_payload, arrays=arrays, config=config)
         gmr_target, target_name = build_gmr_target_from_arrays(arrays=arrays, config=config)
         row_payload["gmr_target_name"] = target_name

@@ -30,6 +30,17 @@ def main() -> None:
         failures.append("GMR target is not action-space.")
     if bool(contract.get("any_prior_not_action_dim", True)):
         failures.append("At least one primitive prior final dimension does not match action_dim.")
+    if bool(contract.get("any_prior_uses_non_action_target", False)) or not bool(contract.get("no_piano_state_or_goal_target", True)):
+        failures.append("At least one prior uses piano_state/goal targets instead of actions.")
+    if bool(contract.get("wrist_key_relative_frame", False)):
+        if contract.get("primitive_frame_mode") != "wrist_key_relative":
+            failures.append("Wrist-relative profile does not record wrist_key_relative frame mode.")
+        if not bool(contract.get("condition_features_exist", False)):
+            failures.append("Conditioned wrist-relative primitives are missing condition features.")
+        if bool(contract.get("missing_library_metadata_columns", [])):
+            failures.append(f"Primitive library is missing metadata columns: {contract.get('missing_library_metadata_columns')}.")
+        if bool(contract.get("absolute_key_position_main_clustering_driver", False)):
+            failures.append("Absolute key position is still configured as a main clustering driver.")
     if bool(contract.get("causal_segment", False)):
         inactive_percent = float(contract.get("percent_segments_with_inactive_start", 0.0))
         if inactive_percent < 100.0 - float(args.max_active_start_percent):
@@ -38,6 +49,8 @@ def main() -> None:
             failures.append("Prepress segments do not consistently include activation after the segment start.")
         if str(contract.get("segment_alignment", "")) != "prepress_to_onset":
             failures.append("Missing prepress_to_onset segment alignment metadata.")
+        if int(contract.get("num_rejected_segments", 0)) < 0 or not isinstance(contract.get("rejection_counts", {}), dict):
+            failures.append("Rejection counts are missing or malformed.")
     if not bool(contract.get("pass_training_contract", False)):
         failures.append("pass_training_contract=false.")
     if failures:
