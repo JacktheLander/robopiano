@@ -348,30 +348,27 @@ def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | No
 
     score_context = _safe_json(_row_value(row, "score_context_json", default="{}"))
     primitive_context = build_primitive_context_features(row=row, arrays=arrays, config=config)
+    feature_blocks = _feature_block_config(config)
     pieces: list[np.ndarray] = []
     names: list[str] = []
 
-    _append_feature_block(
-        pieces,
-        names,
-        "joint_rel_mean",
-        normalized_joints.mean(axis=0),
-    )
-    _append_feature_block(pieces, names, "joint_rel_std", normalized_joints.std(axis=0))
-    _append_feature_block(pieces, names, "joint_rel_delta", normalized_joints[-1] - normalized_joints[0])
-    _append_feature_block(pieces, names, "joint_rel_velocity_mean", normalized_velocity.mean(axis=0))
-    _append_feature_block(pieces, names, "joint_rel_velocity_std", normalized_velocity.std(axis=0))
-    _append_feature_block(pieces, names, "joint_rel_accel_mean", normalized_acceleration.mean(axis=0))
-    _append_feature_block(pieces, names, "joint_abs_speed_summary", np.asarray(_trajectory_summary(velocity), dtype=np.float32))
-    _append_feature_block(pieces, names, "joint_abs_accel_summary", np.asarray(_trajectory_summary(acceleration), dtype=np.float32))
+    if feature_blocks["include_joint_summary"]:
+        _append_feature_block(pieces, names, "joint_rel_mean", normalized_joints.mean(axis=0))
+        _append_feature_block(pieces, names, "joint_rel_std", normalized_joints.std(axis=0))
+        _append_feature_block(pieces, names, "joint_rel_delta", normalized_joints[-1] - normalized_joints[0])
+        _append_feature_block(pieces, names, "joint_rel_velocity_mean", normalized_velocity.mean(axis=0))
+        _append_feature_block(pieces, names, "joint_rel_velocity_std", normalized_velocity.std(axis=0))
+        _append_feature_block(pieces, names, "joint_rel_accel_mean", normalized_acceleration.mean(axis=0))
+        _append_feature_block(pieces, names, "joint_abs_speed_summary", np.asarray(_trajectory_summary(velocity), dtype=np.float32))
+        _append_feature_block(pieces, names, "joint_abs_accel_summary", np.asarray(_trajectory_summary(acceleration), dtype=np.float32))
 
-    if actions is not None:
+    if actions is not None and feature_blocks["include_action_summary"]:
         _append_feature_block(pieces, names, "action_mean", actions.mean(axis=0))
         _append_feature_block(pieces, names, "action_std", actions.std(axis=0))
         _append_feature_block(pieces, names, "action_delta", actions[-1] - actions[0])
         if action_delta is not None:
             _append_feature_block(pieces, names, "action_delta_summary", np.asarray(_trajectory_summary(action_delta), dtype=np.float32))
-    else:
+    elif feature_blocks["include_action_summary"]:
         action_dim = int(config.get("fallback_action_dim", 39))
         zeros = np.zeros((action_dim,), dtype=np.float32)
         _append_feature_block(pieces, names, "action_mean", zeros)
@@ -379,10 +376,10 @@ def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | No
         _append_feature_block(pieces, names, "action_delta", zeros)
         _append_feature_block(pieces, names, "action_delta_summary", np.zeros((4,), dtype=np.float32))
 
-    if fingertips is not None:
+    if fingertips is not None and feature_blocks["include_fingertip_context"]:
         fingertip_speed = np.gradient(np.asarray(fingertips, dtype=np.float32), axis=0)
         _append_feature_block(pieces, names, "fingertip_motion", np.asarray(_trajectory_summary(fingertip_speed), dtype=np.float32))
-    if wrist_pose is not None:
+    if wrist_pose is not None and feature_blocks["include_wrist_context"]:
         wrist_pose = np.asarray(wrist_pose, dtype=np.float32)
         _append_feature_block(pieces, names, "wrist_pose_delta", wrist_pose[-1] - wrist_pose[0])
         _append_feature_block(pieces, names, "wrist_pose_summary", np.asarray(_trajectory_summary(np.gradient(wrist_pose, axis=0)), dtype=np.float32))
@@ -390,23 +387,32 @@ def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | No
         hand_pose = np.asarray(hand_pose, dtype=np.float32)
         _append_feature_block(pieces, names, "hand_pose_delta", hand_pose[-1] - hand_pose[0])
 
-    normalized_traj = resample_time_axis(normalized_joints, int(config["trajectory_resample_steps"])).reshape(-1)
-    _append_feature_block(pieces, names, "traj_joint_rel", normalized_traj)
-    velocity_traj = resample_time_axis(normalized_velocity, int(config["trajectory_resample_steps"])).reshape(-1)
-    _append_feature_block(pieces, names, "traj_joint_velocity_rel", velocity_traj)
-    if bool(config.get("include_action_trajectory", True)) and action_delta is not None:
+    if feature_blocks["include_joint_trajectory"]:
+        normalized_traj = resample_time_axis(normalized_joints, int(config["trajectory_resample_steps"])).reshape(-1)
+        _append_feature_block(pieces, names, "traj_joint_rel", normalized_traj)
+    if feature_blocks["include_velocity_trajectory"]:
+        velocity_traj = resample_time_axis(normalized_velocity, int(config["trajectory_resample_steps"])).reshape(-1)
+        _append_feature_block(pieces, names, "traj_joint_velocity_rel", velocity_traj)
+    if feature_blocks["include_action_trajectory"] and action_delta is not None:
         action_traj = resample_time_axis(action_delta, int(config["trajectory_resample_steps"])).reshape(-1)
         _append_feature_block(pieces, names, "traj_action_delta", action_traj)
 
-    histogram = np.asarray(score_context.get("goal_histogram", [0.0] * 12), dtype=np.float32)
-    _append_feature_block(pieces, names, "score_hist", histogram)
+    if feature_blocks["include_score_histogram"]:
+        histogram = np.asarray(score_context.get("goal_histogram", [0.0] * 12), dtype=np.float32)
+        _append_feature_block(pieces, names, "score_hist", histogram)
     target_keys = _parse_key_signature(
         str(_row_value(row, "target_key_signature", default="") or _row_value(row, "key_signature", default=""))
     )
-    _append_feature_block(pieces, names, "target_keyset", _target_keyset_vector(target_keys))
-    _append_feature_block(pieces, names, "target_keyset_summary", _target_keyset_summary(target_keys))
-    _append_feature_block(pieces, names, "target_interval_hist", _target_interval_histogram(target_keys))
+    if feature_blocks["include_target_keyset_absolute"]:
+        _append_feature_block(pieces, names, "target_keyset", _target_keyset_vector(target_keys))
+    if feature_blocks["include_target_keyset_relative"]:
+        _append_feature_block(pieces, names, "target_keyset_summary", _target_keyset_summary(target_keys))
+        _append_feature_block(pieces, names, "target_interval_hist", _target_interval_histogram(target_keys))
     for block_name, values in primitive_context["feature_blocks"].items():
+        if block_name.startswith("context_wrist") and not feature_blocks["include_wrist_context"]:
+            continue
+        if block_name.startswith("context_fingertip") and not feature_blocks["include_fingertip_context"]:
+            continue
         _append_feature_block(pieces, names, block_name, values)
     scalar_context = np.asarray(
         [
@@ -444,6 +450,23 @@ def build_feature_vector_from_arrays(row: Any, arrays: dict[str, np.ndarray | No
     _append_feature_block(pieces, names, "contact_summary", contact_summary)
 
     return np.concatenate(pieces).astype(np.float32), names
+
+
+def _feature_block_config(config: dict[str, Any]) -> dict[str, bool]:
+    blocks = dict(config.get("feature_blocks", {}) if isinstance(config.get("feature_blocks"), dict) else {})
+    defaults = {
+        "include_joint_summary": True,
+        "include_joint_trajectory": True,
+        "include_velocity_trajectory": True,
+        "include_action_summary": True,
+        "include_action_trajectory": bool(config.get("include_action_trajectory", True)),
+        "include_wrist_context": True,
+        "include_fingertip_context": True,
+        "include_score_histogram": True,
+        "include_target_keyset_absolute": False,
+        "include_target_keyset_relative": True,
+    }
+    return {key: bool(blocks.get(key, value)) for key, value in defaults.items()}
 
 
 def enrich_segment_row_with_primitive_context(

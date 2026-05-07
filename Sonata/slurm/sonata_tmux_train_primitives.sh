@@ -8,7 +8,7 @@ SESSION_NAME="${SONATA_TMUX_SESSION:-sonata-primitives-stage1}"
 # Match train_primitives_cmp_stage1.sbatch defaults; override for projects2/another clone
 : "${SONATA_ROOT:=/WAVE/projects/ECEN-524-Wi26/robopiano/Sonata}"
 SBATCH_PATH="${SONATA_ROOT}/slurm/train_primitives_cmp_stage1.sbatch"
-: "${STAGE1_OUTPUT_ROOT:=/WAVE/datasets/ccoelho_lab-jlanders/outputs_run4}"
+: "${STAGE1_OUTPUT_ROOT:=/WAVE/datasets/ccoelho_lab-jlanders/outputs_run5}"
 STAGE1_OUT="${STAGE1_OUTPUT_ROOT}"
 LOG_DIR="${STAGE1_OUT}/logs"
 

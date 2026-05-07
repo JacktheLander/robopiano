@@ -120,6 +120,8 @@ def test_condition_vector_and_reusable_clustering_exclude_absolute_keyset() -> N
 
     assert selected.shape[1] < len(names)
     assert not any(name.startswith("target_keyset_") for name in selected_names)
+    assert not any(name.startswith("contact_summary_") for name in selected_names)
+    assert not any("piano_state" in name for name in selected_names)
     assert any(name.startswith("context_interval_pattern") for name in selected_names)
 
 

@@ -7,8 +7,10 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+SCRIPTS_ROOT = PROJECT_ROOT / "scripts"
+for path in (SRC_ROOT, SCRIPTS_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from sonata.config import deep_update, load_stage_config, resolve_path
 from sonata.utils.logging import configure_logging
@@ -21,6 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None)
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--dry-run-segment-budget", action="store_true")
+    parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--log-level", default="INFO")
     add_wandb_arguments(parser)
     return parser
@@ -50,6 +54,12 @@ def main() -> None:
     config["data_config"] = deep_update(data_config, {"force": bool(args.force or config.get("force", False))})
     config["force"] = bool(args.force or config.get("force", False))
     logger = configure_logging(args.log_level)
+    if args.dry_run_segment_budget:
+        from audit_stage1_segment_budget import audit_segment_budget
+
+        metrics = audit_segment_budget(config=config, max_episodes=args.max_episodes, logger=logger)
+        print(__import__("json").dumps(metrics, indent=2, sort_keys=True))
+        return
     outputs = run_primitive_pipeline(config=config, logger=logger)
     logger.info("Primitive library ready at %s", outputs["library_base"])
 

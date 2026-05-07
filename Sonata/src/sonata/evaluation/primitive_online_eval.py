@@ -115,11 +115,6 @@ class PrimitiveInstance:
     joint_velocities_gt: np.ndarray | None = None
     source_midi_path: str | None = None
     target_source: str = "goals"
-    primitive_frame_mode: str = "absolute"
-    relative_wrist_anchor: str = "[]"
-    finger_set: str = "unknown"
-    target_key_ids: str = "[]"
-    interval_pattern: str = "[]"
 
     @property
     def conditioning_feature_norm(self) -> float:
@@ -178,15 +173,6 @@ class PrimitiveOnlineRolloutResult:
     video_format: str | None = None
     video_warning: str | None = None
     notes: list[str] = field(default_factory=list)
-    condition_features_used: tuple[str, ...] = ()
-    condition_feature_norm: float = float("nan")
-    conditioned_prior_used: bool = False
-    unconditional_fallback_used: bool = True
-    primitive_frame_mode: str = "absolute"
-    relative_wrist_anchor: str = "[]"
-    finger_set: str = "unknown"
-    target_key_ids: str = "[]"
-    interval_pattern: str = "[]"
 
 
 @dataclass(slots=True)
@@ -199,14 +185,6 @@ class PrimitiveLibraryEntry:
     prototype_weights: np.ndarray | None
     default_prototype_index: int
     metadata: dict[str, Any]
-    condition_feature_names: tuple[str, ...] = ()
-    condition_feature_indices: tuple[int, ...] = ()
-    condition_mean: np.ndarray | None = None
-    condition_std: np.ndarray | None = None
-    condition_regression_coef: np.ndarray | None = None
-    condition_regression_intercept: np.ndarray | None = None
-    supports_conditioned_rollout: bool = False
-    fallback_unconditional_available: bool = True
 
 
 @dataclass(slots=True)
@@ -527,6 +505,22 @@ def sample_primitive_assignment_rows(
         frame = frame.loc[pd.to_numeric(frame["duration_steps"], errors="coerce") >= int(min_duration_steps)]
     if max_duration_steps is not None and "duration_steps" in frame.columns:
         frame = frame.loc[pd.to_numeric(frame["duration_steps"], errors="coerce") <= int(max_duration_steps)]
+    if str(sampling_config.get("mode", "")).strip() == "chord_set_press":
+        if bool(sampling_config.get("require_activation_after_start", True)) and "activation_after_start" in frame.columns:
+            frame = frame.loc[frame["activation_after_start"].fillna(False).astype(bool)]
+        if bool(sampling_config.get("require_inactive_start", True)) and "inactive_start" in frame.columns:
+            frame = frame.loc[frame["inactive_start"].fillna(False).astype(bool)]
+        if bool(sampling_config.get("require_contact_near_onset", False)) and "contact_near_onset" in frame.columns:
+            frame = frame.loc[frame["contact_near_onset"].fillna(False).astype(bool)]
+        if bool(sampling_config.get("require_unique_target_key_signature", False)) and "target_key_signature" in frame.columns:
+            sort_columns = [column for column in ("primitive_id", "target_key_signature", "causal_press_score", "segment_id") if column in frame.columns]
+            ascending = [True, True, False, True][: len(sort_columns)]
+            max_per_signature = int(sampling_config.get("max_instances_per_target_key_signature", 1))
+            frame = (
+                frame.sort_values(sort_columns, ascending=ascending, kind="stable")
+                .groupby("target_key_signature", sort=True, group_keys=False)
+                .head(max_per_signature)
+            )
     if frame.empty:
         return frame.reset_index(drop=True)
 
@@ -601,6 +595,8 @@ def build_primitive_instances(
                     goals=arrays["goals"],
                     piano_states=arrays["piano_states"],
                     events_config=events_config,
+                    row=row._asdict(),
+                    duration_steps=max(int(row.duration_steps), 1),
                 )
                 merged = merge_intended_and_realized_events(intended_bundle, realized_bundle)
                 conditioning_features = feature_lookup.get(str(row.segment_id))
@@ -664,11 +660,6 @@ def build_primitive_instances(
                             arrays["piano_states"] if arrays["piano_states"] is not None else arrays["goals"]
                         ),
                         target_source=str(intended_bundle.source),
-                        primitive_frame_mode=str(getattr(row, "primitive_frame_mode", "absolute") or "absolute"),
-                        relative_wrist_anchor=str(getattr(row, "relative_wrist_anchor", "[]") or "[]"),
-                        finger_set=str(getattr(row, "finger_set", getattr(row, "finger_set_id", "unknown")) or "unknown"),
-                        target_key_ids=str(getattr(row, "target_key_ids", getattr(row, "target_key_ids_json", "[]")) or "[]"),
-                        interval_pattern=str(getattr(row, "interval_pattern", "[]") or "[]"),
                     )
                 )
             except Exception as exc:
@@ -689,18 +680,28 @@ def infer_instance_key_events(
     goals: np.ndarray | None,
     piano_states: np.ndarray | None,
     events_config: dict[str, Any],
+    row: dict[str, Any] | None = None,
+    duration_steps: int | None = None,
 ) -> tuple[KeyEventBundle, KeyEventBundle]:
     use_goals = bool(events_config.get("use_goals", True))
     use_piano_states = bool(events_config.get("use_piano_states", True))
-    intended = (
-        extract_key_events_from_goals(
-            goals,
-            key_threshold=float(events_config.get("goal_key_threshold", 0.5)),
-            sustain_threshold=float(events_config.get("goal_sustain_threshold", 0.5)),
+    target_keys = _target_keys_from_row(row or {})
+    if target_keys:
+        intended = _key_event_bundle_from_target_keys(
+            target_keys=target_keys,
+            duration_steps=duration_steps or (goals.shape[0] if goals is not None else 1),
+            source="target_key_ids_json" if row and row.get("target_key_ids_json") else "target_key_signature",
         )
-        if use_goals and goals is not None
-        else empty_key_event_bundle(source="goals")
-    )
+    else:
+        intended = (
+            extract_key_events_from_goals(
+                goals,
+                key_threshold=float(events_config.get("goal_key_threshold", 0.5)),
+                sustain_threshold=float(events_config.get("goal_sustain_threshold", 0.5)),
+            )
+            if use_goals and goals is not None
+            else empty_key_event_bundle(source="goals")
+        )
     realized = (
         extract_key_events_from_piano_states(
             piano_states,
@@ -711,7 +712,7 @@ def infer_instance_key_events(
         else empty_key_event_bundle(source="piano_states")
     )
     if (
-        bool(events_config.get("allow_piano_state_intended_fallback", False))
+        bool(events_config.get("allow_piano_state_intended_fallback", False) or events_config.get("use_piano_states_as_intended", False))
         and not intended.events
         and realized.events
     ):
@@ -735,6 +736,51 @@ def infer_instance_key_events(
             unique_keys=tuple(intended.unique_keys),
         )
     return intended, realized
+
+
+def _target_keys_from_row(row: dict[str, Any]) -> tuple[int, ...]:
+    for field in ("target_key_ids_json", "target_key_ids"):
+        try:
+            values = json.loads(str(row.get(field, "") or "[]"))
+        except Exception:
+            values = []
+        keys = []
+        for value in values:
+            try:
+                key = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= key < _NUM_PIANO_KEYS:
+                keys.append(key)
+        if keys:
+            return tuple(sorted(set(keys)))
+    signature = str(row.get("target_key_signature", row.get("key_signature", "")) or "")
+    keys = []
+    for item in signature.replace("|", "-").split("-"):
+        try:
+            key = int(item.strip())
+        except ValueError:
+            continue
+        if 0 <= key < _NUM_PIANO_KEYS:
+            keys.append(key)
+    return tuple(sorted(set(keys)))
+
+
+def _key_event_bundle_from_target_keys(*, target_keys: Sequence[int], duration_steps: int, source: str) -> KeyEventBundle:
+    steps = max(int(duration_steps), 1)
+    key_roll = np.zeros((steps, _NUM_PIANO_KEYS), dtype=np.float32)
+    onset = min(max(steps // 2, 0), steps - 1)
+    events = []
+    for key in sorted({int(key) for key in target_keys if 0 <= int(key) < _NUM_PIANO_KEYS}):
+        key_roll[onset:, key] = 1.0
+        events.append(KeyEvent(key_id=key, onset_frame=onset, release_frame=steps))
+    return KeyEventBundle(
+        source=source,
+        key_roll=key_roll,
+        sustain_roll=np.zeros((steps,), dtype=np.float32),
+        events=events,
+        unique_keys=tuple(sorted({event.key_id for event in events})),
+    )
 
 
 def extract_key_events_from_goals(
@@ -901,8 +947,7 @@ def rollout_primitive_instance(
             causal_failure_reason="non_action_prior",
         )
 
-    prior_selection = select_primitive_prior(instance=instance, library_entry=library_entry)
-    selected_prior = prior_selection["prior_mean"]
+    selected_prior = select_primitive_prior_mean(instance=instance, library_entry=library_entry)
     expected_action_dim = int(selected_prior.shape[-1])
     predicted_actions = _resample_sequence(
         np.asarray(selected_prior, dtype=np.float32),
@@ -1089,15 +1134,6 @@ def rollout_primitive_instance(
             video_format=video_format,
             video_warning=video_warning,
             notes=list(notes),
-            condition_features_used=tuple(prior_selection["condition_features_used"]),
-            condition_feature_norm=float(instance.conditioning_feature_norm),
-            conditioned_prior_used=bool(prior_selection["conditioned_prior_used"]),
-            unconditional_fallback_used=bool(prior_selection["unconditional_fallback_used"]),
-            primitive_frame_mode=str(instance.primitive_frame_mode),
-            relative_wrist_anchor=str(instance.relative_wrist_anchor),
-            finger_set=str(instance.finger_set),
-            target_key_ids=str(instance.target_key_ids),
-            interval_pattern=str(instance.interval_pattern),
         )
     except Exception as exc:  # pragma: no cover
         return PrimitiveOnlineRolloutResult(
@@ -1122,15 +1158,6 @@ def rollout_primitive_instance(
             causal_validated=False,
             causal_failure_reason=str(exc),
             target_source=instance.target_source,
-            condition_features_used=tuple(prior_selection.get("condition_features_used", ())) if "prior_selection" in locals() else (),
-            condition_feature_norm=float(instance.conditioning_feature_norm),
-            conditioned_prior_used=bool(prior_selection.get("conditioned_prior_used", False)) if "prior_selection" in locals() else False,
-            unconditional_fallback_used=bool(prior_selection.get("unconditional_fallback_used", True)) if "prior_selection" in locals() else True,
-            primitive_frame_mode=str(instance.primitive_frame_mode),
-            relative_wrist_anchor=str(instance.relative_wrist_anchor),
-            finger_set=str(instance.finger_set),
-            target_key_ids=str(instance.target_key_ids),
-            interval_pattern=str(instance.interval_pattern),
         )
 
 
@@ -1165,12 +1192,6 @@ def _failed_rollout_result(
         causal_validated=False,
         causal_failure_reason=causal_failure_reason,
         target_source=instance.target_source,
-        condition_feature_norm=float(instance.conditioning_feature_norm),
-        primitive_frame_mode=str(instance.primitive_frame_mode),
-        relative_wrist_anchor=str(instance.relative_wrist_anchor),
-        finger_set=str(instance.finger_set),
-        target_key_ids=str(instance.target_key_ids),
-        interval_pattern=str(instance.interval_pattern),
     )
 
 
@@ -1571,15 +1592,6 @@ def build_instance_result_row(
         "primitive_prior_path": instance.primitive_prior_path,
         "conditioning_feature_norm": float(instance.conditioning_feature_norm),
         "conditioning_feature_dim": int(instance.conditioning_features.shape[0]) if instance.conditioning_features is not None else 0,
-        "condition_features_used": json.dumps(list(rollout.condition_features_used)),
-        "condition_feature_norm": float(rollout.condition_feature_norm),
-        "conditioned_prior_used": bool(rollout.conditioned_prior_used),
-        "unconditional_fallback_used": bool(rollout.unconditional_fallback_used),
-        "primitive_frame_mode": rollout.primitive_frame_mode,
-        "relative_wrist_anchor": rollout.relative_wrist_anchor,
-        "finger_set": rollout.finger_set,
-        "target_key_ids": rollout.target_key_ids,
-        "interval_pattern": rollout.interval_pattern,
         "intended_key_count": int(len(instance.intended_keys)),
         "realized_key_count_gt": int(len(instance.realized_keys_gt)),
         "predicted_key_count": int(observed_key_count),
@@ -1591,6 +1603,7 @@ def build_instance_result_row(
         "predicted_key_center": float(predicted_key_center),
         "status": rollout.status,
         "success": bool(rollout.success),
+        "chord_set_success": bool(rollout.success),
         "error": rollout.error,
         "restore_mode": rollout.restore_mode,
         "alignment_mode": rollout.alignment_mode,
@@ -1634,6 +1647,9 @@ def build_instance_result_row(
         "causal_true_positive_events": int(causal_metrics.get("causal_true_positive_events", 0)),
         "causal_false_positive_events": int(causal_metrics.get("causal_false_positive_events", 0)),
         "causal_missed_events": int(causal_metrics.get("causal_missed_events", 0)),
+        "missed_target_keys": int(causal_metrics.get("causal_missed_events", 0)),
+        "false_positive_keys": int(causal_metrics.get("causal_false_positive_events", 0)),
+        "activation_without_contact_keys": int(len(causal_metrics.get("activation_without_contact_key_indices", []))),
         "causal_precision": float(causal_metrics.get("causal_precision", float("nan"))),
         "causal_recall": float(causal_metrics.get("causal_recall", float("nan"))),
         "causal_f1": float(causal_metrics.get("causal_f1", float("nan"))),
@@ -1751,6 +1767,17 @@ def build_aggregate_metrics(
         "mean_causal_f1": float(pd.to_numeric(causal_usable.get("causal_f1", pd.Series(dtype=float)), errors="coerce").mean()) if not causal_usable.empty else float("nan"),
         "causal_success_rate": float(causal_usable.get("success", pd.Series(False, index=causal_usable.index)).astype(bool).mean()) if not causal_usable.empty else float("nan"),
     }
+    success_series = result_df.get("chord_set_success", result_df.get("success", pd.Series(False, index=result_df.index))).astype(bool) if not result_df.empty else pd.Series(dtype=bool)
+    success_by_chord_size = (
+        result_df.assign(_success=success_series).groupby("chord_size")["_success"].mean().to_dict()
+        if not result_df.empty and "chord_size" in result_df.columns
+        else {}
+    )
+    success_by_coarse_family = (
+        result_df.assign(_success=success_series).groupby("coarse_family")["_success"].mean().to_dict()
+        if not result_df.empty and "coarse_family" in result_df.columns
+        else {}
+    )
     return {
         "status": "completed",
         "runtime_error": runtime_error,
@@ -1763,6 +1790,9 @@ def build_aggregate_metrics(
         "num_primitives_evaluated": int(summary_df["primitive_id"].nunique()) if not summary_df.empty else 0,
         "legacy_state_metrics": legacy_state_metrics,
         "causal_contact_metrics": causal_contact_metrics,
+        "chord_set_success": float(success_series.mean()) if len(success_series) else float("nan"),
+        "success_by_chord_size": {str(key): float(value) for key, value in success_by_chord_size.items()},
+        "success_by_coarse_family": {str(key): float(value) for key, value in success_by_coarse_family.items()},
         "mean_causal_f1": causal_contact_metrics["mean_causal_f1"],
         "mean_abs_timing_error_frames": float(pd.to_numeric(usable["mean_abs_timing_error_frames"], errors="coerce").mean()) if not usable.empty else float("nan"),
         "mean_piano_state_mse": float(pd.to_numeric(usable["piano_state_mse"], errors="coerce").mean()) if not usable.empty else float("nan"),
@@ -1793,14 +1823,6 @@ def load_primitive_library_lookup(
         prototype_means = None
         prototype_latent_centroids = None
         prototype_weights = None
-        condition_feature_names: tuple[str, ...] = ()
-        condition_feature_indices: tuple[int, ...] = ()
-        condition_mean = None
-        condition_std = None
-        condition_regression_coef = None
-        condition_regression_intercept = None
-        supports_conditioned_rollout = bool(getattr(row, "supports_conditioned_rollout", False) or False)
-        fallback_unconditional_available = bool(getattr(row, "fallback_unconditional_available", True))
         default_prototype_index = int(getattr(row, "default_prototype_index", 0) or 0)
         if prior_path is not None and prior_path.exists():
             payload = np.load(prior_path, allow_pickle=True)
@@ -1811,22 +1833,6 @@ def load_primitive_library_lookup(
                 prototype_latent_centroids = np.asarray(payload["prototype_latent_centroids"], dtype=np.float32)
             if "prototype_weights" in payload:
                 prototype_weights = np.asarray(payload["prototype_weights"], dtype=np.float32)
-            if "condition_feature_names" in payload:
-                condition_feature_names = tuple(str(item) for item in np.asarray(payload["condition_feature_names"], dtype=object).reshape(-1).tolist())
-            if "condition_feature_indices" in payload:
-                condition_feature_indices = tuple(int(item) for item in np.asarray(payload["condition_feature_indices"], dtype=np.int64).reshape(-1).tolist())
-            if "condition_mean" in payload:
-                condition_mean = np.asarray(payload["condition_mean"], dtype=np.float32)
-            if "condition_std" in payload:
-                condition_std = np.asarray(payload["condition_std"], dtype=np.float32)
-            if "condition_regression_coef" in payload:
-                condition_regression_coef = np.asarray(payload["condition_regression_coef"], dtype=np.float32)
-            if "condition_regression_intercept" in payload:
-                condition_regression_intercept = np.asarray(payload["condition_regression_intercept"], dtype=np.float32)
-            if "supports_conditioned_rollout" in payload:
-                supports_conditioned_rollout = bool(np.asarray(payload["supports_conditioned_rollout"]).reshape(-1)[0])
-            if "fallback_unconditional_available" in payload:
-                fallback_unconditional_available = bool(np.asarray(payload["fallback_unconditional_available"]).reshape(-1)[0])
         lookup[primitive_id] = PrimitiveLibraryEntry(
             primitive_id=primitive_id,
             prior_path=prior_path,
@@ -1836,66 +1842,11 @@ def load_primitive_library_lookup(
             prototype_weights=prototype_weights,
             default_prototype_index=default_prototype_index,
             metadata=row._asdict(),
-            condition_feature_names=condition_feature_names,
-            condition_feature_indices=condition_feature_indices,
-            condition_mean=condition_mean,
-            condition_std=condition_std,
-            condition_regression_coef=condition_regression_coef,
-            condition_regression_intercept=condition_regression_intercept,
-            supports_conditioned_rollout=supports_conditioned_rollout,
-            fallback_unconditional_available=fallback_unconditional_available,
         )
     return lookup
 
 
-def select_primitive_prior(*, instance: PrimitiveInstance, library_entry: PrimitiveLibraryEntry) -> dict[str, Any]:
-    if (
-        library_entry.supports_conditioned_rollout
-        and instance.conditioning_features is not None
-        and library_entry.condition_mean is not None
-        and library_entry.condition_std is not None
-        and library_entry.condition_regression_coef is not None
-        and library_entry.condition_regression_intercept is not None
-    ):
-        if library_entry.condition_feature_indices:
-            valid_indices = [index for index in library_entry.condition_feature_indices if 0 <= int(index) < int(instance.conditioning_features.shape[0])]
-            condition_source = np.asarray(instance.conditioning_features[np.asarray(valid_indices, dtype=np.int64)], dtype=np.float32)
-        else:
-            condition_source = np.asarray(instance.conditioning_features, dtype=np.float32)
-        feature_dim = min(int(condition_source.shape[0]), int(library_entry.condition_mean.shape[0]), int(library_entry.condition_std.shape[0]))
-        if feature_dim > 0:
-            condition = np.asarray(condition_source[:feature_dim], dtype=np.float32)
-            mean = np.asarray(library_entry.condition_mean[:feature_dim], dtype=np.float32)
-            std = np.clip(np.asarray(library_entry.condition_std[:feature_dim], dtype=np.float32), 1e-6, None)
-            normalized = (condition - mean) / std
-            coef = np.asarray(library_entry.condition_regression_coef, dtype=np.float32)
-            intercept = np.asarray(library_entry.condition_regression_intercept, dtype=np.float32)
-            if coef.ndim == 2 and coef.shape[1] >= feature_dim and intercept.size == coef.shape[0]:
-                flat = intercept + coef[:, :feature_dim] @ normalized
-                if library_entry.prior_mean is not None:
-                    prior_shape = np.asarray(library_entry.prior_mean).shape
-                    if flat.size == int(np.prod(prior_shape)):
-                        return {
-                            "prior_mean": flat.reshape(prior_shape).astype(np.float32),
-                            "condition_features_used": library_entry.condition_feature_names[:feature_dim],
-                            "conditioned_prior_used": True,
-                            "unconditional_fallback_used": False,
-                        }
-    if not library_entry.fallback_unconditional_available:
-        raise ValueError(f"Primitive `{library_entry.primitive_id}` cannot condition rollout and has no unconditional fallback.")
-    return {
-        "prior_mean": _select_unconditional_or_prototype_prior(instance=instance, library_entry=library_entry),
-        "condition_features_used": (),
-        "conditioned_prior_used": False,
-        "unconditional_fallback_used": True,
-    }
-
-
 def select_primitive_prior_mean(*, instance: PrimitiveInstance, library_entry: PrimitiveLibraryEntry) -> np.ndarray:
-    return np.asarray(select_primitive_prior(instance=instance, library_entry=library_entry)["prior_mean"], dtype=np.float32)
-
-
-def _select_unconditional_or_prototype_prior(*, instance: PrimitiveInstance, library_entry: PrimitiveLibraryEntry) -> np.ndarray:
     if library_entry.prototype_means is None or library_entry.prototype_means.size == 0:
         if library_entry.prior_mean is None:
             raise ValueError(f"Primitive `{library_entry.primitive_id}` is missing a prior mean.")
@@ -2359,6 +2310,7 @@ def _resolve_eval_config(config: dict[str, Any]) -> dict[str, Any]:
     events.setdefault("use_piano_states", True)
     events.setdefault("allow_goal_realized_fallback", False)
     events.setdefault("allow_piano_state_intended_fallback", False)
+    events.setdefault("use_piano_states_as_intended", False)
     events.setdefault("goal_key_threshold", 0.5)
     events.setdefault("goal_sustain_threshold", 0.5)
     events.setdefault("piano_state_threshold", 0.5)
@@ -2381,6 +2333,20 @@ def _resolve_eval_config(config: dict[str, Any]) -> dict[str, Any]:
     rollout["causal_eval"] = causal_eval
     aggregation.setdefault("top_k_examples", 3)
     aggregation.setdefault("max_plot_primitives", 24)
+    if str(sampling.get("mode", "")).strip() == "chord_set_press":
+        sampling.setdefault("split", "val")
+        sampling.setdefault("max_instances", 500)
+        sampling.setdefault("instances_per_primitive", 4)
+        sampling.setdefault("min_chord_size", 1)
+        sampling.setdefault("max_chord_size", 4)
+        sampling.setdefault("min_duration_steps", 8)
+        sampling.setdefault("max_duration_steps", 20)
+        sampling.setdefault("require_unique_target_key_signature", True)
+        sampling.setdefault("max_instances_per_target_key_signature", 5)
+        sampling.setdefault("require_activation_after_start", True)
+        sampling.setdefault("require_inactive_start", True)
+        sampling.setdefault("require_contact_near_onset", True)
+        events["allow_piano_state_intended_fallback"] = bool(events.get("use_piano_states_as_intended", False))
     return resolved
 
 

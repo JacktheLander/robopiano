@@ -122,6 +122,7 @@ class SegmentRecord:
     inactive_start: bool = False
     activation_after_start: bool = False
     contact_near_onset: bool = False
+    causal_press_score: float = 0.0
     rejection_reason: str = ""
     target_key_ids: str = "[]"
     target_key_ids_json: str = "[]"

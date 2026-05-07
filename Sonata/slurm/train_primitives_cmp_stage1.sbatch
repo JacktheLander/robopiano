@@ -1,11 +1,11 @@
 #!/bin/bash
 # train_primitives_cmp_stage1.sbatch
 #
-# Slurm: Stage 1 (keyset+onset) primitive pipeline for RP1M-300, partition cmp.
+# Slurm: Stage 1 wrist-relative prepress primitive pipeline for RP1M-300, partition cmp.
 # ------------------------------------------------------------------------------
 # HOW TO SUBMIT
 #   1) Ensure the run root exists (creates subdirs: primitives/, data/, logs/):
-#        mkdir -p /WAVE/datasets/ccoelho_lab-jlanders/outputs_run4/logs
+#        mkdir -p /WAVE/datasets/ccoelho_lab-jlanders/outputs_run5/logs
 #   2) Edit SONATA_ROOT below if your clone path differs.
 #   3) Submit (add flags to override, e.g. more CPUs: sbatch --cpus-per-task=24 ...):
 #        sbatch /path/to/Sonata/slurm/train_primitives_cmp_stage1.sbatch
@@ -33,14 +33,14 @@
 # ------------------------------------------------------------------------------
 # Slurm I/O: update these two paths if you change the default STAGE1_OUTPUT_ROOT below.
 # They must stay under  ${STAGE1_OUTPUT_ROOT}/logs  for this run (same as mkdir -p in the job).
-#SBATCH --job-name=sonata-s1-ko
+#SBATCH --job-name=sonata-s1-wrist
 #SBATCH --partition=cmp
 #SBATCH --mem=256G
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=16
 # --- Logs: keep in sync with default STAGE1_OUTPUT_ROOT (see next block) -------
-#SBATCH --output=/WAVE/datasets/ccoelho_lab-jlanders/outputs_run4/logs/slurm-%x-%j.out
-#SBATCH --error=/WAVE/datasets/ccoelho_lab-jlanders/outputs_run4/logs/slurm-%x-%j.err
+#SBATCH --output=/WAVE/datasets/ccoelho_lab-jlanders/outputs_run5/logs/slurm-%x-%j.out
+#SBATCH --error=/WAVE/datasets/ccoelho_lab-jlanders/outputs_run5/logs/slurm-%x-%j.err
 #SBATCH --export=ALL
 #
 set -euo pipefail
@@ -52,7 +52,7 @@ set -euo pipefail
 # --- Canonical on-disk run root: ALL Stage 1 artifacts (primitives, data, W&B local cache). ---
 #     Override:  export STAGE1_OUTPUT_ROOT=/path && sbatch this_script.sbatch
 #     Use :- so an empty env var still falls back to the default.
-STAGE1_OUTPUT_DEFAULT="/WAVE/datasets/ccoelho_lab-jlanders/outputs_run4"
+STAGE1_OUTPUT_DEFAULT="/WAVE/datasets/ccoelho_lab-jlanders/outputs_run5"
 export STAGE1_OUTPUT_ROOT="${STAGE1_OUTPUT_ROOT:-${STAGE1_OUTPUT_DEFAULT}}"
 export RP1M_300_ROOT="${RP1M_300_ROOT:-/WAVE/users/unix/jlanders/rp1m_300/rp1m_repertoire.zarr}"
 echo "SONATA_ROOT=${SONATA_ROOT}" >&2
@@ -155,7 +155,7 @@ fi
 
 cd "${SONATA_ROOT}"
 
-HPC_CONFIG="${SONATA_ROOT}/configs/primitive/hpc_keyset_onset_stage1.yaml"
+HPC_CONFIG="${SONATA_ROOT}/configs/primitive/hpc_prepress_wrist_relative_stage1.yaml"
 if [[ ! -f "${HPC_CONFIG}" ]]; then
   echo "Missing HPC config: ${HPC_CONFIG}" >&2
   exit 1
@@ -194,7 +194,7 @@ if out.resolve() != exp_prim or data.resolve() != exp_data:
     raise SystemExit(1)
 PY
 
-# Primitive config: keyset+onset + online slim; data: medium (max_episodes: 20 per song)
+# Primitive config: wrist-relative prepress + online slim; data: medium (max_episodes: 20 per song)
 # --output-root forces primitive_root to match this script even if YAML resolution differed.
 "${PY}" scripts/train_primitives.py \
   --config "${HPC_CONFIG}" \

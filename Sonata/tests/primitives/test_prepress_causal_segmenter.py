@@ -11,7 +11,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from sonata.data.schema import EpisodeRecord  # noqa: E402
-from sonata.primitives.segmenters import build_segmenter  # noqa: E402
+from sonata.primitives.segmenters import budget_segment_candidates, build_segmenter  # noqa: E402
 
 
 def _episode(piano_states: np.ndarray) -> EpisodeRecord:
@@ -61,6 +61,17 @@ def test_prepress_causal_segmenter_captures_pre_onset_motion() -> None:
     assert segment.segment_alignment == "prepress_to_onset"
     assert segment.inactive_start is True
     assert segment.activation_after_start is True
+    accepted, _ = budget_segment_candidates(
+        segments,
+        {
+            "prepress_steps": 12,
+            "post_onset_steps": 3,
+            "segment_min_len": 8,
+            "segment_max_len": 20,
+            "segment_budget": {"enabled": True, "max_segments_per_score_onset": 1, "max_segments_per_target_signature": 1},
+        },
+    )
+    assert accepted[0].causal_press_score > 0
 
 
 def test_prepress_causal_segmenter_rejects_already_active_start() -> None:

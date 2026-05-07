@@ -11,21 +11,21 @@
 #
 # ------------------------------------------------------------------------------
 # Slurm log paths MUST stay under ${STAGE1_OUTPUT_ROOT}/logs — edit lines below if that root changes.
-#SBATCH --job-name=sonata-s1-ko-res
+#SBATCH --job-name=sonata-s1-wrist-res
 #SBATCH --partition=cmp
 #SBATCH --mem=512G
 #SBATCH --time=48:00:00
 #SBATCH --cpus-per-task=16
 # --- Logs ---
-#SBATCH --output=/WAVE/datasets/ccoelho_lab-jlanders/outputs_run4/logs/slurm-%x-%j.out
-#SBATCH --error=/WAVE/datasets/ccoelho_lab-jlanders/outputs_run4/logs/slurm-%x-%j.err
+#SBATCH --output=/WAVE/datasets/ccoelho_lab-jlanders/outputs_run5/logs/slurm-%x-%j.out
+#SBATCH --error=/WAVE/datasets/ccoelho_lab-jlanders/outputs_run5/logs/slurm-%x-%j.err
 #SBATCH --export=ALL
 #
 set -euo pipefail
 
 : "${SONATA_ROOT:=/WAVE/projects/ECEN-524-Wi26/robopiano/Sonata}"
 
-STAGE1_OUTPUT_DEFAULT="/WAVE/datasets/ccoelho_lab-jlanders/outputs_run4"
+STAGE1_OUTPUT_DEFAULT="/WAVE/datasets/ccoelho_lab-jlanders/outputs_run5"
 export STAGE1_OUTPUT_ROOT="${STAGE1_OUTPUT_ROOT:-${STAGE1_OUTPUT_DEFAULT}}"
 export RP1M_300_ROOT="${RP1M_300_ROOT:-/WAVE/users/unix/jlanders/rp1m_300/rp1m_repertoire.zarr}"
 
@@ -114,7 +114,7 @@ fi
 
 cd "${SONATA_ROOT}"
 
-HPC_CONFIG="${SONATA_ROOT}/configs/primitive/hpc_keyset_onset_stage1.yaml"
+HPC_CONFIG="${SONATA_ROOT}/configs/primitive/hpc_prepress_wrist_relative_stage1.yaml"
 if [[ ! -f "${HPC_CONFIG}" ]]; then
   echo "Missing HPC config: ${HPC_CONFIG}" >&2
   exit 1

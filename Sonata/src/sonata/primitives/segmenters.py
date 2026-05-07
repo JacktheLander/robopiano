@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import time
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +75,7 @@ class CandidateSegment:
     inactive_start: bool = False
     activation_after_start: bool = False
     contact_near_onset: bool = False
+    causal_press_score: float = 0.0
     rejection_reason: str = ""
 
 
@@ -925,6 +927,288 @@ def _segment_iou(left: CandidateSegment, right: CandidateSegment) -> float:
     return float(intersection / max(union, 1))
 
 
+def _roll_has_key_activation(roll: np.ndarray | None, threshold: float) -> bool:
+    if roll is None:
+        return False
+    values = np.asarray(roll, dtype=np.float32)
+    return bool(values.ndim == 2 and values.shape[0] > 0 and np.any(values[:, : min(values.shape[1], 88)] >= float(threshold)))
+
+
+def default_segment_budget_config(config: dict[str, Any]) -> dict[str, Any]:
+    budget = dict(config.get("segment_budget", {}) if isinstance(config.get("segment_budget"), dict) else {})
+    budget.setdefault("enabled", False)
+    budget.setdefault("max_total_segments", None)
+    budget.setdefault("max_segments_per_song", None)
+    budget.setdefault("max_segments_per_episode", None)
+    budget.setdefault("max_segments_per_score_onset", None)
+    budget.setdefault("max_segments_per_target_signature", None)
+    budget.setdefault("preserve_family_balance", True)
+    budget.setdefault("ranking_metric", "causal_press_score")
+    budget.setdefault("seed", int(config.get("seed", 0)))
+    return budget
+
+
+def score_segment_candidates(candidates: list[CandidateSegment], config: dict[str, Any]) -> list[CandidateSegment]:
+    scoring = dict(config.get("candidate_scoring", {}) if isinstance(config.get("candidate_scoring"), dict) else {})
+    target_duration = float(scoring.get("target_duration_steps", int(config.get("prepress_steps", 10)) + int(config.get("post_onset_steps", 4))))
+    target_duration = max(target_duration, 1.0)
+    weights = {
+        "contact_near_onset": float(scoring.get("contact_near_onset", 2.0)),
+        "activation_after_start": float(scoring.get("activation_after_start", 2.0)),
+        "inactive_start": float(scoring.get("inactive_start", 1.0)),
+        "boundary_alignment": float(scoring.get("boundary_alignment", 1.0)),
+        "simple_chord_size": float(scoring.get("simple_chord_size", 0.5)),
+        "missing_target_signature": float(scoring.get("missing_target_signature", -1.0)),
+        "duplicate_iou": float(scoring.get("duplicate_iou", -0.5)),
+        "duration_mismatch": float(scoring.get("duration_mismatch", -0.25)),
+        "too_short": float(scoring.get("too_short", -1.0)),
+        "too_long": float(scoring.get("too_long", -1.0)),
+    }
+    min_len = int(config.get("segment_min_len", 1))
+    max_len = int(config.get("segment_max_len", 10**9))
+    _assign_duplicate_iou(candidates)
+    for candidate in candidates:
+        duration = max(int(candidate.end_step) - int(candidate.onset_step), 1)
+        signature = str(candidate.target_key_signature or candidate.key_signature or "")
+        score = 0.0
+        score += weights["contact_near_onset"] if bool(candidate.contact_near_onset) else 0.0
+        score += weights["activation_after_start"] if bool(candidate.activation_after_start) else 0.0
+        score += weights["inactive_start"] if bool(candidate.inactive_start) else 0.0
+        score += weights["boundary_alignment"] * float(candidate.boundary_alignment_score)
+        score += weights["simple_chord_size"] if 1 <= int(candidate.chord_size) <= 4 else 0.0
+        score += weights["missing_target_signature"] if signature in {"", "none", "[]"} else 0.0
+        score += weights["duplicate_iou"] * float(candidate.duplicate_iou)
+        score += weights["duration_mismatch"] * abs(float(duration) - target_duration) / target_duration
+        score += weights["too_short"] if duration < min_len else 0.0
+        score += weights["too_long"] if duration > max_len else 0.0
+        candidate.causal_press_score = float(score)
+    return candidates
+
+
+def budget_segment_candidates(
+    candidates: list[CandidateSegment],
+    config: dict[str, Any],
+    *,
+    song_id: str = "",
+    episode_id: str = "",
+    max_total_segments: int | None = None,
+) -> tuple[list[CandidateSegment], dict[str, Any]]:
+    budget = default_segment_budget_config(config)
+    scored = score_segment_candidates(list(candidates), config)
+    before_stats = _candidate_metric_summary(scored)
+    if not bool(budget.get("enabled", False)):
+        stats = _budget_stats(
+            budget=budget,
+            proposed=len(candidates),
+            before=scored,
+            after=scored,
+            dropped=0,
+            before_stats=before_stats,
+        )
+        return scored, stats
+    kept = _limit_by_group(
+        scored,
+        limit=_positive_int(budget.get("max_segments_per_target_signature")),
+        key_fn=lambda item: (int(item.target_onset_step), _candidate_signature(item)),
+        budget=budget,
+    )
+    kept = _limit_by_group(
+        kept,
+        limit=_positive_int(budget.get("max_segments_per_score_onset")),
+        key_fn=lambda item: int(item.target_onset_step),
+        budget=budget,
+    )
+    kept = _limit_candidates(
+        kept,
+        _positive_int(budget.get("max_segments_per_episode")),
+        budget=budget,
+    )
+    if max_total_segments is not None:
+        kept = _limit_candidates(kept, max_total_segments, budget=budget)
+    stats = _budget_stats(
+        budget=budget,
+        proposed=len(candidates),
+        before=scored,
+        after=kept,
+        dropped=max(len(scored) - len(kept), 0),
+        before_stats=before_stats,
+    )
+    stats["song_id"] = str(song_id)
+    stats["episode_id"] = str(episode_id)
+    return kept, stats
+
+
+def aggregate_budget_metrics(segment_df: pd.DataFrame, config: dict[str, Any], extra_stats: dict[str, Any] | None = None) -> dict[str, Any]:
+    budget = default_segment_budget_config(config)
+    frame = segment_df.copy() if segment_df is not None else pd.DataFrame()
+    extra_stats = dict(extra_stats or {})
+    after_count = int(len(frame))
+    duration = pd.to_numeric(frame.get("duration_steps", pd.Series(dtype=float)), errors="coerce").dropna()
+    onset_counts = (
+        frame.groupby(["episode_id", "target_onset_step"], dropna=False).size().to_numpy(dtype=np.float32)
+        if not frame.empty and {"episode_id", "target_onset_step"}.issubset(frame.columns)
+        else np.zeros((0,), dtype=np.float32)
+    )
+    proposed = int(extra_stats.get("proposed_segments", after_count))
+    accepted_before = int(extra_stats.get("accepted_segments_before_budget", after_count))
+    metrics = {
+        "proposed_segments": proposed,
+        "accepted_segments_before_budget": accepted_before,
+        "accepted_segments_after_budget": after_count,
+        "dropped_by_budget": int(max(accepted_before - after_count, extra_stats.get("dropped_by_budget", 0))),
+        "budget_enabled": bool(budget.get("enabled", False)),
+        "budget_max_total_segments": budget.get("max_total_segments"),
+        "budget_max_segments_per_episode": budget.get("max_segments_per_episode"),
+        "budget_max_segments_per_score_onset": budget.get("max_segments_per_score_onset"),
+        "budget_max_segments_per_target_signature": budget.get("max_segments_per_target_signature"),
+        "mean_segments_per_score_onset_before_budget": float(extra_stats.get("mean_segments_per_score_onset_before_budget", 0.0)),
+        "p95_segments_per_score_onset_before_budget": float(extra_stats.get("p95_segments_per_score_onset_before_budget", 0.0)),
+        "mean_segments_per_score_onset_after_budget": float(np.mean(onset_counts)) if onset_counts.size else 0.0,
+        "p95_segments_per_score_onset_after_budget": float(np.percentile(onset_counts, 95)) if onset_counts.size else 0.0,
+        "median_segment_duration_steps": float(np.median(duration)) if len(duration) else 0.0,
+        "p95_segment_duration_steps": float(np.percentile(duration, 95)) if len(duration) else 0.0,
+        "chord_size_counts": _series_counts(frame.get("chord_size")),
+        "coarse_family_counts": _series_counts(frame.get("coarse_family")),
+        "rejection_reason_counts": dict(extra_stats.get("rejection_reason_counts", extra_stats.get("rejection_counts", {}))),
+    }
+    return metrics
+
+
+def _assign_duplicate_iou(candidates: list[CandidateSegment]) -> None:
+    groups: dict[tuple[int, str], list[CandidateSegment]] = {}
+    for candidate in candidates:
+        groups.setdefault((int(candidate.target_onset_step), _candidate_signature(candidate)), []).append(candidate)
+    for group in groups.values():
+        for left in group:
+            left.duplicate_iou = max((_segment_iou(left, right) for right in group if right is not left), default=0.0)
+
+
+def _candidate_signature(candidate: CandidateSegment) -> str:
+    return str(candidate.target_key_signature or candidate.key_signature or "none")
+
+
+def _candidate_sort_key(candidate: CandidateSegment, budget: dict[str, Any]) -> tuple[Any, ...]:
+    metric = str(budget.get("ranking_metric", "causal_press_score"))
+    score = float(getattr(candidate, metric, getattr(candidate, "causal_press_score", 0.0)))
+    seed = int(budget.get("seed", 0))
+    token = f"{seed}:{candidate.score_event_id}:{candidate.target_onset_step}:{_candidate_signature(candidate)}:{candidate.onset_step}:{candidate.end_step}"
+    tie = int(zlib.crc32(token.encode("utf-8")) & 0xFFFFFFFF)
+    return (-score, tie, int(candidate.target_onset_step), _candidate_signature(candidate), int(candidate.onset_step), int(candidate.end_step), str(candidate.score_event_id))
+
+
+def _limit_by_group(
+    candidates: list[CandidateSegment],
+    *,
+    limit: int | None,
+    key_fn,
+    budget: dict[str, Any],
+) -> list[CandidateSegment]:
+    if limit is None:
+        return list(candidates)
+    kept: list[CandidateSegment] = []
+    groups: dict[Any, list[CandidateSegment]] = {}
+    for candidate in candidates:
+        groups.setdefault(key_fn(candidate), []).append(candidate)
+    for key in sorted(groups, key=lambda value: str(value)):
+        kept.extend(_limit_candidates(groups[key], limit, budget=budget))
+    return sorted(kept, key=lambda item: _candidate_sort_key(item, budget))
+
+
+def _limit_candidates(candidates: list[CandidateSegment], limit: int | None, *, budget: dict[str, Any]) -> list[CandidateSegment]:
+    ordered = sorted(candidates, key=lambda item: _candidate_sort_key(item, budget))
+    if limit is None or len(ordered) <= limit:
+        return ordered
+    if not bool(budget.get("preserve_family_balance", True)):
+        return ordered[:limit]
+    return _balanced_top_k(ordered, int(limit), budget=budget)
+
+
+def _balanced_top_k(candidates: list[CandidateSegment], limit: int, *, budget: dict[str, Any]) -> list[CandidateSegment]:
+    if limit <= 0:
+        return []
+    groups: dict[str, list[CandidateSegment]] = {}
+    for candidate in candidates:
+        family = str(candidate.coarse_family or _keyset_coarse_family(candidate.chord_size))
+        groups.setdefault(family, []).append(candidate)
+    kept: list[CandidateSegment] = []
+    for family in sorted(groups):
+        if len(kept) >= limit:
+            break
+        kept.append(sorted(groups[family], key=lambda item: _candidate_sort_key(item, budget))[0])
+    seen = {id(item) for item in kept}
+    for candidate in candidates:
+        if len(kept) >= limit:
+            break
+        if id(candidate) not in seen:
+            kept.append(candidate)
+            seen.add(id(candidate))
+    return sorted(kept, key=lambda item: _candidate_sort_key(item, budget))
+
+
+def _candidate_metric_summary(candidates: list[CandidateSegment]) -> dict[str, Any]:
+    onset_counts: dict[tuple[int, str], int] = {}
+    durations = []
+    for candidate in candidates:
+        onset_counts[(int(candidate.target_onset_step), _candidate_signature(candidate))] = onset_counts.get((int(candidate.target_onset_step), _candidate_signature(candidate)), 0) + 1
+        durations.append(max(int(candidate.end_step) - int(candidate.onset_step), 1))
+    counts = np.asarray(list(onset_counts.values()), dtype=np.float32)
+    duration_values = np.asarray(durations, dtype=np.float32)
+    return {
+        "mean_segments_per_score_onset": float(np.mean(counts)) if counts.size else 0.0,
+        "p95_segments_per_score_onset": float(np.percentile(counts, 95)) if counts.size else 0.0,
+        "median_segment_duration_steps": float(np.median(duration_values)) if duration_values.size else 0.0,
+        "p95_segment_duration_steps": float(np.percentile(duration_values, 95)) if duration_values.size else 0.0,
+    }
+
+
+def _budget_stats(
+    *,
+    budget: dict[str, Any],
+    proposed: int,
+    before: list[CandidateSegment],
+    after: list[CandidateSegment],
+    dropped: int,
+    before_stats: dict[str, Any],
+) -> dict[str, Any]:
+    after_stats = _candidate_metric_summary(after)
+    return {
+        "proposed_segments": int(proposed),
+        "accepted_segments_before_budget": int(len(before)),
+        "accepted_segments_after_budget": int(len(after)),
+        "accepted_segments": int(len(after)),
+        "dropped_by_budget": int(dropped),
+        "budget_enabled": bool(budget.get("enabled", False)),
+        "budget_max_total_segments": budget.get("max_total_segments"),
+        "budget_max_segments_per_episode": budget.get("max_segments_per_episode"),
+        "budget_max_segments_per_score_onset": budget.get("max_segments_per_score_onset"),
+        "budget_max_segments_per_target_signature": budget.get("max_segments_per_target_signature"),
+        "mean_segments_per_score_onset_before_budget": float(before_stats["mean_segments_per_score_onset"]),
+        "p95_segments_per_score_onset_before_budget": float(before_stats["p95_segments_per_score_onset"]),
+        "mean_segments_per_score_onset_after_budget": float(after_stats["mean_segments_per_score_onset"]),
+        "p95_segments_per_score_onset_after_budget": float(after_stats["p95_segments_per_score_onset"]),
+        "median_segment_duration_steps": float(after_stats["median_segment_duration_steps"]),
+        "p95_segment_duration_steps": float(after_stats["p95_segment_duration_steps"]),
+        "chord_size_counts": _candidate_counts(after, "chord_size"),
+        "coarse_family_counts": _candidate_counts(after, "coarse_family"),
+    }
+
+
+def _candidate_counts(candidates: list[CandidateSegment], field: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        value = getattr(candidate, field)
+        key = str(value if value not in (None, "") else "unknown")
+        counts[key] = int(counts.get(key, 0)) + 1
+    return dict(sorted(counts.items()))
+
+
+def _series_counts(series: pd.Series | None) -> dict[str, int]:
+    if series is None:
+        return {}
+    counts = pd.Series(series).fillna("unknown").astype(str).value_counts().sort_index()
+    return {str(key): int(value) for key, value in counts.items()}
+
+
 class PrepressCausalSegmenter(BaseSegmenter):
     name = "prepress_causal"
 
@@ -942,6 +1226,7 @@ class PrepressCausalSegmenter(BaseSegmenter):
         fingertip_key_distance_threshold_m: float,
         segment_min_len: int,
         segment_max_len: int,
+        truncate_at_next_onset: bool = False,
     ):
         self.prepress_steps = max(int(prepress_steps), 1)
         self.post_onset_steps = max(int(post_onset_steps), 1)
@@ -954,11 +1239,12 @@ class PrepressCausalSegmenter(BaseSegmenter):
         self.fingertip_key_distance_threshold_m = float(fingertip_key_distance_threshold_m)
         self.segment_min_len = max(int(segment_min_len), 1)
         self.segment_max_len = max(int(segment_max_len), self.segment_min_len)
+        self.truncate_at_next_onset = bool(truncate_at_next_onset)
         self.last_stats = {"proposed_segments": 0, "accepted_segments": 0, "rejection_counts": {}}
 
     def segment(self, episode, score_events: list[ScoreEvent]) -> list[CandidateSegment]:
         del score_events
-        roll_source = episode.piano_states if episode.piano_states is not None else episode.goals
+        roll_source = episode.goals if _roll_has_key_activation(episode.goals, self.activation_threshold) else episode.piano_states
         rejection_counts: dict[str, int] = {}
         if episode.hand_joints is None:
             self.last_stats = {"proposed_segments": 0, "accepted_segments": 0, "rejection_counts": {"missing_hand_joints": 1}}
@@ -976,16 +1262,20 @@ class PrepressCausalSegmenter(BaseSegmenter):
         key_roll = np.zeros((roll.shape[0], 88), dtype=bool)
         key_roll[:, : min(88, roll.shape[1])] = roll[:, : min(88, roll.shape[1])] >= self.activation_threshold
         onset_groups = self._activation_onset_groups(key_roll)
+        boundary_signal, _, _ = _build_boundary_signal(episode)
         proposed = len(onset_groups)
         accepted: list[CandidateSegment] = []
-        for onset_step, keys in onset_groups:
+        for group_index, (onset_step, keys) in enumerate(onset_groups):
             if self.max_events_per_onset is not None:
                 keys = keys[: self.max_events_per_onset]
+            next_onset_step = onset_groups[group_index + 1][0] if group_index + 1 < len(onset_groups) else None
             candidate = self._build_candidate(
                 episode=episode,
                 key_roll=key_roll,
                 onset_step=int(onset_step),
+                next_onset_step=next_onset_step,
                 keys=[int(key) for key in keys],
+                boundary_signal=boundary_signal,
                 rejection_counts=rejection_counts,
             )
             if candidate is not None:
@@ -1014,11 +1304,17 @@ class PrepressCausalSegmenter(BaseSegmenter):
         episode,
         key_roll: np.ndarray,
         onset_step: int,
+        next_onset_step: int | None,
         keys: list[int],
+        boundary_signal: np.ndarray,
         rejection_counts: dict[str, int],
     ) -> CandidateSegment | None:
         start = int(onset_step) - self.prepress_steps
         end = int(onset_step) + self.post_onset_steps
+        truncated_by_next_onset = False
+        if self.truncate_at_next_onset and next_onset_step is not None and int(next_onset_step) < end:
+            end = max(int(next_onset_step), int(onset_step) + 1)
+            truncated_by_next_onset = True
         if start < 0:
             self._reject(rejection_counts, "insufficient_prepress_history")
             return None
@@ -1047,11 +1343,14 @@ class PrepressCausalSegmenter(BaseSegmenter):
             self._reject(rejection_counts, "min_hold_failed")
             return None
         contact_near_onset = self._contact_near_onset(episode=episode, keys=keys, onset_step=int(onset_step))
-        if self.require_contact_near_onset and not contact_near_onset:
+        if self.require_contact_near_onset and contact_near_onset is False:
             self._reject(rejection_counts, "contact_near_onset_failed")
             return None
         key_signature = "-".join(str(key) for key in sorted(keys)) if keys else "none"
         chord_size = len(keys)
+        boundary_index = int(np.clip(onset_step, 0, max(boundary_signal.shape[0] - 1, 0))) if boundary_signal.size else 0
+        boundary_alignment_score = float(boundary_signal[boundary_index]) if boundary_signal.size else 0.0
+        next_gap = int(next_onset_step) - int(onset_step) if next_onset_step is not None else -1
         return CandidateSegment(
             onset_step=int(start),
             end_step=int(end),
@@ -1064,9 +1363,13 @@ class PrepressCausalSegmenter(BaseSegmenter):
             coarse_family=_keyset_coarse_family(chord_size),
             proposal_size=int(chord_size),
             proposal_span_steps=max(int(self.post_onset_steps), 1),
+            boundary_energy=boundary_alignment_score,
+            boundary_alignment_score=boundary_alignment_score,
             target_key_count=int(chord_size),
             target_key_signature=key_signature,
             target_onset_step=int(onset_step),
+            next_onset_gap_steps=int(next_gap),
+            truncated_by_next_onset=bool(truncated_by_next_onset),
             causal_segment=True,
             segment_alignment="prepress_to_onset",
             inactive_start=True,
@@ -1074,14 +1377,14 @@ class PrepressCausalSegmenter(BaseSegmenter):
             contact_near_onset=bool(contact_near_onset),
         )
 
-    def _contact_near_onset(self, *, episode, keys: list[int], onset_step: int) -> bool:
+    def _contact_near_onset(self, *, episode, keys: list[int], onset_step: int) -> bool | None:
         if episode.hand_fingertips is None:
-            return False
+            return None
         # RP1M caches fingertip poses but not a stable piano-key position table. Keep this hook
         # explicit for future datasets instead of fabricating contact from piano state.
         key_positions = getattr(episode, "key_positions", None)
         if key_positions is None:
-            return False
+            return None
         tips = np.asarray(episode.hand_fingertips, dtype=np.float32).reshape(episode.hand_fingertips.shape[0], -1, 3)
         keys_xyz = np.asarray(key_positions, dtype=np.float32).reshape(-1, 3)
         left = max(int(onset_step) - self.contact_tolerance_frames, 0)
@@ -1155,6 +1458,7 @@ def build_segmenter(config: dict[str, Any]) -> BaseSegmenter:
             fingertip_key_distance_threshold_m=float(config.get("fingertip_key_distance_threshold_m", 0.025)),
             segment_min_len=int(config.get("segment_min_len", 8)),
             segment_max_len=int(config.get("segment_max_len", 20)),
+            truncate_at_next_onset=bool(config.get("segment_truncate_at_next_onset", False)),
         )
     raise ValueError(f"Unknown segmentation strategy: {strategy}")
 
@@ -1297,6 +1601,8 @@ _SEGMENT_CONFIG_SIGNATURE_KEYS = (
     "fingertip_key_distance_threshold_m",
     "segment_end_mode",
     "segment_start_mode",
+    "segment_budget",
+    "candidate_scoring",
 )
 
 
@@ -1652,6 +1958,10 @@ def run_segmentation_slim(
     processed_this_loop = 0
     segments_this_loop = 0
     aggregate_rejection_counts: dict[str, int] = {}
+    aggregate_budget_stats: dict[str, Any] = {}
+    budget_config = default_segment_budget_config(config)
+    max_total_segments = _positive_int(budget_config.get("max_total_segments")) if bool(budget_config.get("enabled", False)) else None
+    total_segments_allowed = None if max_total_segments is None else max(max_total_segments - int(len(existing_segment_df)), 0)
     if raw_writer is None:
         segment_num_workers = resolve_worker_count(config.get("segment_num_workers"), default=0)
         prepared_batches = _iter_prepared_episode_batches(
@@ -1661,6 +1971,15 @@ def run_segmentation_slim(
         )
         for batch in tqdm(prepared_batches, total=len(remaining_df), desc="Segment episodes"):
             new_score_rows.extend(batch.score_rows)
+            _merge_budget_run_stats(aggregate_budget_stats, batch.stats)
+            if total_segments_allowed is not None:
+                remaining_slots = max(int(total_segments_allowed) - int(segments_this_loop), 0)
+                if len(batch.prepared_segments) > remaining_slots:
+                    dropped = len(batch.prepared_segments) - remaining_slots
+                    batch.prepared_segments = batch.prepared_segments[:remaining_slots]
+                    batch.stats["dropped_by_budget"] = int(batch.stats.get("dropped_by_budget", 0)) + int(dropped)
+                    batch.stats["accepted_segments_after_budget"] = int(len(batch.prepared_segments))
+                    batch.stats["accepted_segments"] = int(len(batch.prepared_segments))
             if batch.prepared_segments:
                 slim_writer.begin_episode(song_id=batch.song_id, episode_id=batch.episode_id)
                 for segment in batch.prepared_segments:
@@ -1719,6 +2038,13 @@ def run_segmentation_slim(
                     include_arrays=True,
                 )
             )
+            raw_stats = dict(getattr(segmenter, "last_stats", {}))
+            raw_stats["accepted_segments_after_budget"] = int(len(prepared_segments))
+            raw_stats["accepted_segments_before_budget"] = int(raw_stats.get("accepted_segments", len(prepared_segments)))
+            _merge_budget_run_stats(aggregate_budget_stats, raw_stats)
+            if total_segments_allowed is not None:
+                remaining_slots = max(int(total_segments_allowed) - int(segments_this_loop), 0)
+                prepared_segments = prepared_segments[:remaining_slots]
             if not prepared_segments:
                 append_episode_progress(
                     slim_paths,
@@ -1771,6 +2097,7 @@ def run_segmentation_slim(
     segment_df = compose_segment_index(existing_segment_df, slim_segment_df)
     score_df = _merge_score_tables(existing_score_df=existing_score_df, new_rows=new_score_rows)
     store_summary = summarize_slim_cache(slim_paths)
+    budget_metrics = aggregate_budget_metrics(segment_df, config, aggregate_budget_stats)
     total_raw_estimate = int(previous_store_manifest.get("estimated_raw_segment_bytes", 0))
     total_raw_estimate += int(migration_summary.get("source_raw_bytes", 0))
     total_raw_estimate += int(slim_writer.stats["estimated_raw_segment_bytes"])
@@ -1789,7 +2116,9 @@ def run_segmentation_slim(
         "segment_strategy": config.get("segmenter_name", config.get("segmentation_strategy", "note_aligned")),
         "segment_config_signature": _segment_config_signature(config),
         "rejection_counts": dict(sorted(aggregate_rejection_counts.items())),
+        "rejection_reason_counts": dict(sorted(aggregate_rejection_counts.items())),
         "num_rejected_segments": int(sum(aggregate_rejection_counts.values())),
+        **budget_metrics,
         "num_segments": int(store_summary["num_segments"]),
         "num_chunks": int(store_summary["num_chunks"]),
         "feature_dim": int(store_summary["feature_dim"]),
@@ -1823,7 +2152,9 @@ def run_segmentation_slim(
             "segment_strategy": config.get("segmenter_name", config.get("segmentation_strategy", "note_aligned")),
             "segment_config_signature": _segment_config_signature(config),
             "rejection_counts": dict(sorted(aggregate_rejection_counts.items())),
+            "rejection_reason_counts": dict(sorted(aggregate_rejection_counts.items())),
             "num_rejected_segments": int(sum(aggregate_rejection_counts.values())),
+            **budget_metrics,
             "online_segment_processing": True,
             "save_raw_segment_chunks": save_raw_segment_chunks_enabled(config),
             "online_storage_format": resolve_online_storage_format(config),
@@ -1915,6 +2246,32 @@ def _merge_rejection_counts(target: dict[str, int], source: Any) -> None:
         target[str(key)] = int(target.get(str(key), 0)) + count
 
 
+def _merge_budget_run_stats(target: dict[str, Any], source: dict[str, Any]) -> None:
+    int_fields = ("proposed_segments", "accepted_segments_before_budget", "accepted_segments_after_budget", "dropped_by_budget")
+    for field in int_fields:
+        try:
+            target[field] = int(target.get(field, 0)) + int(source.get(field, 0))
+        except (TypeError, ValueError):
+            pass
+    for field in ("mean_segments_per_score_onset_before_budget", "p95_segments_per_score_onset_before_budget"):
+        value = source.get(field)
+        if value is not None:
+            values = list(target.get(f"{field}_values", []))
+            values.append(float(value))
+            target[f"{field}_values"] = values
+            target[field] = float(np.mean(values)) if values else 0.0
+    for field in ("chord_size_counts", "coarse_family_counts", "rejection_reason_counts", "rejection_counts"):
+        value = source.get(field)
+        if isinstance(value, dict):
+            merged = dict(target.get(field, {}))
+            for key, count in value.items():
+                try:
+                    merged[str(key)] = int(merged.get(str(key), 0)) + int(count)
+                except (TypeError, ValueError):
+                    continue
+            target[field] = merged
+
+
 def _load_or_infer_score_events(episode, config: dict[str, Any]) -> list[ScoreEvent]:
     if episode.note_path is not None and episode.note_path.exists():
         try:
@@ -1989,6 +2346,13 @@ def _prepare_episode_batch(
     episode = load_episode_record(manifest_row_payload)
     score_events = _load_or_infer_score_events(episode=episode, config=config)
     segmenter = build_segmenter(config)
+    candidate_segments = segmenter.segment(episode, score_events)
+    accepted_candidates, budget_stats = budget_segment_candidates(
+        candidate_segments,
+        config,
+        song_id=str(manifest_row.song_id),
+        episode_id=str(manifest_row.episode_id),
+    )
     prepared_segments = list(
         iter_prepared_segments(
             manifest_row=manifest_row,
@@ -1997,10 +2361,13 @@ def _prepare_episode_batch(
             segmenter=segmenter,
             config=config,
             include_arrays=include_arrays,
+            candidate_segments=accepted_candidates,
         )
     )
     stats = dict(getattr(segmenter, "last_stats", {}))
+    stats.update(budget_stats)
     stats["accepted_segments"] = int(len(prepared_segments))
+    stats["accepted_segments_after_budget"] = int(len(prepared_segments))
     return PreparedEpisodeBatch(
         song_id=str(manifest_row.song_id),
         episode_id=str(manifest_row.episode_id),
@@ -2018,6 +2385,7 @@ def iter_prepared_segments(
     config: dict[str, Any],
     *,
     include_arrays: bool,
+    candidate_segments: list[CandidateSegment] | None = None,
 ) -> Iterator[PreparedSegment]:
     from sonata.primitives.features import (
         build_feature_vector_from_arrays,
@@ -2028,7 +2396,14 @@ def iter_prepared_segments(
     if episode.hand_joints is None:
         return
     feature_names: list[str] = []
-    candidate_segments = segmenter.segment(episode, score_events)
+    if candidate_segments is None:
+        raw_candidates = segmenter.segment(episode, score_events)
+        candidate_segments, _ = budget_segment_candidates(
+            raw_candidates,
+            config,
+            song_id=str(getattr(manifest_row, "song_id", "")),
+            episode_id=str(getattr(manifest_row, "episode_id", "")),
+        )
     for index, candidate in enumerate(candidate_segments):
         arrays = slice_segment_arrays(episode, candidate.onset_step, candidate.end_step)
         hand_joints = arrays["hand_joints"]
@@ -2076,6 +2451,7 @@ def iter_prepared_segments(
             inactive_start=bool(candidate.inactive_start),
             activation_after_start=bool(candidate.activation_after_start),
             contact_near_onset=bool(candidate.contact_near_onset),
+            causal_press_score=float(candidate.causal_press_score),
             rejection_reason=str(candidate.rejection_reason),
         )
         row_payload = enrich_segment_row_with_primitive_context(record.as_row() | {"split": manifest_row.split}, arrays, config)

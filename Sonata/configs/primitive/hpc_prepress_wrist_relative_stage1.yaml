@@ -1,8 +1,8 @@
-output_root: ../../outputs/primitives/prepress_wrist_relative_medium
-data_output_root: ../../outputs/data/medium
+output_root: ${STAGE1_OUTPUT_ROOT}/primitives
+data_output_root: ${STAGE1_OUTPUT_ROOT}/data
 data_manifest_name: dataset_manifest
 data_profile: medium
-experiment_name: Sonata-3-prepress-wrist-relative-medium-primitives
+experiment_name: Sonata-3-hpc-prepress-wrist-relative-stage1
 wandb:
   enabled: true
   project: robopianist
@@ -107,7 +107,9 @@ stage1_max_segments_per_score_onset: 1.5
 stage1_max_p95_segment_duration_steps: 20
 segment_budget:
   enabled: true
-  max_total_segments: 1000000
+  # Hard cap: stop collecting segments after this many accepted (after per-episode/onset budget).
+  # Full medium pass would be ~1.7M without this; set to 500k to bound the run.
+  max_total_segments: 500000
   max_segments_per_song: null
   max_segments_per_episode: 40
   max_segments_per_score_onset: 1

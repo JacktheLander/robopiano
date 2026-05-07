@@ -1,0 +1,50 @@
+rp1m_root: /WAVE/users/unix/jlanders/rp1m_300/rp1m_repertoire.zarr
+robopiano_root: /WAVE/projects/ECEN-524-Wi26/robopiano
+robopianist_root: /WAVE/projects/ECEN-524-Wi26/robopiano/robopianist
+
+experiment_name: partita_sarabande_multitraj_debug
+
+song_name: null
+
+song_search_terms:
+  - FrenchSuiteNo5Sarabande
+  - FrenchSuiteNo5
+  - Sarabande
+  - PianoSonataNo232NdMov
+  - FrenchSuiteNo1Allemande
+  - PianoSonataD8451StMov
+  - PartitaNo26
+  - GolliwoggsCakewalk
+
+selection:
+  top_k_train: 64
+  reconstruction_rank: 0
+  exclude_reconstruction_from_training: true
+  min_key_f1: 0.85
+  max_mispress_rate: 0.15
+  key_threshold: 0.5
+  fallback_scan_songs: 50
+
+segmentation:
+  min_segment_len: 4
+  max_segment_len: 32
+  use_goal_boundaries: true
+  use_piano_state_boundaries: true
+  use_action_derivative_boundaries: true
+  action_derivative_percentile: 90
+
+primitives:
+  num_primitives: 32
+  pca_dim: 24
+  resample_len: 16
+  cluster_method: kmeans
+  random_seed: 42
+  include_relative_song_time: true
+  relative_song_time_weight: 0.2
+
+reconstruction:
+  mode: nearest
+  target_trajectory_rank: 0
+
+outputs:
+  root: partita/outputs

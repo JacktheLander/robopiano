@@ -908,7 +908,16 @@ def select_clustering_features(
     selectors.extend(["context_duration_dynamics", "joint_rel_", "traj_joint_rel", "traj_joint_velocity_rel", "action_", "traj_action_delta"])
     indices = select_feature_indices(feature_names=feature_names, selectors=selectors)
     if bool(clustering_config.get("exclude_absolute_key_position_from_clustering", True)):
-        excluded_prefixes = ("target_keyset_", "context_wrist_start_", "score_scalar_0005", "context_chord_geometry_0001")
+        excluded_prefixes = (
+            "target_keyset_",
+            "contact_summary_",
+            "piano_state_",
+            "piano_states_",
+            "raw_piano_state_",
+            "context_wrist_start_",
+            "score_scalar_0005",
+            "context_chord_geometry_0001",
+        )
         indices = [index for index in indices if not any(feature_names[index].startswith(prefix) for prefix in excluded_prefixes)]
     if not indices:
         return np.asarray(feature_matrix, dtype=np.float32), list(feature_names), list(range(len(feature_names)))
@@ -1111,6 +1120,13 @@ def compute_stage1_metrics(
                 "gmr_target_steps": int(storage_summary.get("gmr_target_steps", storage_summary.get("gmr_horizon", 0))),
                 "gmr_target_dim": int(storage_summary.get("gmr_target_dim", storage_summary.get("gmr_dim", 0))),
                 "estimated_storage_reduction_vs_legacy": storage_summary.get("estimated_storage_reduction_vs_legacy"),
+                "budget_enabled": bool(storage_summary.get("budget_enabled", False)),
+                "proposed_segments": int(storage_summary.get("proposed_segments", 0)),
+                "accepted_segments_before_budget": int(storage_summary.get("accepted_segments_before_budget", 0)),
+                "accepted_segments_after_budget": int(storage_summary.get("accepted_segments_after_budget", len(segment_df))),
+                "dropped_by_budget": int(storage_summary.get("dropped_by_budget", 0)),
+                "mean_segments_per_score_onset_after_budget": float(storage_summary.get("mean_segments_per_score_onset_after_budget", metrics["segments_per_score_onset"])),
+                "p95_segments_per_score_onset_after_budget": float(storage_summary.get("p95_segments_per_score_onset_after_budget", 0.0)),
             }
         )
     return metrics
@@ -1349,6 +1365,35 @@ def _apply_stage1_defaults(config: dict[str, Any]) -> dict[str, Any]:
     output.setdefault("fingertip_key_distance_threshold_m", 0.025)
     output.setdefault("segment_end_mode", "onset_plus_post")
     output.setdefault("segment_start_mode", "fixed_prepress")
+    output.setdefault(
+        "segment_budget",
+        {
+            "enabled": False,
+            "max_total_segments": None,
+            "max_segments_per_song": None,
+            "max_segments_per_episode": None,
+            "max_segments_per_score_onset": None,
+            "max_segments_per_target_signature": None,
+            "preserve_family_balance": True,
+            "ranking_metric": "causal_press_score",
+            "seed": int(output.get("seed", 0)),
+        },
+    )
+    output.setdefault(
+        "feature_blocks",
+        {
+            "include_joint_summary": True,
+            "include_joint_trajectory": True,
+            "include_velocity_trajectory": True,
+            "include_action_summary": True,
+            "include_action_trajectory": True,
+            "include_wrist_context": True,
+            "include_fingertip_context": True,
+            "include_score_histogram": True,
+            "include_target_keyset_absolute": False,
+            "include_target_keyset_relative": True,
+        },
+    )
     output.setdefault("use_process_pool", True)
     output.setdefault("gpu_acceleration", False)
     output.setdefault("gpu_backend_preference", ["rapids", "cupy", "torch"])
