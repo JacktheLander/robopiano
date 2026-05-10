@@ -1,0 +1,39 @@
+experiment_name: debug
+run_name: debug
+seed: 42
+extraction_root: Variations/outputs/extraction/debug
+output_root: Variations/outputs/diffusion
+splits:
+  val_fraction: 0.1
+  seed: 42
+  min_pairs_per_split: 1
+data:
+  batch_size: 64
+  num_workers: 0
+model:
+  hidden_dim: 128
+  num_blocks: 4
+  time_dim: 128
+  cond_dim: 128
+diffusion:
+  timesteps: 200
+  beta_start: 0.0001
+  beta_end: 0.02
+  ddim_steps: 20
+training:
+  epochs: 20
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  warmup_epochs: 1
+  amp: false
+  ema_decay: 0.999
+  val_every: 1
+  checkpoint_interval: 1
+  best_of_k: 4
+  max_val_batches: 4
+  sample_artifact_count: 16
+  device: auto
+wandb:
+  enabled: false
+  log_artifacts: true
+  watch_model: false
