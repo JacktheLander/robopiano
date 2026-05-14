@@ -74,15 +74,17 @@ def variations_output_root(config: dict[str, Any]) -> Path:
 
 def extraction_root(config: dict[str, Any]) -> Path:
     if config.get("extraction_root"):
+        configured = Path(str(config["extraction_root"]))
+        if configured.is_absolute():
+            return configured
         output_env = os.environ.get("VARIATIONS_OUTPUT_ROOT")
         if output_env:
-            configured = Path(str(config["extraction_root"]))
             parts = configured.parts
             if len(parts) >= 4 and parts[-3:] == ("outputs", "extraction", parts[-1]):
                 return Path(output_env) / "extraction" / parts[-1]
             if len(parts) >= 3 and parts[-2] == "extraction":
                 return Path(output_env) / "extraction" / parts[-1]
-        return repo_path(config, config["extraction_root"])
+        return repo_path(config, configured)
     return variations_output_root(config) / "extraction" / experiment_name(config)
 
 

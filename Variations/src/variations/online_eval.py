@@ -5,14 +5,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 from typing import TYPE_CHECKING, Any
-import csv
 
 import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 for _path in (
-    REPO_ROOT / "Bagatelle" / "src",
     REPO_ROOT / "Intermezzo" / "src",
     REPO_ROOT / "Variations" / "src",
     REPO_ROOT / "Variations",
@@ -25,70 +23,12 @@ for _path in (
 
 from intermezzo.io import atomic_save_json, atomic_save_npz, create_unique_run_dir, filesystem_slug  # noqa: E402
 from intermezzo.midi import load_target_keys_from_midi  # noqa: E402
-try:
-    from intermezzo.online_eval import (  # type: ignore[import-not-found]  # noqa: E402
-        DEFAULT_MAESTRO_ROOT,
-        RolloutConfig,
-        rollout_hand_targets_headless,
-        select_maestro_midi,
-    )
-except ModuleNotFoundError:  # pragma: no cover - exercised on older main branches.
-    from bagatelle.evaluation import RolloutConfig, rollout_bagatelle_hand_targets_headless as rollout_hand_targets_headless  # noqa: E402
-
-    DEFAULT_MAESTRO_ROOT = Path("/WAVE/datasets/ccoelho_lab-jlanders/maestro-v3.0.0/maestro-v3.0.0")
-
-    def select_maestro_midi(
-        *,
-        midi_path: str | Path | None,
-        maestro_root: str | Path,
-        selection: str = "shortest",
-        piece_index: int = 0,
-    ) -> tuple[Path, dict[str, Any]]:
-        if midi_path:
-            path = Path(midi_path).expanduser().resolve()
-            if not path.is_file():
-                raise FileNotFoundError(f"MIDI file not found: {path}")
-            return path, {"midi_selection": "explicit", "midi_path": str(path)}
-
-        root = Path(maestro_root).expanduser().resolve()
-        if not root.exists():
-            raise FileNotFoundError(f"MAESTRO root not found: {root}")
-        metadata = root / "maestro-v3.0.0.csv"
-        if selection == "shortest" and metadata.is_file():
-            rows: list[dict[str, str]] = []
-            with metadata.open("r", encoding="utf-8", newline="") as handle:
-                for row in csv.DictReader(handle):
-                    filename = row.get("midi_filename")
-                    duration = row.get("duration")
-                    if not filename or duration is None:
-                        continue
-                    path = root / filename
-                    if path.is_file():
-                        rows.append({**row, "_path": str(path)})
-            if rows:
-                rows.sort(key=lambda row: float(row["duration"]))
-                row = rows[0]
-                return Path(row["_path"]).resolve(), {
-                    "midi_selection": "shortest_from_maestro_metadata",
-                    "maestro_root": str(root),
-                    "maestro_duration_s": float(row["duration"]),
-                    "canonical_composer": row.get("canonical_composer"),
-                    "canonical_title": row.get("canonical_title"),
-                    "split": row.get("split"),
-                }
-
-        files = [path for path in root.rglob("*") if path.suffix.lower() in {".mid", ".midi"}]
-        files.sort(key=lambda path: path.relative_to(root).as_posix())
-        if not files:
-            raise RuntimeError(f"No MIDI files found under {root}")
-        index = int(piece_index)
-        if index < 0 or index >= len(files):
-            raise IndexError(f"piece_index {index} out of range for {len(files)} MIDI files")
-        return files[index].resolve(), {
-            "midi_selection": "sorted_piece_index",
-            "piece_index": index,
-            "maestro_root": str(root),
-        }
+from intermezzo.online_eval import (  # noqa: E402
+    DEFAULT_MAESTRO_ROOT,
+    RolloutConfig,
+    rollout_hand_targets_headless,
+    select_maestro_midi,
+)
 
 if TYPE_CHECKING:
     from simulate.model_loader import LoadedSimulationModel

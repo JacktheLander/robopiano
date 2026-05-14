@@ -100,6 +100,25 @@ python Variations/scripts/evaluate_online_rollout.py \
 
 If checkpoint paths are omitted, the evaluator searches `/WAVE/datasets/ccoelho_lab-jlanders/Variations` and uses the most recent `best.pt` for each model type. Outputs are written under `/WAVE/datasets/ccoelho_lab-jlanders/Variations/online_evaluation` with per-model rollout JSON/NPZ files plus a combined `summary.json`.
 
+Post-train a checkpoint toward actual key contact by first refining predicted poses against active key centers in MuJoCo, then fitting the model to those refined 46-D poses:
+
+```bash
+python Variations/scripts/generate_contact_refined_labels.py \
+  --model-type mlp_baseline \
+  --checkpoint /path/to/mlp/checkpoints/best.pt \
+  --output /path/to/contact_refinement/mlp_contact_labels.npz \
+  --max-samples 16025 \
+  --max-iter 40
+
+python Variations/scripts/posttrain_contact_refinement.py \
+  --model-type mlp_baseline \
+  --checkpoint /path/to/mlp/checkpoints/best.pt \
+  --labels /path/to/contact_refinement/mlp_contact_labels.npz \
+  --output /path/to/contact_refinement/mlp_baseline_contact.pt
+```
+
+Use `model-type` values `mlp_baseline`, `latent_mdn`, or `diffusion`. The Slurm helper `Variations/slurm/submit_contact_refinement_pipeline.sh` runs the label generation and contact post-training path for all three tuned checkpoints.
+
 Merge evaluation CSVs from different suites and plot grouped bars:
 
 ```bash
@@ -132,36 +151,6 @@ python Variations/scripts/evaluate_latent_mdn.py \
   --latent-mdn-checkpoint Variations/outputs/latent_mdn/mdn/checkpoints/best.pt \
   --mlp-checkpoint Variations/outputs/mlp_baseline/joints/checkpoints/best.pt \
   --diffusion-checkpoint Variations/outputs/diffusion/full/checkpoints/best.pt
-```
-
-## FingerPred Active-Fingertip Model
-
-FingerPred is an additive Variations model family. It does not replace the joint-pose MLP, diffusion, or latent MDN runs. It uses the latent-MDN two-stage architecture for:
-
-```text
-target_keys[88] -> active hand_fingertips[30]
-```
-
-RP1M does not expose explicit fingering labels, so FingerPred derives an `active_tip_mask[10]` by assigning each pressed key to the nearest observed fingertip at the accepted press frame. The model outputs all ten xyz fingertips, but training and primary evaluation metrics are masked to active fingertip coordinates only. FingerPred checkpoints predict fingertip positions, not 46D hand joints, so they are intentionally rejected by the MAESTRO simulation and online rollout tools.
-
-Train with:
-
-```bash
-python Variations/scripts/train_fingerpred.py --config Variations/configs/fingerpred.yaml
-```
-
-Evaluate with:
-
-```bash
-python Variations/scripts/evaluate_fingerpred.py \
-  --config Variations/configs/fingerpred.yaml \
-  --checkpoint Variations/outputs/fingerpred/fingerpred_active_tips_latent16_k3/mdn/checkpoints/best.pt
-```
-
-On Slurm:
-
-```bash
-sbatch Variations/slurm/train_fingerpred.slurm
 ```
 
 ## Outputs

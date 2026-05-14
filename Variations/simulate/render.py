@@ -104,19 +104,14 @@ def rollout_variations_maestro_prediction(
         video_format = None
         audio_warning = None
         played_for_audio = np.stack(played_roll, axis=0) if played_roll else np.zeros((0, 88), dtype=np.float32)
-        try:
-            audio_events = piano_roll_to_midi_events(played_for_audio, dt=control_timestep, threshold=threshold)
-        except ModuleNotFoundError as exc:
-            audio_events = []
-            audio_warning = f"Audio disabled because a playback dependency is unavailable: {exc}"
+        audio_events = piano_roll_to_midi_events(played_for_audio, dt=control_timestep, threshold=threshold)
         if render_error is None:
-            video_path, video_format, write_audio_warning = write_video(
+            video_path, video_format, audio_warning = write_video(
                 frames,
                 output_dir / f"{label}_playback.mp4",
                 fps=max(int(fps / max(render_every, 1)), 1),
                 audio_events=audio_events,
             )
-            audio_warning = audio_warning or write_audio_warning
 
         played = np.stack(played_roll, axis=0) if played_roll else np.zeros((0, 88), dtype=np.float32)
         goal_steps = min(int(goals.shape[0]), int(played.shape[0]))
