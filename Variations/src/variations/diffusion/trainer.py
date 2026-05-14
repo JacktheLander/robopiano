@@ -20,6 +20,8 @@ from variations.diffusion.schedule import GaussianDiffusion
 from variations.utils.config import diffusion_run_root, extraction_root, save_config
 from variations.utils.io import ensure_dir, save_json
 
+JOINT_STATE_DIM = 46
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -126,6 +128,7 @@ def dataset_stats(dataset: PressPairsDataset) -> dict[str, float]:
 def build_model_from_config(config: dict[str, Any]) -> VariationsDenoiser:
     model_cfg = config.get("model", {})
     return VariationsDenoiser(
+        hand_dim=int(model_cfg.get("hand_dim", JOINT_STATE_DIM)),
         hidden_dim=int(model_cfg.get("hidden_dim", 256)),
         num_blocks=int(model_cfg.get("num_blocks", 6)),
         time_dim=int(model_cfg.get("time_dim", 128)),
@@ -227,7 +230,6 @@ def validate(
     model.eval()
     eps_losses = []
     best_x0_mse = []
-    fingertip_l2 = []
     sample_bundle = None
     for batch_idx, batch in enumerate(tqdm(loader, desc="val", leave=False)):
         target_keys = batch["target_keys"].to(device)
@@ -253,37 +255,29 @@ def validate(
         best_idx = mse.argmin(dim=1)
         best = stacked[torch.arange(stacked.shape[0], device=device), best_idx]
         batch_best_mse = mse.min(dim=1).values
-        batch_fingertip_l2 = torch.linalg.norm(best[:, -30:] - truth[:, 0, -30:], dim=1)
         best_x0_mse.extend(batch_best_mse.detach().cpu().tolist())
-        fingertip_l2.extend(batch_fingertip_l2.detach().cpu().tolist())
         if sample_bundle is None and sample_artifact_count > 0:
             n = min(int(sample_artifact_count), stacked.shape[0])
             sample_bundle = {
                 "target_keys": batch["target_keys"][:n].detach().cpu().numpy(),
-                "hand_state_true": batch["hand_state"][:n].detach().cpu().numpy(),
-                "hand_state_samples": stacked[:n].detach().cpu().numpy(),
-                "hand_state_best": best[:n].detach().cpu().numpy(),
+                "joint_state_true": batch["hand_state"][:n].detach().cpu().numpy(),
+                "joint_state_samples": stacked[:n].detach().cpu().numpy(),
+                "joint_state_best": best[:n].detach().cpu().numpy(),
                 "best_sample_index": best_idx[:n].detach().cpu().numpy().astype(np.int32),
                 "x0_mse_best": batch_best_mse[:n].detach().cpu().numpy(),
-                "fingertip_l2": batch_fingertip_l2[:n].detach().cpu().numpy(),
                 "chord_size": batch["target_keys"][:n].sum(dim=1).detach().cpu().numpy(),
             }
         if max_batches is not None and batch_idx + 1 >= max_batches:
             break
     x0_arr = np.asarray(best_x0_mse, dtype=np.float32)
-    fingertip_arr = np.asarray(fingertip_l2, dtype=np.float32)
     metrics = {
         "val_eps_mse": float(np.mean(eps_losses)) if eps_losses else 0.0,
         "val_x0_mse_best_of_k": float(np.mean(x0_arr)) if x0_arr.size else 0.0,
         "val_x0_mse_p50": float(np.percentile(x0_arr, 50)) if x0_arr.size else 0.0,
         "val_x0_mse_p90": float(np.percentile(x0_arr, 90)) if x0_arr.size else 0.0,
-        "val_fingertip_l2_mean": float(np.mean(fingertip_arr)) if fingertip_arr.size else 0.0,
-        "val_fingertip_l2_p50": float(np.percentile(fingertip_arr, 50)) if fingertip_arr.size else 0.0,
-        "val_fingertip_l2_p90": float(np.percentile(fingertip_arr, 90)) if fingertip_arr.size else 0.0,
     }
     if sample_bundle is not None:
         sample_bundle["all_x0_mse_best"] = x0_arr
-        sample_bundle["all_fingertip_l2"] = fingertip_arr
     return ValidationResult(metrics=metrics, sample_bundle=sample_bundle)
 
 
@@ -496,17 +490,14 @@ def _wandb_payload(row: dict[str, Any], validation_result: ValidationResult | No
     bundle = validation_result.sample_bundle
     if "all_x0_mse_best" in bundle:
         payload["val/x0_mse_best_hist"] = wandb.Histogram(bundle["all_x0_mse_best"])
-    if "all_fingertip_l2" in bundle:
-        payload["val/fingertip_l2_hist"] = wandb.Histogram(bundle["all_fingertip_l2"])
-    if {"chord_size", "x0_mse_best", "fingertip_l2"} <= set(bundle.keys()):
-        table = wandb.Table(columns=["idx", "chord_size", "x0_mse_best", "fingertip_l2", "best_sample_index"])
+    if {"chord_size", "x0_mse_best"} <= set(bundle.keys()):
+        table = wandb.Table(columns=["idx", "chord_size", "x0_mse_best", "best_sample_index"])
         count = len(bundle["chord_size"])
         for idx in range(count):
             table.add_data(
                 idx,
                 float(bundle["chord_size"][idx]),
                 float(bundle["x0_mse_best"][idx]),
-                float(bundle["fingertip_l2"][idx]),
                 int(bundle["best_sample_index"][idx]),
             )
         payload["val/sample_error_table"] = table
@@ -539,6 +530,31 @@ def _wandb_log_dir(wandb_run, path: Path, name: str, artifact_type: str, aliases
         print(f"wandb artifact upload failed for {path}; continuing: {exc}")
 
 
+def _resolve_norm_stats_npz(payload: dict[str, Any], config: dict[str, Any]) -> Path:
+    """Pick norm_stats.npz from checkpoint payload or config; repair common lab path typos."""
+    candidates: list[Path] = []
+    raw = payload.get("norm_stats_path")
+    if raw:
+        p = Path(raw)
+        candidates.append(p)
+        s = str(p)
+        typo = "/ccoelho_lab-jlanders/variations_"
+        if typo in s:
+            candidates.append(Path(s.replace(typo, "/ccoelho_lab-jlanders/Variations/variations_", 1)))
+    candidates.append(_extraction_root(config) / "splits" / "norm_stats.npz")
+    seen: set[str] = set()
+    for cand in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        if cand.is_file():
+            return cand
+    raise FileNotFoundError(
+        "norm_stats.npz not found for diffusion checkpoint; tried: " + ", ".join(str(c) for c in candidates)
+    )
+
+
 def load_model_for_inference(checkpoint_path: str | Path, device: torch.device | str = "auto") -> tuple[VariationsDenoiser, GaussianDiffusion, dict[str, Any], np.ndarray, np.ndarray]:
     device = resolve_device(str(device))
     payload = torch.load(checkpoint_path, map_location=device)
@@ -553,7 +569,7 @@ def load_model_for_inference(checkpoint_path: str | Path, device: torch.device |
                 model_state[name].copy_(value.to(device))
     model.eval()
     diffusion = build_diffusion_from_config(config, device)
-    norm_path = Path(payload.get("norm_stats_path") or (_extraction_root(config) / "splits" / "norm_stats.npz"))
+    norm_path = _resolve_norm_stats_npz(payload, config)
     data = np.load(norm_path, allow_pickle=False)
     return model, diffusion, config, np.asarray(data["mean"], dtype=np.float32), np.asarray(data["std"], dtype=np.float32)
 
@@ -577,7 +593,7 @@ def sample_hand_states(
     mean_t = torch.as_tensor(mean, dtype=torch.float32, device=resolved_device)
     std_t = torch.as_tensor(std, dtype=torch.float32, device=resolved_device)
     for _ in range(max(int(num_samples), 1)):
-        sample = diffusion.p_sample_loop(model, (target.shape[0], 76), target, num_inference_steps=steps)
+        sample = diffusion.p_sample_loop(model, (target.shape[0], mean.shape[0]), target, num_inference_steps=steps)
         outputs.append((sample * std_t + mean_t).detach().cpu().numpy())
     return np.stack(outputs, axis=1)
 
@@ -617,7 +633,7 @@ def evaluate_checkpoint(config: dict[str, Any], checkpoint_path: str | Path) -> 
         artifacts / "samples_val.npz",
         samples=samples,
         target_keys=val_dataset.target_keys[:sample_count],
-        hand_state=val_dataset.hand_state[:sample_count],
+        joint_state=val_dataset.hand_state[:sample_count],
     )
     save_json(artifacts / "evaluation_metrics.json", result.metrics)
     return {"metrics": result.metrics, "samples": artifacts / "samples_val.npz"}

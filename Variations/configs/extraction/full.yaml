@@ -4,7 +4,7 @@ rp1m_root: /WAVE/users/unix/jlanders/rp1m_300/rp1m_repertoire.zarr
 outputs:
   root: Variations/outputs
 sampling:
-  num_songs: 500
+  num_songs: 2087
   score_sample_size: 128
   top_k_trajectories: 32
   min_song_key_f1: 0.0
@@ -12,4 +12,3 @@ sampling:
 extraction:
   round_robin_trajectories: true
   deduplicate_unique_goal_keys: true
-

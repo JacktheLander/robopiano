@@ -1,7 +1,7 @@
-experiment_name: medium
-run_name: medium
+experiment_name: full_tuned
+run_name: full_tuned
 seed: 42
-extraction_root: Variations/outputs/extraction/medium
+extraction_root: Variations/outputs/extraction/full
 output_root: Variations/outputs/diffusion
 splits:
   val_fraction: 0.1
@@ -11,7 +11,6 @@ data:
   batch_size: 512
   num_workers: 4
 model:
-  hand_dim: 46
   hidden_dim: 512
   num_blocks: 8
   time_dim: 256
@@ -20,18 +19,18 @@ diffusion:
   timesteps: 1000
   beta_start: 0.0001
   beta_end: 0.02
-  ddim_steps: 50
+  ddim_steps: 75
 training:
-  epochs: 200
-  learning_rate: 0.0001
+  epochs: 300
+  learning_rate: 0.000075
   weight_decay: 0.0001
   warmup_epochs: 5
   amp: true
-  ema_decay: 0.999
+  ema_decay: 0.9995
   val_every: 1
   checkpoint_interval: 5
-  best_of_k: 8
-  max_val_batches: 16
+  best_of_k: 16
+  max_val_batches: 32
   sample_artifact_count: 32
   device: auto
 wandb:
@@ -41,7 +40,8 @@ wandb:
   tags:
     - variations
     - diffusion
-    - joints-only
+    - rp1m-full
+    - tuned
   log_artifacts: true
   watch_model: true
   watch_log: gradients

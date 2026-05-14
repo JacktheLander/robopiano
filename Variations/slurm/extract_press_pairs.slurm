@@ -5,21 +5,23 @@
 #SBATCH --mem=128G
 #SBATCH --time=0-08:00:00
 #SBATCH --chdir=/WAVE/projects/ECEN-524-Wi26/robopiano
-#SBATCH -o /WAVE/datasets/ccoelho_lab-jlanders/variations_extract_%j.out
-#SBATCH -e /WAVE/datasets/ccoelho_lab-jlanders/variations_extract_%j.err
+#SBATCH -o /WAVE/datasets/ccoelho_lab-jlanders/Variations/slurm_logs/variations_extract_%j.out
+#SBATCH -e /WAVE/datasets/ccoelho_lab-jlanders/Variations/slurm_logs/variations_extract_%j.err
 
 set -eo pipefail
 
 source ~/.bashrc
 conda activate sonata
 set -u
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
 export RP1M_300_ROOT=${RP1M_300_ROOT:-/WAVE/users/unix/jlanders/rp1m_300/rp1m_repertoire.zarr}
 export RP1M_ROOT=${RP1M_ROOT:-$RP1M_300_ROOT}
 export RUN_NAME=${RUN_NAME:-variations_extract_${SLURM_JOB_ID:-$(date +%Y%m%d_%H%M%S)}}
-export OUTPUT_ROOT=${OUTPUT_ROOT:-/WAVE/datasets/ccoelho_lab-jlanders/$RUN_NAME}
+export OUTPUT_ROOT=${OUTPUT_ROOT:-/WAVE/datasets/ccoelho_lab-jlanders/Variations/$RUN_NAME}
 export VARIATIONS_OUTPUT_ROOT=${VARIATIONS_OUTPUT_ROOT:-$OUTPUT_ROOT/variations}
+export VARIATIONS_EXTRACT_CONFIG=${VARIATIONS_EXTRACT_CONFIG:-Variations/configs/extraction/medium.yaml}
 
 mkdir -p "$OUTPUT_ROOT" "$VARIATIONS_OUTPUT_ROOT/logs"
-python Variations/scripts/extract_press_pairs.py --config Variations/configs/extraction/medium.yaml \
+python Variations/scripts/extract_press_pairs.py --config "$VARIATIONS_EXTRACT_CONFIG" \
   2>&1 | tee "$VARIATIONS_OUTPUT_ROOT/logs/extract_press_pairs_${SLURM_JOB_ID:-manual}.log"

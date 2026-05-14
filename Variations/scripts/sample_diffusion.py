@@ -20,7 +20,7 @@ def _load_targets(path: Path) -> np.ndarray:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sample hand states from a trained Variations diffusion checkpoint.")
+    parser = argparse.ArgumentParser(description="Sample 46D joint states from a trained Variations diffusion checkpoint.")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--target-keys-file", required=True)
     parser.add_argument("--out", required=True)
@@ -40,7 +40,7 @@ def main() -> None:
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out, target_keys=target_keys, hand_state_samples=samples)
+    np.savez_compressed(out, target_keys=target_keys, joint_state_samples=samples)
     print(f"Saved samples: {out}")
 
 

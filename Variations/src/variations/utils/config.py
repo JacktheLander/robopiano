@@ -87,8 +87,10 @@ def extraction_root(config: dict[str, Any]) -> Path:
 
 
 def diffusion_run_root(config: dict[str, Any]) -> Path:
-    output_root = Path(os.environ.get("VARIATIONS_DIFFUSION_ROOT", ""))
-    if not str(output_root):
+    diffusion_override = os.environ.get("VARIATIONS_DIFFUSION_ROOT")
+    if diffusion_override:
+        output_root = Path(diffusion_override)
+    else:
         variations_root = os.environ.get("VARIATIONS_OUTPUT_ROOT")
         if variations_root:
             output_root = Path(variations_root) / "diffusion"

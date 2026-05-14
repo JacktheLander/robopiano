@@ -1,0 +1,35 @@
+experiment_name: mlp_baseline_fingertips_only
+model_type: fingertip_mlp_baseline
+seed: 42
+extraction_root: Variations/outputs/extraction/full
+splits:
+  val_fraction: 0.1
+  seed: 42
+  min_pairs_per_split: 1000
+data:
+  output_mode: fingertips_only
+  batch_size: 256
+  num_workers: 4
+model:
+  input_dim: 88
+  output_dim: 30
+  hidden_dims: [256, 512, 512, 256]
+  dropout: 0.05
+  activation: gelu
+  hidden_mult: 2
+training:
+  epochs: 200
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  early_stopping_patience: 20
+  device: auto
+loss:
+  fingertips_weight: 1.0
+logging:
+  output_root: Variations/outputs/mlp_baseline
+  run_name: fingertips_only
+  use_wandb: true
+  project: variations
+  tags: [variations, mlp-baseline, fingertips-only]
+

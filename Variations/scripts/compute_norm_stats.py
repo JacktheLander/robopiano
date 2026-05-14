@@ -13,7 +13,7 @@ from variations.data.dataset import compute_norm_stats
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compute train-only hand_state normalization stats.")
+    parser = argparse.ArgumentParser(description="Compute train-only 46D joint-state normalization stats.")
     parser.add_argument("--extraction-root", required=True)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -23,4 +23,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

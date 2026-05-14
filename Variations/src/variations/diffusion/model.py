@@ -46,7 +46,7 @@ class VariationsDenoiser(nn.Module):
         self,
         *,
         target_dim: int = 88,
-        hand_dim: int = 76,
+        hand_dim: int = 46,
         hidden_dim: int = 256,
         num_blocks: int = 6,
         time_dim: int = 128,
@@ -80,4 +80,3 @@ class VariationsDenoiser(nn.Module):
         for block in self.blocks:
             hidden = block(hidden, cond)
         return self.output(hidden)
-

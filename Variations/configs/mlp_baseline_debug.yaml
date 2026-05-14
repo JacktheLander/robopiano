@@ -1,0 +1,35 @@
+# Small MLP run aligned with extraction/debug + diffusion/debug for local smoke tests.
+experiment_name: mlp_baseline_joints_debug
+model_type: mlp_baseline
+seed: 42
+extraction_root: Variations/outputs/extraction/debug
+splits:
+  val_fraction: 0.1
+  seed: 42
+  min_pairs_per_split: 1
+data:
+  output_mode: joints_only
+  batch_size: 64
+  num_workers: 0
+model:
+  input_dim: 88
+  output_dim: 46
+  hidden_dims: [128, 128]
+  dropout: 0.0
+  activation: gelu
+  hidden_mult: 2
+training:
+  epochs: 15
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  early_stopping_patience: 20
+  device: auto
+loss:
+  joints_weight: 1.0
+logging:
+  output_root: Variations/outputs/mlp_baseline
+  run_name: joints_debug
+  use_wandb: false
+  project: variations
+  tags: [variations, mlp-baseline, debug]

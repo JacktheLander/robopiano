@@ -1,0 +1,63 @@
+seed: 42
+model_type: fingerpred
+extraction_root: Variations/outputs/extraction/full
+splits:
+  val_fraction: 0.1
+  seed: 42
+  min_pairs_per_split: 1000
+data:
+  output_mode: fingerpred
+  input_dim: 88
+  target_dim: 30
+  num_workers: 4
+autoencoder:
+  input_dim: 30
+  latent_dim: 16
+  dropout: 0.10
+  training:
+    batch_size: 512
+    epochs: 120
+    learning_rate: 0.0002
+    weight_decay: 0.0005
+    grad_clip_norm: 1.0
+    early_stopping_patience: 12
+    device: auto
+  loss:
+    fingertips_weight: 1.0
+    latent_l2_weight: 0.0003
+mdn:
+  input_dim: 88
+  latent_dim: 16
+  num_components: 3
+  hidden_dim: 384
+  dropout: 0.15
+  min_log_std: -5.0
+  max_log_std: 2.0
+  training:
+    batch_size: 512
+    epochs: 120
+    learning_rate: 0.0001
+    weight_decay: 0.001
+    grad_clip_norm: 1.0
+    early_stopping_patience: 8
+    device: auto
+  loss:
+    mdn_nll_weight: 1.0
+    fingertip_aux_weight: 1.0
+inference:
+  strategy: best_component
+evaluation:
+  split: val
+  max_samples: null
+  device: auto
+logging:
+  output_root: Variations/outputs/fingerpred
+  use_wandb: true
+  project: variations
+  run_name: fingerpred_active_tips_latent16_k3
+  filename: fingerpred_metrics.csv
+  tags:
+    - variations
+    - fingerpred
+    - active-fingertips
+    - latent-mdn
