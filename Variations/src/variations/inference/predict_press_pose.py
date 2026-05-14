@@ -67,6 +67,7 @@ def predict_press_pose(
     model.eval()
     if model_type == "mlp_baseline":
         y_norm = model(target_keys)
+        y_norm = y_norm[:, :JOINT_STATE_DIM]
         return normalizer.denormalize_hand_state(y_norm)
     if model_type == "diffusion":
         if diffusion is None:

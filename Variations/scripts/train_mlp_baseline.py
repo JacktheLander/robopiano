@@ -15,11 +15,27 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 VARIATIONS_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = VARIATIONS_ROOT.parent
 SRC_ROOT = VARIATIONS_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
+for _path in (VARIATIONS_ROOT, REPO_ROOT):
+    _text = str(_path)
+    if _text not in sys.path:
+        sys.path.insert(0, _text)
 
-from variations.data.dataset import PressPairsDataset, build_splits, compute_norm_stats
+from variations.data.dataset import (
+    EXTRACTED_HAND_STATE_DIM,
+    FINGERTIP_STATE_DIM,
+    JOINT_STATE_DIM,
+    PressPairsDataset,
+    build_splits,
+    compute_fingerpred_norm_stats,
+    compute_joint_fingertip_norm_stats,
+    compute_norm_stats,
+    norm_stats_path_for_mode,
+)
+from variations.data.fingerpred import canonical_piano_key_positions
 from variations.inference.predict_press_pose import HandStateNormalizer
 from variations.losses.supervised_pose_loss import supervised_pose_loss
 from variations.models.mlp_baseline import build_mlp_baseline
@@ -92,6 +108,7 @@ class MetricsWriter:
 def prepare_datasets(config: dict[str, Any]) -> tuple[PressPairsDataset, PressPairsDataset, Path]:
     root = extraction_root(config)
     split_cfg = config.get("splits", {})
+    output_mode = str(config.get("data", {}).get("output_mode", "joints_only"))
     if not (root / "splits" / "split_index.csv").exists():
         build_splits(
             root,
@@ -99,24 +116,85 @@ def prepare_datasets(config: dict[str, Any]) -> tuple[PressPairsDataset, PressPa
             seed=int(split_cfg.get("seed", 42)),
             min_pairs_per_split=int(split_cfg.get("min_pairs_per_split", 1000)),
         )
-    norm_path = root / "splits" / "norm_stats.npz"
-    if not norm_path.exists():
+    norm_path = norm_stats_path_for_mode(root, output_mode)
+    if output_mode == "joints_with_fingertips":
+        norm_path = compute_joint_fingertip_norm_stats(root)
+        key_positions = canonical_piano_key_positions()
+    elif output_mode == "fingerpred":
+        key_positions = canonical_piano_key_positions()
+        norm_path = compute_fingerpred_norm_stats(root, key_positions=key_positions)
+    else:
+        key_positions = None
         compute_norm_stats(root)
-    train_dataset = PressPairsDataset(root, split="train", norm_stats_path=norm_path, assert_unique_goals=True)
-    val_dataset = PressPairsDataset(root, split="val", norm_stats_path=norm_path, assert_unique_goals=True)
+        norm_path = root / "splits" / "norm_stats.npz"
+    train_dataset = PressPairsDataset(
+        root,
+        split="train",
+        norm_stats_path=norm_path,
+        assert_unique_goals=True,
+        output_mode=output_mode,
+        key_positions=key_positions,
+    )
+    val_dataset = PressPairsDataset(
+        root,
+        split="val",
+        norm_stats_path=norm_path,
+        assert_unique_goals=True,
+        output_mode=output_mode,
+        key_positions=key_positions,
+    )
     return train_dataset, val_dataset, norm_path
 
 
 def batch_target(batch: dict[str, torch.Tensor], device: torch.device) -> torch.Tensor:
-    return batch["hand_state_normalized"].to(device)
+    return batch["target_state_normalized"].to(device)
 
 
-def compute_loss(pred: torch.Tensor, target: torch.Tensor, loss_cfg: dict[str, Any]) -> dict[str, torch.Tensor]:
-    return supervised_pose_loss(
-        pred,
-        target,
-        joints_weight=float(loss_cfg.get("joints_weight", 1.0)),
+def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    typed_mask = mask.to(device=pred.device, dtype=pred.dtype)
+    return (((pred - target) ** 2) * typed_mask).sum() / typed_mask.sum().clamp_min(1.0)
+
+
+def compute_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    batch: dict[str, torch.Tensor],
+    loss_cfg: dict[str, Any],
+    *,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    if pred.shape[1] == JOINT_STATE_DIM:
+        return supervised_pose_loss(
+            pred,
+            target[:, :JOINT_STATE_DIM],
+            joints_weight=float(loss_cfg.get("joints_weight", 1.0)),
+        )
+    if pred.shape[1] != EXTRACTED_HAND_STATE_DIM:
+        raise ValueError(f"Expected MLP output width 46 or 76, got {pred.shape[1]}")
+
+    joint_loss = torch.nn.functional.mse_loss(pred[:, :JOINT_STATE_DIM], target[:, :JOINT_STATE_DIM])
+    fingertip_norm_loss = masked_mse(
+        pred[:, JOINT_STATE_DIM:EXTRACTED_HAND_STATE_DIM],
+        target[:, JOINT_STATE_DIM:EXTRACTED_HAND_STATE_DIM],
+        batch["active_tip_mask"].repeat_interleave(3, dim=1).to(pred.device),
     )
+    pred_denorm = pred * std.to(pred.device, pred.dtype) + mean.to(pred.device, pred.dtype)
+    pred_tips = pred_denorm[:, JOINT_STATE_DIM:EXTRACTED_HAND_STATE_DIM]
+    key_targets = batch["active_key_fingertip_targets"].to(pred.device, pred.dtype)
+    coord_mask = batch["active_tip_mask"].repeat_interleave(3, dim=1).to(pred.device, pred.dtype)
+    contact_loss = masked_mse(pred_tips, key_targets, coord_mask)
+    loss = (
+        float(loss_cfg.get("joints_weight", 1.0)) * joint_loss
+        + float(loss_cfg.get("active_fingertip_weight", 1.0)) * fingertip_norm_loss
+        + float(loss_cfg.get("target_key_contact_weight", 1.0)) * contact_loss
+    )
+    return {
+        "loss": loss,
+        "joint_loss": joint_loss,
+        "active_fingertip_loss": fingertip_norm_loss,
+        "target_key_contact_loss": contact_loss,
+    }
 
 
 def denormalized_metrics(
@@ -124,7 +202,7 @@ def denormalized_metrics(
     true_joint: torch.Tensor,
     normalizer: HandStateNormalizer,
 ) -> dict[str, float]:
-    pred_joint = normalizer.denormalize_hand_state(pred_norm)
+    pred_joint = normalizer.denormalize_hand_state(pred_norm[:, :JOINT_STATE_DIM])
     diff = pred_joint - true_joint
     return {
         "denormalized_pose_mse": float((diff * diff).mean().detach().cpu().item()),
@@ -140,6 +218,8 @@ def run_epoch(
     device: torch.device,
     normalizer: HandStateNormalizer,
     loss_cfg: dict[str, Any],
+    target_mean: torch.Tensor,
+    target_std: torch.Tensor,
     grad_clip_norm: float | None = None,
 ) -> dict[str, float]:
     train = optimizer is not None
@@ -152,7 +232,7 @@ def run_epoch(
         if train:
             optimizer.zero_grad(set_to_none=True)
         pred = model(target_keys)
-        loss_dict = compute_loss(pred, target, loss_cfg)
+        loss_dict = compute_loss(pred, target, batch, loss_cfg, mean=target_mean, std=target_std)
         if train:
             loss_dict["loss"].backward()
             if grad_clip_norm is not None and grad_clip_norm > 0:
@@ -218,7 +298,7 @@ def checkpoint_payload(
         "config": config,
         "normalizer": normalizer.state_dict(),
         "model_type": config.get("model_type", "mlp_baseline"),
-        "output_mode": "joints_only",
+        "output_mode": str(config.get("data", {}).get("output_mode", "joints_only")),
     }
 
 
@@ -258,6 +338,9 @@ def main() -> None:
         val_dataset = Subset(val_dataset, range(min(args.max_val_samples, len(val_dataset))))
 
     normalizer = HandStateNormalizer.from_npz(norm_path, device=device)
+    norm_data = np.load(norm_path, allow_pickle=False)
+    target_mean = torch.as_tensor(np.asarray(norm_data["mean"], dtype=np.float32), device=device)
+    target_std = torch.as_tensor(np.asarray(norm_data["std"], dtype=np.float32), device=device)
     model = build_mlp_baseline(config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -279,6 +362,7 @@ def main() -> None:
         "train_pairs": len(train_dataset),
         "val_pairs": len(val_dataset),
         "output_mode": "joints_only",
+        "training_target_dim": int(target_mean.shape[0]),
     })
 
     wandb_run = maybe_start_wandb(config, run_root)
@@ -306,6 +390,8 @@ def main() -> None:
             device=device,
             normalizer=normalizer,
             loss_cfg=config.get("loss", {}),
+            target_mean=target_mean,
+            target_std=target_std,
             grad_clip_norm=grad_clip,
         )
         with torch.no_grad():
@@ -316,6 +402,8 @@ def main() -> None:
                 device=device,
                 normalizer=normalizer,
                 loss_cfg=config.get("loss", {}),
+                target_mean=target_mean,
+                target_std=target_std,
             )
         speed = inference_ms_per_sample(model, val_dataset.dataset if isinstance(val_dataset, Subset) else val_dataset, device)
         row = {

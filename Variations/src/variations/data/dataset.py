@@ -95,17 +95,30 @@ def _song_npz_path(extraction_root: Path, row: dict[str, str]) -> Path:
 
 def normalize_output_mode(output_mode: str | None) -> str:
     value = str(output_mode or "joints_only").strip().lower()
-    aliases = {"joint": "joints_only", "joints": "joints_only", "active_fingertips": "fingerpred"}
+    aliases = {
+        "joint": "joints_only",
+        "joints": "joints_only",
+        "joint_fingertips": "joints_with_fingertips",
+        "joints_fingertips": "joints_with_fingertips",
+        "active_fingertips": "fingerpred",
+    }
     value = aliases.get(value, value)
-    if value not in {"joints_only", "fingerpred"}:
-        raise ValueError(f"Unsupported output_mode {output_mode!r}; expected joints_only or fingerpred.")
+    if value not in {"joints_only", "joints_with_fingertips", "fingerpred"}:
+        raise ValueError(
+            f"Unsupported output_mode {output_mode!r}; expected joints_only, joints_with_fingertips, or fingerpred."
+        )
     return value
 
 
 def norm_stats_path_for_mode(extraction_root: str | Path, output_mode: str) -> Path:
     root = Path(extraction_root)
     mode = normalize_output_mode(output_mode)
-    name = "norm_stats.npz" if mode == "joints_only" else "norm_stats_fingerpred.npz"
+    if mode == "joints_only":
+        name = "norm_stats.npz"
+    elif mode == "joints_with_fingertips":
+        name = "norm_stats_joints_fingertips.npz"
+    else:
+        name = "norm_stats_fingerpred.npz"
     return root / "splits" / name
 
 
@@ -183,6 +196,33 @@ def compute_fingerpred_norm_stats(
     return out
 
 
+def compute_joint_fingertip_norm_stats(extraction_root: str | Path, *, force: bool = False) -> Path:
+    root = Path(extraction_root)
+    out = ensure_dir(root / "splits") / "norm_stats_joints_fingertips.npz"
+    if out.exists() and not force:
+        mean, _std = load_norm_stats(out, expected_dim=EXTRACTED_HAND_STATE_DIM)
+        if mean.shape[0] == EXTRACTED_HAND_STATE_DIM:
+            return out
+    rows = [row for row in load_split_index(root) if row["split"] == "train"]
+    chunks = []
+    for row in rows:
+        path = _song_npz_path(root, row)
+        if not path.exists():
+            continue
+        data = np.load(path, allow_pickle=False)
+        full_hand = np.asarray(data["hand_state"], dtype=np.float32)
+        if full_hand.shape[1] >= EXTRACTED_HAND_STATE_DIM:
+            chunks.append(full_hand[:, :EXTRACTED_HAND_STATE_DIM])
+    if not chunks:
+        raise RuntimeError(f"No train joint+fingertip rows found under {root}")
+    arr = np.concatenate(chunks, axis=0)
+    mean = arr.mean(axis=0).astype(np.float32)
+    std = arr.std(axis=0).astype(np.float32)
+    std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
+    np.savez_compressed(out, mean=mean, std=std, state_dim=np.asarray(EXTRACTED_HAND_STATE_DIM, dtype=np.int32), output_mode="joints_with_fingertips")
+    return out
+
+
 def load_norm_stats(path: str | Path, *, expected_dim: int | None = JOINT_STATE_DIM) -> tuple[np.ndarray, np.ndarray]:
     data = np.load(path, allow_pickle=False)
     mean = np.asarray(data["mean"], dtype=np.float32)
@@ -211,6 +251,39 @@ def split_target_coverage(train_targets: np.ndarray, val_targets: np.ndarray) ->
     return float(hits / max(len(val_targets), 1))
 
 
+def _assigned_key_targets(
+    target_keys: np.ndarray,
+    fingertip_state: np.ndarray,
+    active_tip_mask: np.ndarray,
+    key_positions: np.ndarray,
+) -> np.ndarray:
+    keys = np.asarray(target_keys, dtype=np.float32)
+    tips = np.asarray(fingertip_state, dtype=np.float32).reshape(-1, 10, 3)
+    mask = np.asarray(active_tip_mask, dtype=np.float32) > 0.5
+    positions = np.asarray(key_positions, dtype=np.float32)
+    out = np.zeros((tips.shape[0], FINGERTIP_STATE_DIM), dtype=np.float32)
+    for row_idx in range(tips.shape[0]):
+        active_keys = np.flatnonzero(keys[row_idx, :88] > 0.5)
+        active_tips = np.flatnonzero(mask[row_idx])
+        if active_keys.size == 0 or active_tips.size == 0:
+            continue
+        row_tips = tips[row_idx, active_tips]
+        key_xyz = positions[active_keys]
+        cost = np.linalg.norm(row_tips[:, None, :2] - key_xyz[None, :, :2], axis=2)
+        try:
+            from scipy.optimize import linear_sum_assignment
+
+            tip_sel, key_sel = linear_sum_assignment(cost)
+            pairs = zip(active_tips[tip_sel], active_keys[key_sel])
+        except Exception:
+            nearest = np.argmin(cost, axis=1)
+            pairs = zip(active_tips, active_keys[nearest])
+        for tip_idx, key_idx in pairs:
+            start = int(tip_idx) * 3
+            out[row_idx, start : start + 3] = positions[int(key_idx)]
+    return out
+
+
 class PressPairsDataset(Dataset):
     def __init__(
         self,
@@ -230,7 +303,9 @@ class PressPairsDataset(Dataset):
         hands: list[np.ndarray] = []
         fingertips: list[np.ndarray] = []
         active_masks: list[np.ndarray] = []
+        active_key_targets: list[np.ndarray] = []
         song_ids = []
+        key_positions_arr = None if key_positions is None else np.asarray(key_positions, dtype=np.float32)
         for row in split_rows:
             path = _song_npz_path(self.extraction_root, row)
             if not path.exists():
@@ -248,8 +323,15 @@ class PressPairsDataset(Dataset):
             targets.append(target)
             hands.append(hand)
             fingertips.append(fingertip)
-            if self.output_mode == "fingerpred":
-                active_masks.append(infer_active_tip_mask(target, fingertip, key_positions=key_positions))
+            if self.output_mode in {"fingerpred", "joints_with_fingertips"}:
+                mask = infer_active_tip_mask(target, fingertip, key_positions=key_positions_arr)
+                active_masks.append(mask)
+                if self.output_mode == "joints_with_fingertips":
+                    if key_positions_arr is None:
+                        from variations.data.fingerpred import canonical_piano_key_positions
+
+                        key_positions_arr = canonical_piano_key_positions()
+                    active_key_targets.append(_assigned_key_targets(target, fingertip, mask, key_positions_arr))
             song_ids.extend([str(row["song_id"])] * target.shape[0])
         if targets:
             self.target_keys = np.concatenate(targets, axis=0).astype(np.float32)
@@ -264,6 +346,11 @@ class PressPairsDataset(Dataset):
             if active_masks
             else np.zeros((self.target_keys.shape[0], 10), dtype=np.float32)
         )
+        self.active_key_fingertip_targets = (
+            np.concatenate(active_key_targets, axis=0).astype(np.float32)
+            if active_key_targets
+            else np.zeros((self.target_keys.shape[0], FINGERTIP_STATE_DIM), dtype=np.float32)
+        )
         self.song_ids = np.asarray(song_ids)
         if assert_unique_goals:
             seen = set()
@@ -274,7 +361,12 @@ class PressPairsDataset(Dataset):
                 seen.add(fp)
         if norm_stats_path is None:
             norm_stats_path = norm_stats_path_for_mode(self.extraction_root, self.output_mode)
-        expected_dim = JOINT_STATE_DIM if self.output_mode == "joints_only" else FINGERTIP_STATE_DIM
+        if self.output_mode == "joints_only":
+            expected_dim = JOINT_STATE_DIM
+        elif self.output_mode == "joints_with_fingertips":
+            expected_dim = EXTRACTED_HAND_STATE_DIM
+        else:
+            expected_dim = FINGERTIP_STATE_DIM
         self.mean, self.std = load_norm_stats(norm_stats_path, expected_dim=expected_dim)
         if self.mean.shape[0] != expected_dim:
             raise ValueError(
@@ -285,6 +377,14 @@ class PressPairsDataset(Dataset):
             self.target_coord_mask = np.ones_like(self.hand_state, dtype=np.float32)
             self.hand_state_normalized = ((self.hand_state - self.mean) / self.std).astype(np.float32)
             self.target_state_normalized = self.hand_state_normalized
+        elif self.output_mode == "joints_with_fingertips":
+            self.target_state = np.concatenate([self.hand_state, self.fingertip_state], axis=1).astype(np.float32)
+            self.target_coord_mask = np.concatenate(
+                [np.ones_like(self.hand_state, dtype=np.float32), coord_mask_from_tip_mask(self.active_tip_mask)],
+                axis=1,
+            ).astype(np.float32)
+            self.target_state_normalized = ((self.target_state - self.mean) / self.std).astype(np.float32)
+            self.hand_state_normalized = self.target_state_normalized[:, :JOINT_STATE_DIM]
         else:
             self.target_state = self.fingertip_state
             self.target_coord_mask = coord_mask_from_tip_mask(self.active_tip_mask)
@@ -305,6 +405,7 @@ class PressPairsDataset(Dataset):
             "target_state": torch.from_numpy(self.target_state[index]),
             "target_state_normalized": torch.from_numpy(self.target_state_normalized[index]),
             "active_tip_mask": torch.from_numpy(self.active_tip_mask[index]),
+            "active_key_fingertip_targets": torch.from_numpy(self.active_key_fingertip_targets[index]),
             "target_coord_mask": torch.from_numpy(self.target_coord_mask[index]),
         }
         if self.output_mode == "joints_only":

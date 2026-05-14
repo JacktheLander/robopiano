@@ -7,12 +7,12 @@ splits:
   seed: 42
   min_pairs_per_split: 1000
 data:
-  output_mode: joints_only
+  output_mode: joints_with_fingertips
   batch_size: 512
   num_workers: 4
 model:
   input_dim: 88
-  output_dim: 46
+  output_dim: 76
   hidden_dims: [192, 384, 384, 192]
   dropout: 0.15
   activation: gelu
@@ -26,6 +26,8 @@ training:
   device: auto
 loss:
   joints_weight: 1.0
+  active_fingertip_weight: 2.0
+  target_key_contact_weight: 5.0
 logging:
   output_root: Variations/outputs/mlp_baseline
   run_name: joints_tuned
