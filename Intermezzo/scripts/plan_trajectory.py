@@ -103,7 +103,10 @@ def main() -> None:
         waypoint_hand_joints=plan.waypoint_hand_joints,
         planned_hand_joints=plan.planned_hand_joints,
         planned_hand_velocities=plan.planned_hand_velocities,
+        planned_hand_joints_dense=plan.planned_hand_joints_dense,
+        planned_hand_velocities_dense=plan.planned_hand_velocities_dense,
         segment_ids=plan.segment_ids,
+        segment_ids_dense=plan.segment_ids_dense,
     )
 
     metadata: dict[str, Any] = {

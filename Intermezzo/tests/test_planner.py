@@ -13,7 +13,13 @@ if str(SRC) not in sys.path:
 from intermezzo.constants import LEFT_FOREARM_TY_INDEX, RIGHT_FOREARM_TY_INDEX  # noqa: E402
 from intermezzo.io import create_unique_run_dir  # noqa: E402
 from intermezzo.keys import active_hands_for_transition, extract_waypoint_frames, keyset_hand_sides  # noqa: E402
-from intermezzo.planner import PlannerConfig, build_intermezzo_trajectory, plan_between_waypoints  # noqa: E402
+from intermezzo.planner import (  # noqa: E402
+    PlannerConfig,
+    _apply_press_windows,
+    _interpolate_segment_dense,
+    build_intermezzo_trajectory,
+    plan_between_waypoints,
+)
 import pytest
 
 
@@ -93,13 +99,13 @@ def test_right_hand_clearance_lifts_only_active_side_and_clamps() -> None:
     )
 
     assert float(planned[:, RIGHT_FOREARM_TY_INDEX].max()) <= 0.06
-    assert float(planned[2, RIGHT_FOREARM_TY_INDEX]) > float(max(sanitized[0, RIGHT_FOREARM_TY_INDEX], sanitized[1, RIGHT_FOREARM_TY_INDEX]) - 1e-6)
+    assert float(planned[1, RIGHT_FOREARM_TY_INDEX]) > float(sanitized[0, RIGHT_FOREARM_TY_INDEX])
     assert float(planned[:, LEFT_FOREARM_TY_INDEX].max()) <= 0.02
     np.testing.assert_allclose(planned[0], sanitized[0])
     np.testing.assert_allclose(planned[6], sanitized[1])
 
 
-def test_cross_hand_transition_lifts_both_hands() -> None:
+def test_press_windows_use_waypoint_active_hands() -> None:
     frames = np.asarray([0, 6], dtype=np.int64)
     target_keys = np.stack([_row(10), _row(60)], axis=0)
     waypoints = np.zeros((2, 46), dtype=np.float32)
@@ -114,8 +120,8 @@ def test_cross_hand_transition_lifts_both_hands() -> None:
         config=PlannerConfig(clearance_height=0.02),
     )
 
-    assert float(planned[2, RIGHT_FOREARM_TY_INDEX]) > float(sanitized[0, RIGHT_FOREARM_TY_INDEX])
-    assert float(planned[2, LEFT_FOREARM_TY_INDEX]) > float(sanitized[0, LEFT_FOREARM_TY_INDEX])
+    assert float(planned[1, LEFT_FOREARM_TY_INDEX]) > float(sanitized[0, LEFT_FOREARM_TY_INDEX])
+    np.testing.assert_allclose(planned[6], sanitized[1])
 
 
 def test_build_intermezzo_trajectory_with_mock_predictor() -> None:
@@ -134,8 +140,89 @@ def test_build_intermezzo_trajectory_with_mock_predictor() -> None:
     assert plan.waypoint_hand_joints.shape == (2, 46)
     assert plan.planned_hand_joints.shape == (5, 46)
     assert plan.planned_hand_velocities.shape == (5, 46)
+    assert plan.planned_hand_joints_dense.shape == (50, 46)
+    assert plan.planned_hand_velocities_dense.shape == (50, 46)
+    assert plan.metadata["intermezzo_planned_timestep_count"] == 5
+    assert plan.metadata["intermezzo_target_state_count"] == 2
+    assert plan.metadata["intermezzo_interpolated_timestep_count"] == 3
+    assert plan.metadata["intermezzo_upsampling_factor"] == 2.5
+    assert plan.metadata["intermezzo_internal_planned_timestep_count"] == 50
+    assert plan.metadata["intermezzo_internal_upsampling_factor"] == 25.0
+    assert plan.metadata["planned_hand_joints_dense_shape"] == [50, 46]
+    assert plan.metadata["dense_control_timestep"] == 0.005
     np.testing.assert_allclose(plan.planned_hand_joints[1], plan.waypoint_hand_joints[0])
     np.testing.assert_allclose(plan.planned_hand_joints[3], plan.waypoint_hand_joints[1])
+
+
+def test_dense_interpolation_uses_internal_substeps() -> None:
+    dense = np.zeros((9, 46), dtype=np.float32)
+    segment_ids = np.full((9,), -1, dtype=np.int32)
+    q0 = np.zeros((46,), dtype=np.float32)
+    q1 = np.ones((46,), dtype=np.float32)
+
+    _interpolate_segment_dense(dense, segment_ids, segment_index=0, start=0, end=8, q0=q0, q1=q1)
+
+    assert np.unique(dense[:, 0]).size == 9
+    np.testing.assert_array_equal(segment_ids, np.zeros((9,), dtype=np.int32))
+
+
+def test_press_window_is_centered_on_waypoint_frame() -> None:
+    cfg = PlannerConfig(interpolation_substeps=8, press_approach_s=0.05, press_hold_s=0.0, press_release_s=0.05)
+    dense = np.zeros((17, 46), dtype=np.float32)
+    dense[:, RIGHT_FOREARM_TY_INDEX] = 0.05
+    waypoints = np.zeros((1, 46), dtype=np.float32)
+    waypoints[0, RIGHT_FOREARM_TY_INDEX] = 0.01
+
+    _apply_press_windows(
+        dense,
+        waypoint_frames_dense=np.asarray([8], dtype=np.int64),
+        waypoint_target_keys=np.stack([_row(60)], axis=0),
+        waypoint_hand_joints=waypoints,
+        config=cfg,
+    )
+
+    np.testing.assert_allclose(dense[8, RIGHT_FOREARM_TY_INDEX], waypoints[0, RIGHT_FOREARM_TY_INDEX])
+    preceding = dense[4:9, RIGHT_FOREARM_TY_INDEX]
+    assert np.all(np.diff(preceding) <= 1e-6)
+
+
+def test_press_windows_preserve_all_waypoint_channels() -> None:
+    cfg = PlannerConfig(interpolation_substeps=8, press_approach_s=0.05, press_hold_s=0.0, press_release_s=0.05)
+    dense = np.zeros((33, 46), dtype=np.float32)
+    waypoints = np.zeros((2, 46), dtype=np.float32)
+    waypoints[0, LEFT_FOREARM_TY_INDEX] = 0.01
+    waypoints[1, RIGHT_FOREARM_TY_INDEX] = 0.02
+    waypoints[1, LEFT_FOREARM_TY_INDEX] = 0.0
+
+    _apply_press_windows(
+        dense,
+        waypoint_frames_dense=np.asarray([8, 24], dtype=np.int64),
+        waypoint_target_keys=np.stack([_row(10), _row(60)], axis=0),
+        waypoint_hand_joints=waypoints,
+        config=cfg,
+    )
+
+    np.testing.assert_allclose(dense[8], waypoints[0])
+    np.testing.assert_allclose(dense[24], waypoints[1])
+
+
+def test_press_depth_pushes_active_waypoint_forearm_down() -> None:
+    cfg = PlannerConfig(interpolation_substeps=8, press_depth=0.015)
+    dense = np.zeros((9, 46), dtype=np.float32)
+    waypoints = np.zeros((1, 46), dtype=np.float32)
+    waypoints[0, RIGHT_FOREARM_TY_INDEX] = 0.03
+    waypoints[0, LEFT_FOREARM_TY_INDEX] = 0.03
+
+    _apply_press_windows(
+        dense,
+        waypoint_frames_dense=np.asarray([4], dtype=np.int64),
+        waypoint_target_keys=np.stack([_row(60)], axis=0),
+        waypoint_hand_joints=waypoints,
+        config=cfg,
+    )
+
+    assert dense[4, RIGHT_FOREARM_TY_INDEX] == pytest.approx(0.015)
+    assert dense[4, LEFT_FOREARM_TY_INDEX] == pytest.approx(0.03)
 
 
 def test_build_intermezzo_trajectory_passes_batch_size_when_supported() -> None:
