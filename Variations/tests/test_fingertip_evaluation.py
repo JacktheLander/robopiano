@@ -54,7 +54,9 @@ def test_fingertip_metrics_success_thresholds() -> None:
 
     assert metrics["fingertip_examples"] == 2.0
     assert metrics["fingertip_rmse"] > 0.0
+    assert np.isclose(metrics["fingertip_per_tip_width_distance_mean"], 0.001)
     assert metrics["fingertip_success_at_0p01"] == 0.5
+    assert metrics["fingertip_width_success_at_0p01"] == 0.5
     assert metrics["fingertip_success_at_0p03"] == 1.0
 
 
@@ -131,4 +133,3 @@ def test_measure_fingertips_with_mujoco_restores_each_pose(monkeypatch, tmp_path
     assert measured.shape == (2, 30)
     np.testing.assert_array_equal(measured[0, :15], right.reshape(-1))
     np.testing.assert_array_equal(measured[0, 15:], left.reshape(-1))
-

@@ -11,11 +11,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from intermezzo.constants import LEFT_FOREARM_TY_INDEX, RIGHT_FOREARM_TY_INDEX  # noqa: E402
+from intermezzo.kinematics import FakeHandKinematics  # noqa: E402
 from intermezzo.io import create_unique_run_dir  # noqa: E402
 from intermezzo.keys import active_hands_for_transition, extract_waypoint_frames, keyset_hand_sides  # noqa: E402
 from intermezzo.planner import (  # noqa: E402
     PlannerConfig,
     _apply_press_windows,
+    _apply_selected_finger_z_windows,
     _interpolate_segment_dense,
     build_intermezzo_trajectory,
     plan_between_waypoints,
@@ -85,7 +87,7 @@ def test_plan_preserves_waypoint_endpoints_and_velocity_shape() -> None:
 
 def test_right_hand_clearance_lifts_only_active_side_and_clamps() -> None:
     frames = np.asarray([0, 6], dtype=np.int64)
-    target_keys = np.stack([_row(50), _row(51)], axis=0)
+    target_keys = np.stack([_row(50), _row(10)], axis=0)
     waypoints = np.zeros((2, 46), dtype=np.float32)
     waypoints[:, RIGHT_FOREARM_TY_INDEX] = [0.055, 0.06]
     waypoints[:, LEFT_FOREARM_TY_INDEX] = [0.01, 0.02]
@@ -122,6 +124,38 @@ def test_press_windows_use_waypoint_active_hands() -> None:
 
     assert float(planned[1, LEFT_FOREARM_TY_INDEX]) > float(sanitized[0, LEFT_FOREARM_TY_INDEX])
     np.testing.assert_allclose(planned[6], sanitized[1])
+
+
+def test_selected_finger_z_windows_do_not_move_unselected_finger_or_forearm() -> None:
+    cfg = PlannerConfig(
+        interpolation_substeps=8,
+        press_approach_s=0.05,
+        press_hold_s=0.0,
+        press_release_s=0.05,
+        ik_max_delta_q=0.05,
+        ik_iterations_per_frame=1,
+    )
+    dense = np.zeros((17, 46), dtype=np.float32)
+    waypoints = np.zeros((1, 46), dtype=np.float32)
+    # In FakeHandKinematics, right index fingertip 1 uses hand-state coordinates 2 and 3.
+    waypoints[0, 2] = 0.0
+    waypoints[0, 3] = -0.02
+    key_xy = np.zeros((88, 2), dtype=np.float32)
+    key_xy[60] = [0.0, -0.02]
+
+    corrected = _apply_selected_finger_z_windows(
+        dense,
+        waypoint_frames_dense=np.asarray([8], dtype=np.int64),
+        waypoint_target_keys=np.stack([_row(60)], axis=0),
+        waypoint_hand_joints=waypoints,
+        config=cfg,
+        key_geometry=key_xy,
+        kinematics=FakeHandKinematics(),
+    )
+
+    assert float(corrected[7, 3]) < 0.0
+    np.testing.assert_allclose(corrected[7, [0, 1, RIGHT_FOREARM_TY_INDEX, LEFT_FOREARM_TY_INDEX]], 0.0)
+    np.testing.assert_allclose(corrected[8], waypoints[0])
 
 
 def test_build_intermezzo_trajectory_with_mock_predictor() -> None:
@@ -204,6 +238,31 @@ def test_press_windows_preserve_all_waypoint_channels() -> None:
 
     np.testing.assert_allclose(dense[8], waypoints[0])
     np.testing.assert_allclose(dense[24], waypoints[1])
+
+
+def test_press_windows_keep_same_hand_pressed_between_sustained_waypoints() -> None:
+    cfg = PlannerConfig(
+        interpolation_substeps=10,
+        press_approach_s=0.04,
+        press_hold_s=0.01,
+        press_release_s=0.04,
+        clearance_height=0.02,
+    )
+    dense = np.zeros((70, 46), dtype=np.float32)
+    dense[:, RIGHT_FOREARM_TY_INDEX] = 0.03
+    waypoints = np.zeros((2, 46), dtype=np.float32)
+    waypoints[:, RIGHT_FOREARM_TY_INDEX] = 0.01
+
+    _apply_press_windows(
+        dense,
+        waypoint_frames_dense=np.asarray([10, 50], dtype=np.int64),
+        waypoint_target_keys=np.stack([_row(60), _row(60, 61)], axis=0),
+        waypoint_hand_joints=waypoints,
+        config=cfg,
+    )
+
+    np.testing.assert_allclose(dense[10:51, RIGHT_FOREARM_TY_INDEX], 0.01)
+    assert float(dense[55, RIGHT_FOREARM_TY_INDEX]) > 0.01
 
 
 def test_press_depth_pushes_active_waypoint_forearm_down() -> None:

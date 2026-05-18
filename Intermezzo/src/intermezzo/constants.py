@@ -13,3 +13,18 @@ FOREARM_TY_INDICES = (RIGHT_FOREARM_TY_INDEX, LEFT_FOREARM_TY_INDEX)
 FOREARM_TY_MIN = 0.0
 FOREARM_TY_MAX = 0.06
 KEY_SPLIT_LEFT_RIGHT = 44
+
+# Fingertip order is right thumb/index/middle/ring/little, then left thumb/index/middle/ring/little.
+# These are the reduced hand-state joint indices that belong to each finger, excluding wrist and forearm joints.
+FINGER_JOINT_INDICES = (
+ (18, 19, 20),
+ (2, 3, 4, 5),
+ (6, 7, 8, 9),
+ (10, 11, 12, 13),
+ (14, 15, 16, 17),
+ (41, 42, 43),
+ (25, 26, 27, 28),
+ (29, 30, 31, 32),
+ (33, 34, 35, 36),
+ (37, 38, 39, 40),
+)

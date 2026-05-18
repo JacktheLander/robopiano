@@ -44,6 +44,7 @@ def fingertip_metrics(
     linear = abs_diff - quadratic
     huber = 0.5 * quadratic * quadratic + delta * linear
     per_tip_dist = np.linalg.norm(diff.reshape(steps, -1, 3), axis=2)
+    per_tip_width_dist = np.abs(diff.reshape(steps, -1, 3)[:, :, 0])
 
     out = {
         f"{prefix}_examples": float(steps),
@@ -53,11 +54,16 @@ def fingertip_metrics(
         f"{prefix}_per_tip_distance_mean": float(np.mean(per_tip_dist)),
         f"{prefix}_per_tip_distance_median": float(np.median(per_tip_dist)),
         f"{prefix}_per_tip_distance_p95": float(np.percentile(per_tip_dist, 95)),
+        f"{prefix}_per_tip_width_distance_mean": float(np.mean(per_tip_width_dist)),
+        f"{prefix}_per_tip_width_distance_median": float(np.median(per_tip_width_dist)),
+        f"{prefix}_per_tip_width_distance_p95": float(np.percentile(per_tip_width_dist, 95)),
     }
     per_example_max = np.max(per_tip_dist, axis=1)
+    per_example_width_max = np.max(per_tip_width_dist, axis=1)
     for threshold in success_thresholds:
         key = str(threshold).replace(".", "p")
         out[f"{prefix}_success_at_{key}"] = float(np.mean(per_example_max <= float(threshold)))
+        out[f"{prefix}_width_success_at_{key}"] = float(np.mean(per_example_width_max <= float(threshold)))
     return out
 
 
@@ -201,4 +207,3 @@ def measure_fingertips_with_mujoco(
                 close()
         if temp_context is not None:
             temp_context.cleanup()
-

@@ -72,6 +72,14 @@ class ContactAlignmentMetrics:
     wrong_key_nearest_count: int
     mean_center_error_m: float
     mean_surface_error_m: float
+    mean_width_center_error_m: float
+    median_width_center_error_m: float
+    p95_width_center_error_m: float
+    max_width_center_error_m: float
+    mean_width_surface_error_m: float
+    median_width_surface_error_m: float
+    p95_width_surface_error_m: float
+    max_width_surface_error_m: float
 
 
 def ensure_repo_paths() -> Path:
@@ -319,6 +327,24 @@ class ContactRefiner:
         dy = np.maximum(np.abs(tip_positions[:, 1] - key_positions[:, 1]) - float(cfg.key_front_back_tolerance_m), 0.0)
         return np.sqrt(dx**2 + dy**2)
 
+    def _surface_width_errors(
+        self,
+        tip_positions: np.ndarray,
+        key_positions: np.ndarray,
+        key_indices: np.ndarray,
+        cfg: ContactRefinementConfig,
+    ) -> np.ndarray:
+        if tip_positions.size == 0:
+            return np.zeros((0,), dtype=np.float64)
+        widths = np.asarray(
+            [
+                float(cfg.black_key_half_width_m) if int(key) % 12 in _BLACK_KEY_PITCH_CLASSES else float(cfg.white_key_half_width_m)
+                for key in key_indices
+            ],
+            dtype=np.float64,
+        )
+        return np.maximum(np.abs(tip_positions[:, 0] - key_positions[:, 0]) - widths, 0.0)
+
     def _contact_errors(
         self,
         tip_positions: np.ndarray,
@@ -361,9 +387,19 @@ class ContactRefiner:
                 wrong_key_nearest_count=0,
                 mean_center_error_m=0.0,
                 mean_surface_error_m=0.0,
+                mean_width_center_error_m=0.0,
+                median_width_center_error_m=0.0,
+                p95_width_center_error_m=0.0,
+                max_width_center_error_m=0.0,
+                mean_width_surface_error_m=0.0,
+                median_width_surface_error_m=0.0,
+                p95_width_surface_error_m=0.0,
+                max_width_surface_error_m=0.0,
             )
         diff = assignment.tip_positions - assignment.key_positions
         center_error = np.linalg.norm(diff, axis=1)
+        width_center_error = np.abs(diff[:, 0])
+        width_surface_error = self._surface_width_errors(assignment.tip_positions, assignment.key_positions, assignment.key_indices, cfg)
         surface_xy = self._surface_xy_errors(assignment.tip_positions, assignment.key_positions, assignment.key_indices, cfg)
         surface_error = np.sqrt(surface_xy**2 + diff[:, 2] ** 2)
         error = surface_error if str(cfg.target_mode).strip().lower() == "key_surface_box" else center_error
@@ -387,6 +423,14 @@ class ContactRefiner:
             wrong_key_nearest_count=wrong_key_nearest_count,
             mean_center_error_m=float(np.mean(center_error)),
             mean_surface_error_m=float(np.mean(surface_error)),
+            mean_width_center_error_m=float(np.mean(width_center_error)),
+            median_width_center_error_m=float(np.median(width_center_error)),
+            p95_width_center_error_m=float(np.percentile(width_center_error, 95)),
+            max_width_center_error_m=float(np.max(width_center_error)),
+            mean_width_surface_error_m=float(np.mean(width_surface_error)),
+            median_width_surface_error_m=float(np.median(width_surface_error)),
+            p95_width_surface_error_m=float(np.percentile(width_surface_error, 95)),
+            max_width_surface_error_m=float(np.max(width_surface_error)),
         )
 
     def _loss(

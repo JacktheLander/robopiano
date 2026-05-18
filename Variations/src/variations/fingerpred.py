@@ -148,26 +148,37 @@ def active_fingertip_metrics(
     target_np = target.detach().cpu().numpy().reshape(-1, 10, 3)
     mask_np = tip_mask.detach().cpu().numpy().astype(bool)
     dist = np.linalg.norm(pred_np - target_np, axis=2)
+    width_dist = np.abs(pred_np[:, :, 0] - target_np[:, :, 0])
     active_dist = dist[mask_np]
+    active_width_dist = width_dist[mask_np]
     metrics["active_tip_count"] = float(active_dist.size)
     metrics["active_tip_examples"] = float(mask_np.any(axis=1).sum())
     if active_dist.size:
         metrics["active_tip_distance_mean"] = float(np.mean(active_dist))
         metrics["active_tip_distance_median"] = float(np.median(active_dist))
         metrics["active_tip_distance_p95"] = float(np.percentile(active_dist, 95))
+        metrics["active_tip_width_distance_mean"] = float(np.mean(active_width_dist))
+        metrics["active_tip_width_distance_median"] = float(np.median(active_width_dist))
+        metrics["active_tip_width_distance_p95"] = float(np.percentile(active_width_dist, 95))
     else:
         metrics["active_tip_distance_mean"] = float("nan")
         metrics["active_tip_distance_median"] = float("nan")
         metrics["active_tip_distance_p95"] = float("nan")
+        metrics["active_tip_width_distance_mean"] = float("nan")
+        metrics["active_tip_width_distance_median"] = float("nan")
+        metrics["active_tip_width_distance_p95"] = float("nan")
 
     example_has_active = mask_np.any(axis=1)
     if example_has_active.any():
         per_example_max = np.where(mask_np, dist, -np.inf).max(axis=1)[example_has_active]
+        per_example_width_max = np.where(mask_np, width_dist, -np.inf).max(axis=1)[example_has_active]
         for threshold in success_thresholds:
             key = str(threshold).replace(".", "p")
             metrics[f"active_tip_success_at_{key}"] = float(np.mean(per_example_max <= float(threshold)))
+            metrics[f"active_tip_width_success_at_{key}"] = float(np.mean(per_example_width_max <= float(threshold)))
     else:
         for threshold in success_thresholds:
             key = str(threshold).replace(".", "p")
             metrics[f"active_tip_success_at_{key}"] = float("nan")
+            metrics[f"active_tip_width_success_at_{key}"] = float("nan")
     return metrics

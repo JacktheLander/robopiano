@@ -7,6 +7,7 @@ from typing import Callable
 import numpy as np
 
 from intermezzo.constants import (
+    FINGER_JOINT_INDICES,
     FOREARM_TY_INDICES,
     FOREARM_TY_MAX,
     FOREARM_TY_MIN,
@@ -53,6 +54,7 @@ class PlannerConfig:
     ik_iterations_per_frame: int = 1
     preserve_waypoint_endpoints: bool = True
     magnet_only_final_keyset: bool = True
+    selected_finger_z_attraction: bool = False
 
 
 @dataclass(frozen=True)
@@ -268,13 +270,24 @@ def plan_between_waypoints(
     dense_segment_ids[last_dense:] = int(max(frames.size - 1, 0))
 
     dense_frames = frames * substeps
-    _apply_press_windows(
-        dense,
-        waypoint_frames_dense=dense_frames,
-        waypoint_target_keys=keys,
-        waypoint_hand_joints=waypoints,
-        config=cfg,
-    )
+    if cfg.selected_finger_z_attraction:
+        dense = _apply_selected_finger_z_windows(
+            dense,
+            waypoint_frames_dense=dense_frames,
+            waypoint_target_keys=keys,
+            waypoint_hand_joints=waypoints,
+            config=cfg,
+            key_geometry=key_geometry,
+            kinematics=kinematics,
+        )
+    else:
+        _apply_press_windows(
+            dense,
+            waypoint_frames_dense=dense_frames,
+            waypoint_target_keys=keys,
+            waypoint_hand_joints=waypoints,
+            config=cfg,
+        )
     if cfg.enable_key_magnetism:
         dense = _apply_magnetic_windows(
             dense,
@@ -343,7 +356,11 @@ def _apply_press_windows(
     approach, hold, release = _press_window_frame_counts(config)
     if dense.shape[0] == 0 or waypoint_frames_dense.size == 0:
         return
-    active_windows: dict[int, list[tuple[int, float]]] = {RIGHT_FOREARM_TY_INDEX: [], LEFT_FOREARM_TY_INDEX: []}
+    sustained_flags = _compute_sustained_flags(waypoint_target_keys, threshold=config.threshold)
+    active_windows: dict[int, list[tuple[int, float, float, bool]]] = {
+        RIGHT_FOREARM_TY_INDEX: [],
+        LEFT_FOREARM_TY_INDEX: [],
+    }
     for waypoint_index, center_value in enumerate(np.asarray(waypoint_frames_dense, dtype=np.int64).reshape(-1)):
         center = int(center_value)
         hands = keyset_hand_sides(waypoint_target_keys[waypoint_index], threshold=config.threshold)
@@ -353,15 +370,25 @@ def _apply_press_windows(
             waypoint_pressed = float(waypoint_hand_joints[waypoint_index, vertical_index])
             pressed = float(np.clip(waypoint_pressed - float(config.press_depth), float(config.vertical_min), float(config.vertical_max)))
             lifted = min(pressed + float(config.clearance_height), float(config.vertical_max))
-            active_windows[vertical_index].append((center, lifted))
+            is_sustained = sustained_flags[vertical_index][waypoint_index]
+            was_sustained = waypoint_index > 0 and sustained_flags[vertical_index][waypoint_index - 1]
+            active_windows[vertical_index].append((center, lifted, pressed, is_sustained))
             start = max(0, center - approach)
             end = min(dense.shape[0] - 1, center + hold + release)
             for step in range(start, end + 1):
                 offset = step - center
                 if offset < 0:
+                    if was_sustained:
+                        dense[step, vertical_index] = pressed
+                        dense[step, vertical_index] = float(
+                            np.clip(dense[step, vertical_index], float(config.vertical_min), float(config.vertical_max))
+                        )
+                        continue
                     weight = float(frame_window_envelope(offset, approach, 0, 0, config.press_envelope_power))
                     dense[step, vertical_index] = float(dense[step, vertical_index]) * (1.0 - weight) + pressed * weight
                 elif offset <= hold:
+                    dense[step, vertical_index] = pressed
+                elif is_sustained:
                     dense[step, vertical_index] = pressed
                 else:
                     release_u = min(max((offset - hold) / float(max(release, 1)), 0.0), 1.0)
@@ -371,14 +398,17 @@ def _apply_press_windows(
                     np.clip(dense[step, vertical_index], float(config.vertical_min), float(config.vertical_max))
                 )
     for vertical_index, windows in active_windows.items():
-        for (center, lifted), (next_center, _next_lifted) in zip(windows, windows[1:]):
+        for (center, lifted, pressed, is_sustained), (next_center, _next_lifted, _next_pressed, _next_sustained) in zip(
+            windows, windows[1:]
+        ):
             plateau_start = center + hold + release
             plateau_end = next_center - approach
             if plateau_start < plateau_end:
                 start = max(0, plateau_start)
                 end = min(dense.shape[0], plateau_end)
+                fill_value = pressed if is_sustained else lifted
                 dense[start:end, vertical_index] = float(
-                    np.clip(lifted, float(config.vertical_min), float(config.vertical_max))
+                    np.clip(fill_value, float(config.vertical_min), float(config.vertical_max))
                 )
     for waypoint_index, center_value in enumerate(np.asarray(waypoint_frames_dense, dtype=np.int64).reshape(-1)):
         center = int(center_value)
@@ -393,6 +423,113 @@ def _apply_press_windows(
                         float(config.vertical_max),
                     )
                 )
+
+
+def _compute_sustained_flags(
+    waypoint_target_keys: np.ndarray,
+    *,
+    threshold: float,
+) -> dict[int, list[bool]]:
+    """Mark whether each hand remains active at the immediately next waypoint."""
+    keys = np.asarray(waypoint_target_keys, dtype=np.float32)
+    n = int(keys.shape[0])
+    flags: dict[int, list[bool]] = {
+        RIGHT_FOREARM_TY_INDEX: [],
+        LEFT_FOREARM_TY_INDEX: [],
+    }
+    for waypoint_index in range(n):
+        hands_cur = keyset_hand_sides(keys[waypoint_index], threshold=threshold)
+        hands_next = (
+            keyset_hand_sides(keys[waypoint_index + 1], threshold=threshold)
+            if waypoint_index + 1 < n
+            else {}
+        )
+        for side, vertical_index in (("right", RIGHT_FOREARM_TY_INDEX), ("left", LEFT_FOREARM_TY_INDEX)):
+            flags[vertical_index].append(bool(hands_cur.get(side, False) and hands_next.get(side, False)))
+    return flags
+
+
+
+def _apply_selected_finger_z_windows(
+    planned: np.ndarray,
+    *,
+    waypoint_frames_dense: np.ndarray,
+    waypoint_target_keys: np.ndarray,
+    waypoint_hand_joints: np.ndarray,
+    config: PlannerConfig,
+    key_geometry: np.ndarray | None,
+    kinematics: HandKinematics | None,
+) -> np.ndarray:
+    key_xy = approximate_key_geometry() if key_geometry is None else np.asarray(key_geometry, dtype=np.float32)
+    if key_xy.shape != (NUM_PIANO_KEYS, 2):
+        raise ValueError(f"key_geometry must have shape [88, 2], got {key_xy.shape}")
+    kin = kinematics or FakeHandKinematics()
+    corrected = planned.astype(np.float32, copy=True)
+    approach, hold, release = _press_window_frame_counts(config)
+    if corrected.shape[0] == 0 or waypoint_frames_dense.size == 0:
+        return corrected
+    for waypoint_index, center_value in enumerate(np.asarray(waypoint_frames_dense, dtype=np.int64).reshape(-1)):
+        center = int(center_value)
+        endpoint_q = waypoint_hand_joints[waypoint_index]
+        assignments = assign_active_fingertips(
+            waypoint_target_keys[waypoint_index],
+            endpoint_hand_state=endpoint_q,
+            key_xy=key_xy,
+            kinematics=kin,
+            threshold=config.threshold,
+        )
+        if not assignments:
+            continue
+        selected_fingers = np.asarray([int(item.fingertip_index) for item in assignments], dtype=np.int64)
+        active_joints = _finger_joint_indices(selected_fingers)
+        kin.set_hand_state(endpoint_q)
+        endpoint_xyz = kin.fingertip_xyz()[selected_fingers]
+        start = max(0, center - approach)
+        end = min(corrected.shape[0] - 1, center + hold + release)
+        for step in range(start, end + 1):
+            if config.preserve_waypoint_endpoints and step == center:
+                continue
+            offset = int(step - center)
+            weight = float(
+                frame_window_envelope(
+                    offset,
+                    approach=approach,
+                    hold=hold,
+                    release=release,
+                    power=config.press_envelope_power,
+                )
+            )
+            if weight <= 0.0:
+                continue
+            kin.set_hand_state(corrected[step])
+            current_xyz = kin.fingertip_xyz()[selected_fingers]
+            target_xyz = current_xyz.astype(np.float32, copy=True)
+            target_xyz[:, 2] = current_xyz[:, 2] * (1.0 - weight) + endpoint_xyz[:, 2] * weight
+            corrected[step] = kin.solve_xyz_correction(
+                corrected[step],
+                selected_fingers,
+                target_xyz.astype(np.float32),
+                np.ones((selected_fingers.size,), dtype=np.float32),
+                damping=float(config.ik_damping),
+                max_delta_q=float(config.ik_max_delta_q),
+                iterations=int(config.ik_iterations_per_frame),
+                active_joint_indices=active_joints,
+            )
+    if config.preserve_waypoint_endpoints:
+        for index, frame in enumerate(waypoint_frames_dense):
+            corrected[int(frame)] = waypoint_hand_joints[index]
+    return corrected.astype(np.float32)
+
+
+def _finger_joint_indices(fingertip_indices: np.ndarray) -> np.ndarray:
+    joints: list[int] = []
+    for finger_value in np.asarray(fingertip_indices, dtype=np.int64).reshape(-1):
+        finger = int(finger_value)
+        if 0 <= finger < len(FINGER_JOINT_INDICES):
+            joints.extend(int(index) for index in FINGER_JOINT_INDICES[finger])
+    if not joints:
+        return np.zeros((0,), dtype=np.int64)
+    return np.unique(np.asarray(joints, dtype=np.int64)).astype(np.int64)
 
 
 def _apply_magnetic_windows(
@@ -479,14 +616,16 @@ def _magnetic_correct_frame(
         weights.append(1.0)
     if not fingertip_indices:
         return q.astype(np.float32)
+    selected = np.asarray(fingertip_indices, dtype=np.int64)
     return kinematics.solve_xy_correction(
         q,
-        np.asarray(fingertip_indices, dtype=np.int64),
+        selected,
         np.stack(targets, axis=0).astype(np.float32),
         np.asarray(weights, dtype=np.float32),
         damping=float(config.ik_damping),
         max_delta_q=float(config.ik_max_delta_q),
         iterations=int(config.ik_iterations_per_frame),
+        active_joint_indices=_finger_joint_indices(selected),
     ).astype(np.float32)
 
 
