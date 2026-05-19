@@ -1,0 +1,12 @@
+# Example plan corruption preset. This is not wired into training by default.
+enabled: true
+q_reference_noise_std: 0.012
+q_smooth_drift_std: 0.018
+fingertip_xy_noise_std: 0.004
+fingertip_z_noise_std: 0.007
+hover_height_bias: 0.006
+press_depth_bias: 0.004
+timing_jitter_frames: 4
+missing_waypoint_probability: 0.18
+lookahead_dropout_probability: 0.35
+curriculum_scale: 1.0

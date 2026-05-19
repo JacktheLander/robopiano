@@ -1,0 +1,6 @@
+loss:
+  key_press_weight: 2.0
+  wrong_key_weight: 1.0
+  missed_key_weight: 2.0
+  key_transition_weight: 0.5
+  press_intent_aux_weight: 0.25

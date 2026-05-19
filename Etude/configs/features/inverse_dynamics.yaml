@@ -1,0 +1,8 @@
+inverse_dynamics:
+  desired_state_horizon: 1
+  future_steps: [1, 2, 5, 10]
+  include_future_deltas: true
+  condition_on_keys: true
+  condition_on_fingertips: true
+  condition_on_previous_action: true
+  zero_fill_missing: true

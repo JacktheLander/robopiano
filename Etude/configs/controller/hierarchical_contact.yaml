@@ -1,0 +1,13 @@
+controller:
+  family: hierarchical
+  type: hierarchical_contact
+
+hierarchical:
+  contact_policy: identity
+  outputs:
+    corrected_fingertip_targets: true
+    press_intent: true
+    release_intent: true
+    local_time_offset: false
+  lowlevel:
+    type: scheduled_pd

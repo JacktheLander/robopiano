@@ -1,0 +1,38 @@
+includes:
+  - ../controller/residual_safe_gru.yaml
+  - ../corruption/small.yaml
+  - ../features/temporal_context.yaml
+  - ../loss/key_aware.yaml
+
+experiment:
+  name: corruption_small
+  controller_family: residual_safe_gru
+  evaluation_mode: robustness_train
+  resource_tier: tier2_gpu_train
+
+data:
+  dataset_root: CHANGE_ME
+  batch_size: 128
+  sequence_length: 64
+  num_workers: 4
+
+training:
+  epochs: 10
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  device: cuda
+
+wandb:
+  enabled: false
+
+execution:
+  kind: train_supervised
+  dry_run_support: true
+  allow_execute: true
+  requires_dataset: true
+  requires_gpu: true
+  local_batch_script: local_batch/run_etude_robustness_array.echo
+
+output:
+  root: runs
+  subdir: train/05_corruption_small

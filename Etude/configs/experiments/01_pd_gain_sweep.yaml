@@ -1,0 +1,25 @@
+includes:
+  - ../controller/pd_lookahead_sweep.yaml
+  - ../corruption/none.yaml
+  - ../evaluation/event_metrics.yaml
+
+experiment:
+  name: pd_gain_sweep
+  controller_family: scheduled_pd
+  evaluation_mode: offline_eval
+  resource_tier: tier1_cpu_offline
+
+data:
+  dataset_root: CHANGE_ME
+
+execution:
+  kind: offline_pd_eval
+  dry_run_support: true
+  allow_execute: true
+  local_safe: false
+  requires_dataset: true
+  local_batch_script: local_batch/run_etude_cpu_eval.echo
+
+output:
+  root: runs
+  subdir: offline/01_pd_gain_sweep

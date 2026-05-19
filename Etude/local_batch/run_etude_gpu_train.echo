@@ -1,0 +1,23 @@
+@echo off
+setlocal
+
+if "%~1"=="" (
+  echo Usage: %~nx0 ^<experiment-config^>
+  exit /b 1
+)
+
+cd /d D:\Codex\Robopiano\robopiano\Etude
+call conda activate sonata
+
+set PYTHONPATH=%CD%\src;%CD%;%PYTHONPATH%
+set ETUDE_OUTPUT_ROOT=D:\Codex\Robopiano\robopiano\Etude\runs
+set ETUDE_LOG_ROOT=%ETUDE_OUTPUT_ROOT%\logs
+if not exist "%ETUDE_LOG_ROOT%" mkdir "%ETUDE_LOG_ROOT%"
+
+REM BATCH -p gpu
+REM BATCH --gres=gpu:1
+REM BATCH -c 8
+REM BATCH --mem=64G
+REM BATCH --time=08:00:00
+
+python scripts\run_experiment.py --config "%~1"

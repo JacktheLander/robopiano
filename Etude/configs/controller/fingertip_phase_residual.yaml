@@ -1,0 +1,21 @@
+controller:
+  family: fingertip_residual
+  type: etude.controllers.fingertip_phase_residual:FingertipPhaseResidualController
+  device: cpu
+  phase_gain: 1.0
+  residual_limit: 0.25
+
+  fingertip_control:
+    enabled: true
+    use_fingertip_error_features: true
+    use_fingertip_weights: true
+    use_active_finger_mask: true
+    use_inactive_finger_mask: true
+    allow_missing: true
+
+  phase:
+    enabled: true
+    source: metadata
+    encode_as: both
+    include_mask: true
+    allow_missing: true

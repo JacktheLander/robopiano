@@ -1,0 +1,12 @@
+controller:
+  feature_blocks:
+    - etude.features.key_blocks:build_key_features
+    - etude.features.fingertip_phase_blocks:build_phase_features
+
+tracking_plan:
+  dt: 0.005
+  metadata:
+    source: example
+
+validation:
+  lightweight_only: true

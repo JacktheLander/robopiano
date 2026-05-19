@@ -1,0 +1,42 @@
+includes:
+  - ../controller/temporal_residual_tcn.yaml
+  - ../corruption/aggressive.yaml
+  - ../evaluation/event_metrics.yaml
+  - ../features/temporal_context.yaml
+  - ../loss/key_aware.yaml
+
+experiment:
+  name: robustness_sweep
+  controller_family: temporal_residual_tcn
+  evaluation_mode: robustness_sweep
+  resource_tier: tier4_robustness
+
+controller:
+  model_module: null
+
+data:
+  dataset_root: CHANGE_ME
+  batch_size: 128
+  sequence_length: 64
+  num_workers: 4
+
+training:
+  epochs: 10
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  device: cuda
+
+wandb:
+  enabled: false
+
+execution:
+  kind: train_supervised
+  dry_run_support: true
+  allow_execute: true
+  requires_dataset: true
+  requires_gpu: true
+  local_batch_script: local_batch/run_etude_robustness_array.echo
+
+output:
+  root: runs
+  subdir: train/11_robustness_sweep

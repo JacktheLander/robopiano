@@ -1,0 +1,21 @@
+controller:
+  family: pd
+  type: scheduled_pd
+
+pd:
+  mode: phase_scheduled
+  lookahead_steps: 1
+  action_clip: true
+  kp: 12.0
+  kd: 0.6
+  phase_kp_scales:
+    approach: 1.25
+    hold: 1.0
+    release: 0.85
+  phase_kd_scales:
+    approach: 1.1
+    hold: 1.0
+    release: 0.9
+  action_smoothing:
+    enabled: true
+    alpha: 0.15

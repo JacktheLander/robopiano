@@ -50,6 +50,9 @@ def note_metrics(predicted_keys: np.ndarray, target_keys: np.ndarray) -> dict[st
     recall = tp / max(tp + fn, 1.0)
     f1 = 2 * precision * recall / max(precision + recall, 1e-12)
     return {
+        "piano/frame_precision": precision,
+        "piano/frame_recall": recall,
+        "piano/frame_f1": f1,
         "piano/note_precision": precision,
         "piano/note_recall": recall,
         "piano/note_f1": f1,

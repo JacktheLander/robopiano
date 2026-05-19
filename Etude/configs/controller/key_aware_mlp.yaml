@@ -1,0 +1,12 @@
+controller:
+  family: key_aware_residual
+  type: key_aware_residual
+  residual_model: mlp
+  hidden_dim: 384
+  num_layers: 4
+  dropout: 0.05
+  activation: gelu
+  residual_scale: 1.0
+  residual_clip: 1.0
+  feature_block_paths:
+    - etude.features.key_blocks:build_key_features

@@ -1,0 +1,6 @@
+event_matching:
+  onset_tolerance_ms: 50
+  offset_tolerance_ms: 80
+  min_press_duration_ms: 20
+  merge_gap_ms: 25
+  key_activation_threshold: 0.5

@@ -1,0 +1,12 @@
+controller:
+  type: scheduled_pd
+
+pd:
+  mode: scalar
+  action_clip: true
+  kp: 12.0
+  kd: 0.6
+  lookahead_steps: [0, 1, 2, 4]
+  action_smoothing:
+    enabled: false
+    alpha: 0.2

@@ -1,0 +1,38 @@
+includes:
+  - ../controller/hierarchical_contact.yaml
+  - ../corruption/none.yaml
+  - ../features/contact_mode.yaml
+  - ../loss/key_aware.yaml
+
+experiment:
+  name: hierarchical
+  controller_family: hierarchical_contact
+  evaluation_mode: supervised_train
+  resource_tier: tier2_gpu_train
+
+data:
+  dataset_root: CHANGE_ME
+  batch_size: 128
+  sequence_length: 64
+  num_workers: 4
+
+training:
+  epochs: 10
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  device: cuda
+
+wandb:
+  enabled: false
+
+execution:
+  kind: train_supervised
+  dry_run_support: true
+  allow_execute: true
+  requires_dataset: true
+  requires_gpu: true
+  local_batch_script: local_batch/run_etude_gpu_train.echo
+
+output:
+  root: runs
+  subdir: train/08_hierarchical

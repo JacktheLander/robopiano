@@ -1,0 +1,21 @@
+@echo off
+setlocal
+
+cd /d D:\Codex\Robopiano\robopiano\Etude
+call conda activate sonata
+
+set PYTHONPATH=%CD%\src;%CD%;%PYTHONPATH%
+set ETUDE_OUTPUT_ROOT=D:\Codex\Robopiano\robopiano\Etude\runs
+set ETUDE_LOG_ROOT=%ETUDE_OUTPUT_ROOT%\logs
+if not exist "%ETUDE_LOG_ROOT%" mkdir "%ETUDE_LOG_ROOT%"
+
+REM BATCH -p gpu
+REM BATCH --gres=gpu:1
+REM BATCH -c 8
+REM BATCH --mem=64G
+REM BATCH --time=08:00:00
+REM BATCH --array=0-10
+
+for /f "usebackq delims=" %%F in ("local_batch\robustness_configs.txt") do (
+  python scripts\run_experiment.py --config "%%F"
+)

@@ -1,0 +1,10 @@
+features:
+  tracking:
+    lookahead_steps: [1, 5, 10]
+    include_target_keys: true
+    include_fingertips: true
+  temporal:
+    history_steps: 16
+    include_previous_action: true
+    include_previous_residual: true
+    reset_hidden_on_episode: true

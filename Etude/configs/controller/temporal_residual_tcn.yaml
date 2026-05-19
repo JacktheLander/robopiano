@@ -1,0 +1,28 @@
+seed: 7
+
+controller:
+  family: temporal_residual
+  type: temporal_residual
+  model_type: tcn
+  model_module: path.to.temporal_tcn:TemporalTCN
+  model_path: null
+  input_dim: 0
+  action_dim: 0
+  channels: [128, 128, 128]
+  kernel_size: 3
+  dropout: 0.05
+  residual_scale: 1.0
+  residual_clip: 0.2
+  device: cpu
+  use_hidden_state: false
+
+pd:
+  enabled: true
+  kp_init: 12.0
+  kd_init: 0.6
+  action_clip: true
+
+temporal:
+  history_steps: 16
+  lookahead_steps: [1, 5, 10]
+  reset_hidden_on_episode: true

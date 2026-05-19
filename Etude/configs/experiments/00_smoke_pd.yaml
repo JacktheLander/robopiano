@@ -1,0 +1,24 @@
+includes:
+  - ../controller/pd_grouped.yaml
+  - ../corruption/none.yaml
+  - ../evaluation/event_metrics.yaml
+
+experiment:
+  name: smoke_pd
+  controller_family: pd_grouped
+  evaluation_mode: smoke
+  resource_tier: tier0_login_smoke
+
+execution:
+  kind: smoke
+  dry_run_support: true
+  allow_execute: false
+  local_safe: true
+  local_batch_script: local_batch/run_etude_cpu_eval.echo
+
+output:
+  root: runs
+  subdir: smoke/00_smoke_pd
+
+validation:
+  lightweight_only: true

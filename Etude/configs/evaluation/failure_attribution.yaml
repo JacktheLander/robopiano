@@ -1,0 +1,14 @@
+failure_attribution:
+  fingertip_contact_error_cm: 1.0
+  action_clip_rate: 0.2
+  timing_error_ms: 50
+  wrong_key_rate: 0.05
+  event_f1_drop: 0.1
+  joint_mae: 0.15
+  joint_mse: 0.05
+  fingertip_mean_cm: 1.0
+  contact_depth_cm: 0.5
+  release_error_rate: 0.05
+  instability_rate: 0.05
+  recovery_error_rate: 0.1
+  residual_action_l2: 0.5

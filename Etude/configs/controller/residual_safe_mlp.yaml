@@ -1,0 +1,33 @@
+seed: 7
+
+controller:
+  family: pd_residual
+  type: safe_hybrid_pd_residual
+  residual_model: mlp
+  model_module: etude.controllers.residual_mlp:ResidualMLP
+  model_path: /path/to/residual_safe_mlp_checkpoint.pt
+  input_dim: 0
+  action_dim: 0
+  hidden_dim: 256
+  num_layers: 4
+  dropout: 0.05
+  activation: gelu
+
+pd:
+  enabled: true
+  kp_init: 12.0
+  kd_init: 0.6
+  action_clip: true
+
+residual:
+  scale: 1.0
+  clip_norm: 0.25
+  clip_per_dim: 0.15
+  smoothing_alpha: 0.2
+  phase_gating:
+    enabled: true
+    approach: 0.25
+    pre_contact: 0.75
+    contact: 1.0
+    hold: 0.6
+    release: 0.8

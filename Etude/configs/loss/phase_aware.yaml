@@ -1,0 +1,17 @@
+loss:
+  fingertip:
+    weighted_mse:
+      enabled: true
+    contact_window:
+      enabled: true
+    inactive_clearance:
+      enabled: true
+      clearance_margin: 0.01
+
+  phase:
+    phase_weighted_joint_tracking:
+      enabled: true
+      velocity_weight: 0.1
+    release_phase_penalty:
+      enabled: true
+      release_phase_id: 3

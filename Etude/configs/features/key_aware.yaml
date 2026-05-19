@@ -1,0 +1,16 @@
+features:
+  blocks:
+    - etude.features.key_blocks:build_key_features
+  block_kwargs:
+    etude.features.key_blocks:build_key_features:
+      spec:
+        lookahead_steps: [1, 5, 10]
+        density_horizon: 8
+        include_target_now: true
+        include_target_lookahead: true
+        include_current_state: true
+        include_key_error: true
+        include_note_density: true
+        include_time_to_next: true
+        include_transitions: true
+        zero_fill_missing: true

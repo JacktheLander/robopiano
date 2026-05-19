@@ -1,0 +1,15 @@
+training:
+  mode: rollout_hooks
+
+rollout_training:
+  enabled: false
+  replay_buffer_capacity: 100000
+  failure_only_sampling: false
+  failure_window_size: 8
+
+reward:
+  target_key_activation: 2.0
+  missed_key: -3.0
+  wrong_key: -2.0
+  action_l2: -0.01
+  action_smoothness: -0.005

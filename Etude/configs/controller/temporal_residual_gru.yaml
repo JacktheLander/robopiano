@@ -1,0 +1,28 @@
+seed: 7
+
+controller:
+  family: temporal_residual
+  type: temporal_residual
+  model_type: gru
+  model_module: etude.controllers.residual_gru:ResidualGRU
+  model_path: null
+  input_dim: 0
+  action_dim: 0
+  hidden_dim: 128
+  num_layers: 1
+  encoder_dim: 128
+  residual_scale: 1.0
+  residual_clip: 0.2
+  device: cpu
+  use_hidden_state: true
+
+pd:
+  enabled: true
+  kp_init: 12.0
+  kd_init: 0.6
+  action_clip: true
+
+temporal:
+  history_steps: 16
+  lookahead_steps: [1, 5, 10]
+  reset_hidden_on_episode: true

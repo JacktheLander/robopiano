@@ -21,3 +21,23 @@ def test_save_and_load_qpos_trajectory(tmp_path) -> None:
     assert payload["qdot_ref"].shape == (3, 46)
     assert np.isclose(payload["dt"], 0.005)
     assert payload["metadata"]["source"] == "unit"
+
+
+def test_load_qpos_trajectory_accepts_impromptu_payload(tmp_path) -> None:
+    path = tmp_path / "impromptu_plan.npz"
+    planned = np.ones((4, 46), dtype=np.float32)
+    velocities = np.full((4, 46), 0.25, dtype=np.float32)
+    target_keys = np.zeros((4, 88), dtype=np.float32)
+    np.savez_compressed(
+        path,
+        planned_hand_joints=planned,
+        planned_hand_velocities=velocities,
+        target_keys=target_keys,
+    )
+
+    payload = load_qpos_trajectory(path)
+
+    assert payload["q_ref"].shape == (4, 46)
+    assert payload["qdot_ref"].shape == (4, 46)
+    assert payload["metadata"]["source_format"] == "impromptu_planner_npz"
+    assert payload["metadata"]["target_keys"].shape == (4, 88)

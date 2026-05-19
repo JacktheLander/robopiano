@@ -1,0 +1,14 @@
+contact_mode:
+  enabled: true
+  include_one_hot: true
+  include_active_mask: true
+  include_inactive_mask: true
+  include_distance_to_key: true
+  include_press_release_intent: true
+  flatten: true
+  allow_missing: true
+  contact_mode_names:
+    - inactive
+    - approach
+    - press
+    - release

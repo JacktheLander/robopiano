@@ -1,0 +1,27 @@
+includes:
+  - ../controller/residual_safe_mlp.yaml
+  - ../evaluation/event_metrics.yaml
+  - ../corruption/none.yaml
+
+experiment:
+  name: rollout_eval
+  controller_family: residual_safe_mlp
+  evaluation_mode: rollout_eval
+  resource_tier: tier3_rollout
+
+execution:
+  kind: rollout_eval
+  dry_run_support: true
+  allow_execute: true
+  requires_gpu: true
+  requires_rollout: true
+  local_batch_script: local_batch/run_etude_rollout_eval.echo
+  args:
+    trajectory: CHANGE_ME
+    checkpoint: CHANGE_ME
+    backend: dm_control
+    render_video: false
+
+output:
+  root: runs
+  subdir: rollout/10_rollout_eval

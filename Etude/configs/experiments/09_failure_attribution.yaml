@@ -1,0 +1,25 @@
+includes:
+  - ../controller/residual_safe_mlp.yaml
+  - ../corruption/medium.yaml
+  - ../evaluation/failure_attribution.yaml
+  - ../features/key_aware.yaml
+
+experiment:
+  name: failure_attribution
+  controller_family: residual_safe_mlp
+  evaluation_mode: offline_analysis
+  resource_tier: tier1_cpu_offline
+
+data:
+  dataset_root: CHANGE_ME
+
+execution:
+  kind: offline_pd_eval
+  dry_run_support: true
+  allow_execute: true
+  requires_dataset: true
+  local_batch_script: local_batch/run_etude_cpu_eval.echo
+
+output:
+  root: runs
+  subdir: offline/09_failure_attribution

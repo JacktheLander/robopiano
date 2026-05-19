@@ -1,0 +1,6 @@
+loss:
+  mode: full_action
+  behavior_cloning_weight: 1.0
+  residual_weight: 0.05
+  next_state_consistency_weight: 0.0
+  smoothness_weight: 0.0
