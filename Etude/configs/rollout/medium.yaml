@@ -1,0 +1,5 @@
+backend: dm_control
+task: RoboPianist-repertoire-150-v0
+max_steps: 6000
+render_video: true
+output_root: /WAVE/datasets/ccoelho_lab-jlanders/etude/outputs/eval/medium

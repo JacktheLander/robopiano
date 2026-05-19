@@ -1,0 +1,9 @@
+numpy>=1.24
+pandas>=2.0
+PyYAML>=6.0
+tqdm>=4.66
+matplotlib>=3.7
+torch>=2.2
+zarr>=2.16,<3
+wandb>=0.17
+joblib>=1.3

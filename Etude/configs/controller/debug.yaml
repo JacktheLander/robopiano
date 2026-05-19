@@ -1,0 +1,61 @@
+seed: 7
+
+data:
+  dataset_root: /WAVE/datasets/ccoelho_lab-jlanders/etude/data/debug
+  batch_size: 256
+  sequence_length: 64
+  num_workers: 4
+  normalize: true
+
+trajectory:
+  dt: 0.005
+  reference_dim: 46
+  lookahead_steps: [1, 5, 10]
+  control_rate_hz: 200
+
+controller:
+  type: hybrid_pd_residual
+  residual_model: mlp
+  hidden_dim: 256
+  num_layers: 4
+  dropout: 0.05
+  activation: gelu
+
+pd:
+  enabled: true
+  kp_init: 12.0
+  kd_init: 0.6
+  tune_gains: false
+  action_clip: true
+
+loss:
+  action_weight: 1.0
+  residual_weight: 0.05
+  smoothness_weight: 0.02
+  joint_tracking_weight: 0.5
+  velocity_tracking_weight: 0.1
+  fingertip_weight: 1.0
+  key_press_weight: 2.0
+
+training:
+  epochs: 30
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  device: cuda
+  mixed_precision: true
+  validate_every_epochs: 1
+
+rollout:
+  backend: dm_control
+  max_episodes: 16
+  render_video: false
+  restore_mode: hands_only
+  perturb_initial_state: true
+  perturb_std: 0.01
+
+wandb:
+  enabled: true
+  project: robopianist
+  entity: tnguyen31-santa-clara-university
+  tags: [etude, controller, trajectory_tracking]

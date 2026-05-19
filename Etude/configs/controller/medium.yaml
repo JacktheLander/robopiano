@@ -1,0 +1,36 @@
+seed: 7
+data:
+  dataset_root: /WAVE/datasets/ccoelho_lab-jlanders/etude/data/medium
+  batch_size: 512
+  sequence_length: 64
+  num_workers: 8
+  normalize: true
+trajectory:
+  dt: 0.005
+  reference_dim: 46
+  lookahead_steps: [1, 5, 10]
+  control_rate_hz: 200
+controller:
+  type: hybrid_pd_residual
+  residual_model: mlp
+  hidden_dim: 384
+  num_layers: 4
+  dropout: 0.05
+  activation: gelu
+pd:
+  enabled: true
+  kp_init: 12.0
+  kd_init: 0.6
+  tune_gains: false
+  action_clip: true
+training:
+  epochs: 60
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  gradient_clip_norm: 1.0
+  device: cuda
+  mixed_precision: true
+wandb:
+  enabled: true
+  project: robopianist
+  tags: [etude, medium]
